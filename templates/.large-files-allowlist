@@ -1,0 +1,12 @@
+# Files or directory prefixes exempt from the 10 MB size guard.
+# One entry per line. Directory prefixes end with a trailing slash.
+# Every non-empty, non-comment entry MUST be preceded by a comment
+# explaining why the file legitimately belongs in git.
+#
+# Examples (uncomment to use):
+#
+# reason: test fixtures — real PDFs needed for regression suite
+# test-pdfs/
+#
+# reason: source asset — hand-drawn background, no build step
+# src/assets/images/InfieldImage.png

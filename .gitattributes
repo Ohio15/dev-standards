@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# Shell scripts and hooks: force LF even on Windows checkouts.
+*.sh text eol=lf
+hooks/pre-commit text eol=lf
+
+# YAML is portable but CI runners read it; keep LF.
+*.yml text eol=lf
+*.yaml text eol=lf
