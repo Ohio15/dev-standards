@@ -167,12 +167,18 @@ THRESH_CRIT=1 THRESH_HIGH=2 ./scripts/npm-audit-weekly.sh \
 ```powershell
 # Hygiene scan — Sundays 05:00 local
 schtasks /Create /TN "DevStandards-HygieneScan" /SC WEEKLY /D SUN /ST 05:00 /F `
+  /RL LIMITED `
   /TR "python D:\Projects\dev-standards\scripts\repo-hygiene-scan.py --root D:/Projects --brain-store"
 
 # npm audit — Sundays 06:00 local
+# Uses the .cmd wrapper because schtasks /TR doesn't tolerate the quoted
+# `C:\Program Files\Git\bin\bash.exe` path well.
 schtasks /Create /TN "DevStandards-NpmAudit" /SC WEEKLY /D SUN /ST 06:00 /F `
-  /TR "C:\Program Files\Git\bin\bash.exe D:/Projects/dev-standards/scripts/npm-audit-weekly.sh --root D:/Projects --brain-store"
+  /RL LIMITED `
+  /TR "D:\Projects\dev-standards\scripts\npm-audit-weekly.cmd"
 ```
+
+`scripts/npm-audit-weekly.cmd` is a thin wrapper that invokes Git-Bash → `npm-audit-weekly.sh`. It exists purely to sidestep `schtasks` argument parsing of paths-with-spaces.
 
 ### Brain integration
 
