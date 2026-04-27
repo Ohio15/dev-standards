@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Chained pre-commit dispatcher. Runs each sub-hook in sequence; first failure
+# aborts the commit. Sub-hooks live next to this file in .githooks/ and are
+# named pre-commit-*.sh.
+#
+# Add a new sub-hook by dropping pre-commit-<name>.sh into .githooks/ and
+# making it executable. No edits to this file required.
+#
+# Bypass (emergency only): git commit --no-verify
+#
+# Policy source: https://github.com/Ohio15/dev-standards
+
+set -euo pipefail
+
+hooks_dir="$(cd "$(dirname "$0")" && pwd)"
+
+shopt -s nullglob
+sub_hooks=("$hooks_dir"/pre-commit-*.sh)
+shopt -u nullglob
+
+if [ ${#sub_hooks[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# Stable ordering so behavior is deterministic across machines.
+IFS=$'\n' sub_hooks=($(printf '%s\n' "${sub_hooks[@]}" | LC_ALL=C sort))
+unset IFS
+
+for hook in "${sub_hooks[@]}"; do
+  if [ ! -x "$hook" ]; then
+    echo "WARN: $hook is not executable, skipping" >&2
+    continue
+  fi
+  # Capture the sub-hook's real exit code. `if ! cmd; then rc=$?` would
+  # incorrectly record 0 because $? after the inverted test is the test's
+  # exit code, not the command's.
+  set +e
+  "$hook" "$@"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "pre-commit: $(basename "$hook") failed (exit $rc)" >&2
+    exit "$rc"
+  fi
+done
+
+exit 0

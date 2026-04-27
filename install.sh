@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Install the size guard into a target repo.
+# Install the dev-standards guards into a target repo.
 #
 # Usage:
 #   ./install.sh /path/to/target-repo
 #
-# Copies the pre-commit hook, the CI workflow, and an empty allowlist
-# template into the target repo. Configures core.hooksPath locally.
-# Does not commit — review and commit yourself.
+# Wires the chained pre-commit dispatcher plus the size-guard and secret-scan
+# sub-hooks into .githooks/, drops the CI workflow, and seeds default
+# allowlist + gitleaks config files. Does not commit — review and commit
+# yourself.
 
 set -euo pipefail
 
@@ -24,20 +25,44 @@ fi
 here="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$target/.githooks" "$target/.github/workflows"
+
+# Chained dispatcher + sub-hooks. Each sub-hook is independently executable so
+# the dispatcher can compose them.
 cp "$here/hooks/pre-commit" "$target/.githooks/pre-commit"
-chmod +x "$target/.githooks/pre-commit"
+cp "$here/hooks/pre-commit-size-guard.sh" "$target/.githooks/pre-commit-size-guard.sh"
+cp "$here/hooks/pre-commit-secret-scan.sh" "$target/.githooks/pre-commit-secret-scan.sh"
+chmod +x \
+  "$target/.githooks/pre-commit" \
+  "$target/.githooks/pre-commit-size-guard.sh" \
+  "$target/.githooks/pre-commit-secret-scan.sh"
+
+# CI workflow (size guard only; secret scan is local-pre-commit + GitHub
+# secret-scanning where available).
 cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
 
+# Templates: copy only if absent so we don't clobber repo-specific tuning.
 if [ ! -f "$target/.large-files-allowlist" ]; then
   cp "$here/templates/.large-files-allowlist" "$target/.large-files-allowlist"
+fi
+if [ ! -f "$target/.gitleaks.toml" ]; then
+  cp "$here/templates/.gitleaks.toml" "$target/.gitleaks.toml"
 fi
 
 git -C "$target" config core.hooksPath .githooks
 
 echo "Installed into $target"
-echo "  .githooks/pre-commit"
+echo "  .githooks/pre-commit                  (chained dispatcher)"
+echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
+echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
 echo "  .github/workflows/size-guard.yml"
-echo "  .large-files-allowlist (if not present)"
-echo "  git config core.hooksPath .githooks (local)"
+echo "  .large-files-allowlist                (if not present)"
+echo "  .gitleaks.toml                        (if not present)"
+echo "  git config core.hooksPath .githooks   (local)"
 echo
-echo "Review the files, then: git add -A && git commit -m 'ci: install size guard'"
+echo "Gitleaks must be installed on each developer's machine. Install instructions:"
+echo "  macOS:    brew install gitleaks"
+echo "  Windows:  choco install gitleaks"
+echo "  Any:      go install github.com/zricethezav/gitleaks/v8@latest"
+echo
+echo "Review the files, then:"
+echo "  git add -A && git commit -m 'ci: install dev-standards guards'"

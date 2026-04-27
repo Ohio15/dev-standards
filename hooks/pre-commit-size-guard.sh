@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Reject staged files larger than MAX_BYTES unless listed in .large-files-allowlist.
 #
-# Install per-repo:
-#   mkdir -p .githooks && cp path/to/this/pre-commit .githooks/pre-commit
-#   chmod +x .githooks/pre-commit
-#   git config core.hooksPath .githooks
+# Invoked by .githooks/pre-commit (the chained dispatcher). Not intended to be
+# wired in directly as core.hooksPath/pre-commit; use the dispatcher so future
+# sub-hooks (secret scan, lint, etc.) compose cleanly.
 #
 # Policy source: https://github.com/Ohio15/dev-standards
 
