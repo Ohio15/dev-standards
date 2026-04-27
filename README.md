@@ -10,6 +10,8 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 | `hooks/pre-commit-size-guard.sh` | Rejects staged files >10 MB unless allowlisted. |
 | `hooks/pre-commit-secret-scan.sh` | Runs `gitleaks protect --staged` to block commits introducing secrets. |
 | `workflows/size-guard.yml` | GitHub Actions workflow that rejects tracked files >10 MB. Not skippable. |
+| `templates/.github/workflows/security-audit.yml` | Layer A: always-on dependency-vulnerability gate. Fails PRs on high/critical findings across npm, Go, Python. |
+| `templates/.github/workflows/dep-auto-apply.yml` | Layer B: weekly cron that auto-applies safe dep fixes, runs tests, opens a PR labeled `auto-apply`. Per-repo opt-in. |
 | `templates/.large-files-allowlist` | Annotated template for per-repo large-file exemptions. |
 | `templates/.gitleaks.toml` | Baseline gitleaks ruleset (default rules + Ron-specific patterns). |
 | `install.sh` | One-shot installer that wires the guards into a target repo. |
@@ -103,6 +105,86 @@ The pre-commit hook honors `git commit --no-verify`. The size-guard CI workflow 
 ## Adding new sub-hooks
 
 Drop a `pre-commit-<name>.sh` into `hooks/`, make it executable, and update `install.sh` to copy it into `.githooks/`. The dispatcher discovers sub-hooks by name pattern and runs them in sorted order; no edits to `pre-commit` itself are required.
+
+## Dependency hygiene (Layer A + Layer B)
+
+Two-layer model for keeping dependencies patched without burning weekly attention. Pivoted to "auto-apply" architecture on **2026-04-27** after a self-critique of the original auto-merge scope (see shared-brain memory IDs at the end of this section).
+
+### Layer A — `security-audit.yml` (always on)
+
+Drop-in CI gate that runs on every pull request, every push to `main`/`master`, and on manual dispatch. Detect-and-dispatch: each ecosystem job is conditional on the presence of its lockfile or manifest, so the same workflow file works in pure-Node, pure-Go, polyglot, or empty repos.
+
+| Ecosystem | Trigger | Tool | Gate |
+|---|---|---|---|
+| npm    | `package.json` present | `npm audit` (or `pnpm audit`) | fails on **high** or **critical** |
+| Go     | `go.mod` present       | `govulncheck`                 | fails on any reachable vulnerability |
+| Python | `requirements*.txt` or `pyproject.toml` | `pip-audit --strict` | fails on any vuln |
+
+Moderate / low findings are logged to the workflow summary but don't fail the build. Layer A is **not** opt-in — it runs unconditionally on every repo `install.sh` touches.
+
+### Layer B — `dep-auto-apply.yml` (opt-in, weekly)
+
+Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs the project's test suite, and opens a PR labeled `auto-apply` for human review. Auto-merge is intentionally **not** part of this layer — it can be added later as a thin opt-in wrapper on top, once we have evidence from real auto-apply PRs.
+
+| Ecosystem | Auto-apply behaviour |
+|---|---|
+| npm    | `npm audit fix` (never `--force`, never `--include-major`); `npm test` if a `test` script is defined. pnpm: `pnpm update <vuln-pkgs>` derived from audit JSON. yarn: skipped (no safe `audit fix`). |
+| Go     | `govulncheck` enumerates affected modules; `go get -u=patch <mod>` for each; `go mod tidy`; `go build ./...`; `go test ./...`. **Aborted** if the resulting `go.sum` line-count delta exceeds 20 (heuristic for "this minor was actually breaking"). |
+| Python | Only if every line of every `requirements*.txt` is pinned with `==` or `~=`. Runs `pip-audit --fix --strict --dry-run` first to preview, then for real. `pytest` if available. |
+| Docker | **Read-only audit only.** Verifies every `FROM` line is digest-pinned (`@sha256:...`); auto-bumping digests is out of scope (needs a trusted digest oracle). Un-pinned Dockerfiles are flagged in the PR body. |
+| GitHub Actions | **Read-only audit only.** Verifies every external `uses:` is SHA-pinned (40-char hex). Auto-bumping SHAs within-major is deferred to v2 (requires a Dependabot-style oracle). |
+
+**Outcomes:**
+
+- Anything bumped + tests pass -> branch `auto-apply/YYYY-MM-DD`, PR labeled `auto-apply`, ntfy notification fired, brain ingest posted (if `SHARED_BRAIN_TOKEN` secret is set).
+- Anything bumped + tests fail -> **draft** PR labeled `auto-apply-broken` for human triage. Not auto-closed.
+- Nothing bumped -> silent exit 0; no PR, no notification.
+
+**Enrollment** (per-repo opt-in):
+
+```bash
+touch /path/to/repo/.github/auto-apply-enabled
+git -C /path/to/repo add .github/auto-apply-enabled
+git -C /path/to/repo commit -m "chore: enroll in dev-standards auto-apply Layer A + B"
+git -C /path/to/repo push
+```
+
+`install.sh` deliberately does **not** create this file — Layer B is consequential enough that the admin must touch the file by hand.
+
+**Kill switch:**
+
+```bash
+rm /path/to/repo/.github/auto-apply-enabled
+git -C /path/to/repo commit -am "chore: disable dev-standards auto-apply"
+git -C /path/to/repo push
+```
+
+The next scheduled run will exit silently with a notice.
+
+**Required GitHub permissions / secrets:**
+
+- `permissions: { contents: write, pull-requests: write }` (declared in the workflow itself; no repo-side change needed).
+- `SHARED_BRAIN_TOKEN` (optional secret). If absent, the brain ingest step logs a notice and exits 0 — the workflow doesn't fail.
+
+### Supply chain rule
+
+Every `uses:` in both workflow templates is **SHA-pinned**, not tag-pinned. The pinned SHAs (and the human-readable version they map to) are:
+
+| Action | SHA (40-char) | Version |
+|---|---|---|
+| `actions/checkout` | `692973e3d937129bcbf40652eb9f2f61becf3332` | v4.1.7 |
+| `actions/setup-node` | `0a44ba7841725637a19e28fa30b79a866c81b0a6` | v4.0.4 |
+| `actions/setup-go` | `0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32` | v5.0.2 |
+| `actions/setup-python` | `f677139bbe7f9c59b41e40162b753c062f5d49a3` | v5.2.0 |
+| `peter-evans/create-pull-request` | `5e914681df9dc83aa4e4905692ca88beb2f9e91f` | v7.0.5 |
+
+Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack: never trust a moving tag. Bumps to these SHAs in dev-standards land via the same Layer B that the templates produce, once an oracle for action-SHA-within-major is built.
+
+### References
+
+- **Design:** shared-brain decision `81b962de-3e94-4d67-9093-7dbb5644094d`
+- **Critique that forced the pivot:** shared-brain knowledge `7b258d5c-dcf4-49e9-973a-5e92b951a019`
+- **Original (superseded) scope:** shared-brain knowledge `7af0b998-9cd8-4d45-b709-647aeaf3abac`
 
 ## Hygiene automation
 

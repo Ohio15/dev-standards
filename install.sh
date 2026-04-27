@@ -36,9 +36,14 @@ chmod +x \
   "$target/.githooks/pre-commit-size-guard.sh" \
   "$target/.githooks/pre-commit-secret-scan.sh"
 
-# CI workflow (size guard only; secret scan is local-pre-commit + GitHub
-# secret-scanning where available).
+# CI workflows.
+#   size-guard.yml      — always-on tracked-file size guard
+#   security-audit.yml  — Layer A: always-on dep-vuln gate (npm/go/python)
+#   dep-auto-apply.yml  — Layer B: weekly auto-apply cron (per-repo opt-in
+#                         via .github/auto-apply-enabled — NOT created here)
 cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
+cp "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
+cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
 # Templates: copy only if absent so we don't clobber repo-specific tuning.
 if [ ! -f "$target/.large-files-allowlist" ]; then
@@ -55,9 +60,17 @@ echo "  .githooks/pre-commit                  (chained dispatcher)"
 echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
 echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
 echo "  .github/workflows/size-guard.yml"
+echo "  .github/workflows/security-audit.yml  (Layer A — always on)"
+echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
 echo "  .large-files-allowlist                (if not present)"
 echo "  .gitleaks.toml                        (if not present)"
 echo "  git config core.hooksPath .githooks   (local)"
+echo
+echo "Layer B (weekly auto-apply) is OPT-IN per repo. To enable, create an"
+echo "empty enrollment file (NOT done by this installer):"
+echo "  touch $target/.github/auto-apply-enabled"
+echo "  git -C $target add .github/auto-apply-enabled"
+echo "Kill switch: rm that file and push."
 echo
 echo "Gitleaks must be installed on each developer's machine. Install instructions:"
 echo "  macOS:    brew install gitleaks"
