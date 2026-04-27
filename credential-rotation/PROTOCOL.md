@@ -8,6 +8,16 @@ When a credential leaks (committed to git, exposed in a log, suspected compromis
 - Search shared-brain access logs for usage of leaked-value prefixes (if logging exists).
 - Classify each secret: bearer / HMAC / DB password / signing key. Each has its own rotation pattern.
 
+## Phase 0.5 — Triage (NIST SP 800-61 §3.2.6)
+
+Before consumer inventory, classify and capture forensic state — destroying it later is a P7 risk:
+
+- **Severity classification**: tag the leak by NIST §3.2.6 axes. *Functional impact* (high/med/low — does the service still work?). *Information impact* (high/med/low — what data is exposed?). *Recoverability* (regular/supplemented/extended/not-recoverable).
+- **Forensic preservation**: capture the leaking commit's SHA, snapshot any relevant access logs (server-side), and record a timeline of detection. Do this BEFORE Phase 7 (`git filter-repo`) — once history is rewritten, evidence is gone.
+- **Incident record**: 1-2 lines into a session note or shared-brain entry. Single-user context is fine; the record exists for the next rotation drill.
+
+Skipping this phase = arriving at Phase 7 with no evidence and no severity baseline.
+
 ## Phase 1 — Consumer Inventory (search by VALUE, not env-var-name)
 Critical lesson: env-var-name search misses consumers using non-standard names. Always search by literal value across:
 - Windows: `D:/Projects/**`, `~/.mcp.json`, `~/.claude/**`, `~/.claude.json` (Claude Code), `~/.config/`, IDE storage (`%APPDATA%/Code/User`, etc.), git hooks dir, HKCU env vars, shell profiles, browser-saved passwords (manual)
