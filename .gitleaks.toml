@@ -1,0 +1,102 @@
+# gitleaks config for Ron-owned repos.
+#
+# Inherits the upstream gitleaks default ruleset (covers AWS keys, GCP keys,
+# GitHub PATs, Slack tokens/webhooks, Stripe, npm, JWTs, generic high-entropy
+# strings, etc.) and layers on patterns specific to this codebase: shared-brain
+# bearer tokens, Postgres passwords, webhook signing secrets, and the catch-all
+# `*_API_KEY=<value>` shape that recurs across .env files here.
+#
+# To use: copy to repo root as `.gitleaks.toml`. The pre-commit hook picks it
+# up automatically.
+#
+# Suppress a single false-positive line by appending a `gitleaks:allow` comment:
+#
+#     EXAMPLE_TOKEN = "abcd1234..."  # gitleaks:allow
+
+title = "dev-standards baseline"
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Ron-specific shaped secrets. Each rule pairs an env-var-name anchor with a
+# value-shape regex so we don't false-positive on the variable name alone.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "ron-mcp-api-key"
+description = "shared-brain MCP bearer token"
+regex = '''(?i)\bMCP_API_KEY\s*[:=]\s*["']?([A-Za-z0-9_\-]{24,})["']?'''
+secretGroup = 1
+keywords = ["mcp_api_key"]
+
+[[rules]]
+id = "ron-brain-pg-password"
+description = "shared-brain Postgres password"
+regex = '''(?i)\bBRAIN_PG_PASSWORD\s*[:=]\s*["']?([^\s"'#]{12,})["']?'''
+secretGroup = 1
+keywords = ["brain_pg_password"]
+
+[[rules]]
+id = "ron-webhook-secret"
+description = "Webhook signing secret (HMAC)"
+regex = '''(?i)\bWEBHOOK_SECRET\s*[:=]\s*["']?([A-Za-z0-9_\-+/=]{16,})["']?'''
+secretGroup = 1
+keywords = ["webhook_secret"]
+
+[[rules]]
+id = "ron-aibrowser-secret"
+description = "AIBrowser credential (any AIBROWSER_* key)"
+regex = '''(?i)\bAIBROWSER_[A-Z0-9_]+\s*[:=]\s*["']?([A-Za-z0-9_\-+/=]{16,})["']?'''
+secretGroup = 1
+keywords = ["aibrowser_"]
+
+[[rules]]
+id = "ron-gh-token"
+description = "GitHub token in non-standard slot (GH_TOKEN, GH_PAT, GH_RUNNER_TOKEN, etc.)"
+regex = '''(?i)\bGH_[A-Z0-9_]*(TOKEN|PAT|SECRET|KEY)\s*[:=]\s*["']?(gh[ps]_[A-Za-z0-9]{30,}|[A-Za-z0-9_\-]{30,})["']?'''
+secretGroup = 2
+keywords = ["gh_token", "gh_pat", "gh_secret", "gh_key"]
+
+[[rules]]
+id = "ron-generic-api-key-assignment"
+description = "Generic *_API_KEY= assignment with non-trivial value"
+# Catches MCP_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CF_API_KEY, etc.
+# Length floor 20 chars filters out placeholders like "changeme" or "xxx".
+regex = '''(?i)\b[A-Z][A-Z0-9_]*_API_KEY\s*[:=]\s*["']?([A-Za-z0-9_\-]{20,})["']?'''
+secretGroup = 1
+keywords = ["api_key"]
+
+[[rules]]
+id = "ron-anthropic-key"
+description = "Anthropic API key"
+regex = '''\b(sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_\-]{80,})\b'''
+secretGroup = 1
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "ron-openai-key"
+description = "OpenAI API key (legacy and project-scoped)"
+regex = '''\b(sk-(?:proj-)?[A-Za-z0-9_\-]{32,})\b'''
+secretGroup = 1
+keywords = ["sk-"]
+
+# ---------------------------------------------------------------------------
+# Allowlists: paths and patterns that are scanned but never reported.
+# ---------------------------------------------------------------------------
+
+[allowlist]
+description = "Project-wide allowlist for dev-standards baseline"
+
+# Don't flag the gitleaks config itself; the regexes contain the exact patterns
+# they're meant to catch.
+paths = [
+  '''(?i)\.gitleaks\.toml$''',
+  '''(?i)gitleaks\.toml\.template$''',
+]
+
+# Don't flag obvious example/placeholder values inside fixture and sample files.
+regexes = [
+  '''(?i)\b(example|sample|placeholder|changeme|your[_\-]?token|xxx+|0{8,}|f{8,}|deadbeef)\b''',
+  '''(?i)\bsk-(ant-)?(api|proj)[0-9]{2}?-?[Xx0]{10,}''',
+]
