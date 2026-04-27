@@ -1,3 +1,8 @@
 .DS_Store
 *.swp
 *.swo
+
+# Credential rotation artifacts — NEVER commit
+credential-rotation/replacements.txt
+credential-rotation/replacements*.txt
+**/replacements.txt
