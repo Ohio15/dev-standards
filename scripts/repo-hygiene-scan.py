@@ -354,12 +354,12 @@ def post_to_brain(summary: str, scan_date: str) -> tuple[bool, str]:
         return False, f"api-key file not found at {key_path}"
     api_key = key_path.read_text().strip()
     payload = {
-        "action": "ingest",
         "type": "observation",
         "tags": [f"hygiene-scan-{scan_date}", "automation", "dev-standards"],
         "content": summary[:8000],
         "importance": 0.6,
-        "source": "repo-hygiene-scan.py",
+        "domain": "implementation",
+        "project": "dev-standards",
     }
     body = json.dumps(payload)
     cmd = [
@@ -367,12 +367,16 @@ def post_to_brain(summary: str, scan_date: str) -> tuple[bool, str]:
         "-H", f"Authorization: Bearer {api_key}",
         "-H", "Content-Type: application/json",
         "-d", body,
-        "https://shared-brain.us/api/memory",
+        "https://shared-brain.us/api/memory/ingest",
     ]
     rc, out, err = run(cmd)
     if rc != 0:
         return False, f"curl rc={rc}: {err.strip()}"
-    return True, out.strip()[:200]
+    # The endpoint returns JSON on success; HTML on 404. Reject HTML.
+    out_stripped = out.strip()
+    if out_stripped.startswith("<"):
+        return False, f"non-JSON response: {out_stripped[:120]}"
+    return True, out_stripped[:200]
 
 
 def main() -> int:

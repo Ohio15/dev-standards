@@ -212,16 +212,19 @@ if [[ "$BRAIN_STORE" == "true" && "$DRY_RUN" != "true" ]]; then
     body=$(jq -n \
       --arg c "$summary_text" \
       --arg t "npm-audit-$SCAN_DATE" \
-      '{action:"ingest",type:"observation",tags:[$t,"automation","npm-audit"],content:$c,importance:0.65,source:"npm-audit-weekly.sh"}' \
+      '{type:"observation",tags:[$t,"automation","npm-audit"],content:$c,importance:0.65,domain:"security",project:"dev-standards"}' \
       2>/dev/null || echo '{}')
     if [[ "$body" != "{}" ]]; then
-      curl -sS -X POST \
+      resp=$(curl -sS -X POST \
         -H "Authorization: Bearer $api_key" \
         -H "Content-Type: application/json" \
         -d "$body" \
-        https://shared-brain.us/api/memory >/dev/null 2>&1 \
-        && echo "[brain-store ok]" >&2 \
-        || echo "[brain-store failed]" >&2
+        https://shared-brain.us/api/memory/ingest 2>&1)
+      if [[ "$resp" == \{* ]]; then
+        echo "[brain-store ok]" >&2
+      else
+        echo "[brain-store failed: ${resp:0:120}]" >&2
+      fi
     fi
   else
     echo "[brain-store skipped — no api-key at $KEY_FILE]" >&2
