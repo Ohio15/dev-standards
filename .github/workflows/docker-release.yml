@@ -74,11 +74,12 @@ on:
         type: string
         default: '{}'
         description: |
-          JSON object of secrets accessible to build_args ${secrets.X} placeholders.
+          JSON object of secrets accessible to build_args dollar-secrets placeholders.
           Reusable workflows cannot enumerate inherited secrets, so the caller
-          must opt in by passing `${{ toJson(secrets) }}` (or a curated subset).
-          Default `{}` means no ${secrets.X} placeholders are resolvable; any
-          such reference in build_args will fail the build with a clear error.
+          must opt in by passing the toJson(secrets) expression (or a curated subset).
+          Default empty-object means no dollar-secrets placeholders are resolvable;
+          any such reference in build_args will fail the build with a clear error.
+          See header comment for placeholder syntax.
 
 permissions:
   contents: read
