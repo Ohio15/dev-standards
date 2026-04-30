@@ -1,0 +1,239 @@
+name: lib-release
+
+# Reusable workflow for libraries / shared modules. No deploy step; just
+# gates, optional `npm publish`, and a GitHub Release with auto-generated
+# notes.
+#
+# On `push: tags: ['v*']` from a consumer repo:
+#   1. Run release-gates (tests, gitleaks, size-guard, npm-audit, tag-matches-version).
+#      Tag format + version match are enforced by the gates job; no extra step needed.
+#   2. Read consumer's release-config.yml `lib:` block.
+#   3. If `lib.npm_publish: true` and an NPM_TOKEN secret is present, publish to npm.
+#   4. Generate release notes from `lib.changelog` (if a section exists for this
+#      version) or fall back to `git log` since the previous tag.
+#   5. Publish a GitHub Release with the notes (prerelease=true on `-` tags).
+#
+# Schema: see release/SPEC.md in dev-standards.
+#
+# No ntfy publish: lib releases run entirely on cloud runners and ntfy is
+# LAN-only. The notify channel for libs is GitHub email + `gh release list`,
+# per SPEC.md non-goals.
+
+on:
+  workflow_call:
+    secrets:
+      NPM_TOKEN:
+        required: false
+        description: npm registry token. Required only when lib.npm_publish is true.
+
+permissions:
+  contents: write
+
+jobs:
+  gates:
+    # Absolute ref — `./` would resolve against the consumer repo when this
+    # workflow is called cross-repo, which fails. Pinned to @v1 so bug fixes
+    # propagate without consumer changes.
+    uses: Ohio15/dev-standards/.github/workflows/release-gates.yml@v1
+
+  read-lib-config:
+    needs: gates
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.parse.outputs.project }}
+      changelog_path: ${{ steps.parse.outputs.changelog_path }}
+      npm_publish: ${{ steps.parse.outputs.npm_publish }}
+      version: ${{ needs.gates.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_with_default() {
+            local path="$1" default="$2" val
+            val=$(yq "$path" release-config.yml)
+            if [ "$val" = "null" ] || [ -z "$val" ]; then echo "$default"; else echo "$val"; fi
+          }
+          project=$(read_with_default '.project' 'unknown')
+          # Per SPEC: `lib.changelog` is required for the lib surface (notes
+          # are pulled from it). Default to CHANGELOG.md if omitted; we
+          # tolerate the file not existing at runtime and fall back to git log.
+          changelog_path=$(read_with_default '.lib.changelog' 'CHANGELOG.md')
+          npm_publish=$(read_with_default '.lib.npm_publish' 'false')
+          {
+            echo "project=$project"
+            echo "changelog_path=$changelog_path"
+            echo "npm_publish=$npm_publish"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## lib-release configuration"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| project | $project |"
+            echo "| changelog | $changelog_path |"
+            echo "| npm_publish | $npm_publish |"
+            echo "| version | ${{ needs.gates.outputs.version }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  npm-publish:
+    needs: [gates, read-lib-config]
+    if: needs.read-lib-config.outputs.npm_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Verify NPM_TOKEN is configured
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::error::lib.npm_publish is true but NPM_TOKEN secret is not set on the consumer repo. Add the secret or set lib.npm_publish: false."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (if a build script exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `npm run build --if-present` only runs when the script exists,
+          # making the build step opt-in via package.json without requiring a
+          # release-config flag.
+          npm run build --if-present
+
+      - name: Publish to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Pre-release tags publish under the `next` dist-tag so consumers
+          # who track `latest` aren't surprised; full releases go to `latest`.
+          if [[ "$TAG" == *-* ]]; then
+            echo "publishing prerelease under dist-tag 'next'"
+            npm publish --access public --tag next
+          else
+            echo "publishing under dist-tag 'latest'"
+            npm publish --access public
+          fi
+
+  publish-release:
+    # Wait on npm-publish only when it's enabled; the `always()` + `result`
+    # guard lets us fail-fast if npm publish errored, but still run when
+    # npm_publish is false (in which case npm-publish was skipped).
+    needs: [gates, read-lib-config, npm-publish]
+    if: |
+      always() &&
+      needs.gates.result == 'success' &&
+      needs.read-lib-config.result == 'success' &&
+      (needs.npm-publish.result == 'success' || needs.npm-publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        env:
+          CHANGELOG_PATH: ${{ needs.read-lib-config.outputs.changelog_path }}
+          VERSION: ${{ needs.read-lib-config.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE=release-notes.md
+          : > "$NOTES_FILE"
+
+          # Try to slice the matching `## [vX.Y.Z]` or `## vX.Y.Z` or
+          # `## X.Y.Z` section out of the CHANGELOG. Stop at the next H2.
+          # Keep-a-Changelog format is the common shape; we accept several
+          # heading variants so consumers don't have to convert existing
+          # changelogs.
+          #
+          # Regex notes:
+          #   - `\[` / `\]` in awk string literals get downgraded to `[` / `]`
+          #     and the warning eats your weekend. Use `[[]` (char class
+          #     containing `[`) and `[]]` (char class containing `]`) instead.
+          #   - Literal dots in the version string are escaped to `[.]` via
+          #     gsub so `1.2.3` doesn't silently match `1X2X3`.
+          #   - Tail anchor allows ` `, end-of-line, or ` -` after the version
+          #     so `1.2.3` does NOT match `1.2.3-rc.1`.
+          extracted=0
+          if [ -f "$CHANGELOG_PATH" ]; then
+            # awk: print lines between the matching version header and the
+            # next ^## header (exclusive on both ends — we drop the heading
+            # itself since GitHub renders the tag as the title).
+            awk -v ver="$VERSION" '
+              BEGIN {
+                capture = 0
+                gsub(/\./, "[.]", ver)
+                pattern = "^## +[[]?v?" ver "[]]?( |$| -)"
+              }
+              /^## / {
+                if (capture) { exit }
+                if ($0 ~ pattern) {
+                  capture = 1
+                  next
+                }
+              }
+              capture { print }
+            ' "$CHANGELOG_PATH" > "$NOTES_FILE.tmp"
+            if [ -s "$NOTES_FILE.tmp" ]; then
+              # Trim leading/trailing blank lines.
+              awk 'NF { found = 1 } found' "$NOTES_FILE.tmp" \
+                | awk '{ lines[NR] = $0 } END { for (i = NR; i >= 1; i--) if (lines[i] != "") { last = i; break } for (i = 1; i <= last; i++) print lines[i] }' \
+                > "$NOTES_FILE"
+              extracted=1
+              echo "release notes extracted from $CHANGELOG_PATH section v$VERSION"
+            fi
+            rm -f "$NOTES_FILE.tmp"
+          fi
+
+          if [ "$extracted" -eq 0 ]; then
+            echo "no matching section in ${CHANGELOG_PATH:-<unset>} — falling back to commit log"
+            if PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+              echo "## Changes since ${PREV_TAG}" > "$NOTES_FILE"
+              echo "" >> "$NOTES_FILE"
+              git log "${PREV_TAG}..HEAD" --no-merges --pretty=format:"- %s (%h)" >> "$NOTES_FILE"
+            else
+              echo "## Initial release" > "$NOTES_FILE"
+              echo "" >> "$NOTES_FILE"
+              git log HEAD --no-merges --pretty=format:"- %s (%h)" >> "$NOTES_FILE"
+            fi
+          fi
+
+          echo "--- release notes ---"
+          cat "$NOTES_FILE"
+          echo "--- end ---"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          PRERELEASE_FLAG=""
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            --title "$TAG — ${{ needs.read-lib-config.outputs.project }}" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG \
+            --repo "$GITHUB_REPOSITORY"
+          echo "Release URL: $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"

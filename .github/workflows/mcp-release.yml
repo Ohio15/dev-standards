@@ -1,0 +1,446 @@
+name: mcp-release
+
+# Reusable workflow for MCP servers that ship as a Docker container AND have
+# client-side `~/.mcp.json` pins on dev machines.
+#
+# Logically extends docker-release: same gates + build + push + deploy +
+# health-check + rollback, plus a final post-deploy job that updates the
+# `pin_key`'s version field in any files listed in `mcp.client_pin_paths`
+# from release-config.yml. Pin updates run on the self-hosted nexus-deploy
+# runner because those `.mcp.json` files live on NEXUS / dev hosts, not in
+# the consumer repo.
+#
+# On `push: tags: ['v*']` from a consumer repo:
+#   1. Run release-gates (tests, gitleaks, size-guard, npm-audit, tag-matches-version).
+#   2. Build Docker image(s); push to ghcr.io/<owner>/<repo>:<tag> + :latest.
+#   3. On the self-hosted nexus-deploy runner: snapshot current image digests,
+#      `docker compose up -d` the new tag, run health check, rollback on fail.
+#   4. Update the `pin_key` version in each `mcp.client_pin_paths` file.
+#   5. Publish ntfy notification (success / rolled-back / failed).
+#
+# Schema: see release/SPEC.md in dev-standards.
+#
+# Per-repo prereqs:
+#   - Self-hosted runner labeled `nexus-deploy` registered against the consumer repo.
+#   - Compose file uses `image: ghcr.io/${{owner}}/${{repo}}-<svc>:${IMAGE_TAG:-latest}`.
+#   - Each pin path on the runner host is a JSON file containing
+#     `"<pin_key>": { ..., "version": "vX.Y.Z", ... }` somewhere in its tree.
+
+on:
+  workflow_call:
+    inputs:
+      ntfy_topic:
+        type: string
+        default: nexus-alerts
+        description: ntfy topic to publish release events to.
+      ntfy_host:
+        type: string
+        default: http://192.168.1.20:2586
+        description: ntfy base URL reachable from the self-hosted runner.
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  gates:
+    # Absolute ref — `./` would resolve against the consumer repo when this
+    # workflow is called cross-repo, which fails. Pinned to @v1 so bug fixes
+    # propagate without consumer changes.
+    uses: Ohio15/dev-standards/.github/workflows/release-gates.yml@v1
+
+  read-mcp-config:
+    needs: gates
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.parse.outputs.project }}
+      images: ${{ steps.parse.outputs.images }}
+      nexus_path: ${{ steps.parse.outputs.nexus_path }}
+      compose_file: ${{ steps.parse.outputs.compose_file }}
+      services: ${{ steps.parse.outputs.services }}
+      health_check_command: ${{ steps.parse.outputs.health_check_command }}
+      health_check_timeout: ${{ steps.parse.outputs.health_check_timeout }}
+      health_check_interval: ${{ steps.parse.outputs.health_check_interval }}
+      rollback_on_health_fail: ${{ steps.parse.outputs.rollback_on_health_fail }}
+      client_pin_paths: ${{ steps.parse.outputs.client_pin_paths }}
+      pin_key: ${{ steps.parse.outputs.pin_key }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_with_default() {
+            local path="$1" default="$2" val
+            val=$(yq "$path" release-config.yml)
+            if [ "$val" = "null" ] || [ -z "$val" ]; then echo "$default"; else echo "$val"; fi
+          }
+          project=$(read_with_default '.project' 'unknown')
+
+          # docker.images is required (mcp inherits the docker schema).
+          images_count=$(yq '.docker.images | length' release-config.yml)
+          if [ "$images_count" = "null" ] || [ "$images_count" -lt 1 ]; then
+            echo "::error::release-config.yml missing required field: docker.images (non-empty array)"
+            exit 1
+          fi
+          images=$(yq -o=json '.docker.images' release-config.yml | jq -c)
+
+          nexus_path=$(read_with_default '.docker.deploy.nexus_path' '')
+          compose_file=$(read_with_default '.docker.deploy.compose_file' 'docker-compose.yml')
+          services=$(yq -o=json '.docker.deploy.services // []' release-config.yml | jq -c)
+
+          # Health-check command is potentially multiline (yaml `|` block).
+          # GITHUB_OUTPUT requires single-line key=value, so base64-encode for
+          # transport; the deploy job decodes before exec.
+          raw_health_cmd=$(yq '.docker.deploy.health_check.command' release-config.yml)
+          if [ "$raw_health_cmd" = "null" ] || [ -z "$raw_health_cmd" ]; then
+            health_check_command=""
+          else
+            health_check_command=$(printf '%s' "$raw_health_cmd" | base64 -w0)
+          fi
+          health_check_timeout=$(read_with_default '.docker.deploy.health_check.timeout_seconds' '60')
+          health_check_interval=$(read_with_default '.docker.deploy.health_check.interval_seconds' '5')
+          rollback_on_health_fail=$(read_with_default '.docker.deploy.rollback_on_health_fail' 'true')
+
+          # MCP-specific. client_pin_paths is required for the surface.
+          paths_count=$(yq '.mcp.client_pin_paths | length' release-config.yml)
+          if [ "$paths_count" = "null" ] || [ "$paths_count" -lt 1 ]; then
+            echo "::error::release-config.yml missing required field: mcp.client_pin_paths (non-empty array)"
+            exit 1
+          fi
+          # JSON-encoded array (one path per element). May contain `~` — the
+          # update job expands it against $HOME on the self-hosted runner.
+          client_pin_paths=$(yq -o=json '.mcp.client_pin_paths' release-config.yml | jq -c)
+
+          pin_key=$(read_with_default '.mcp.pin_key' '')
+          if [ -z "$pin_key" ]; then
+            echo "::error::release-config.yml missing required field: mcp.pin_key"
+            exit 1
+          fi
+          # pin_key may contain `/` or `@` (e.g. `@n3xus/notify`). It is a
+          # JSON object key, not a path — passed verbatim into the updater.
+          # base64-encode to keep GITHUB_OUTPUT single-line and survive any
+          # reserved character that might appear in a future scoped name.
+          pin_key_b64=$(printf '%s' "$pin_key" | base64 -w0)
+
+          {
+            echo "project=$project"
+            echo "images=$images"
+            echo "nexus_path=$nexus_path"
+            echo "compose_file=$compose_file"
+            echo "services=$services"
+            echo "health_check_command=$health_check_command"
+            echo "health_check_timeout=$health_check_timeout"
+            echo "health_check_interval=$health_check_interval"
+            echo "rollback_on_health_fail=$rollback_on_health_fail"
+            echo "client_pin_paths=$client_pin_paths"
+            echo "pin_key=$pin_key_b64"
+          } >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: [gates, read-mcp-config]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJson(needs.read-mcp-config.outputs.images) }}
+    outputs:
+      version: ${{ needs.gates.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.image.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: |
+            ${{ matrix.image.name }}:v${{ needs.gates.outputs.version }}
+            ${{ matrix.image.name }}:latest
+            ${{ matrix.image.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          platforms: linux/amd64
+
+  deploy:
+    needs: [read-mcp-config, build-and-push]
+    runs-on: [self-hosted, nexus-deploy]
+    outputs:
+      deploy_status: ${{ steps.healthcheck.outputs.status }}
+      rolled_back: ${{ steps.rollback.outputs.rolled_back }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync nexus_path to tagged commit
+        shell: bash
+        env:
+          NEXUS_PATH: ${{ needs.read-mcp-config.outputs.nexus_path }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "${NEXUS_PATH}/.git" ]; then
+            echo "::error::${NEXUS_PATH} is not a git working tree — cannot sync"
+            exit 1
+          fi
+          cd "${NEXUS_PATH}"
+          git fetch --tags origin
+          git checkout "${TAG}"
+          echo "synced ${NEXUS_PATH} to ${TAG} ($(git rev-parse --short HEAD))"
+
+      - name: Record current image digests for rollback
+        id: snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ needs.read-mcp-config.outputs.nexus_path }}"
+          services_json='${{ needs.read-mcp-config.outputs.services }}'
+          rollback_pairs=""
+          for svc in $(echo "$services_json" | jq -r '.[]'); do
+            cid=$(docker compose -f "${{ needs.read-mcp-config.outputs.compose_file }}" ps -q "$svc" 2>/dev/null | head -1 || true)
+            if [ -n "$cid" ]; then
+              img=$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || echo "")
+              if [ -n "$img" ]; then
+                rollback_pairs+="${svc}=${img}"$'\n'
+                echo "snapshot: $svc -> $img"
+              fi
+            fi
+          done
+          echo "$rollback_pairs" > /tmp/rollback-${{ github.run_id }}.txt
+
+      - name: Deploy new image
+        id: deploy
+        shell: bash
+        env:
+          IMAGE_TAG: v${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "${{ needs.read-mcp-config.outputs.nexus_path }}"
+          services_json='${{ needs.read-mcp-config.outputs.services }}'
+          for svc in $(echo "$services_json" | jq -r '.[]'); do
+            docker compose -f "${{ needs.read-mcp-config.outputs.compose_file }}" pull "$svc"
+          done
+          for svc in $(echo "$services_json" | jq -r '.[]'); do
+            docker compose -f "${{ needs.read-mcp-config.outputs.compose_file }}" up -d --force-recreate "$svc"
+          done
+
+      - name: Health check
+        id: healthcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD_B64='${{ needs.read-mcp-config.outputs.health_check_command }}'
+          if [ -z "$CMD_B64" ]; then
+            echo "no health_check.command in release-config — skipping (set rollback_on_health_fail: false to silence)"
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CMD=$(printf '%s' "$CMD_B64" | base64 -d)
+          TIMEOUT=${{ needs.read-mcp-config.outputs.health_check_timeout }}
+          INTERVAL=${{ needs.read-mcp-config.outputs.health_check_interval }}
+          deadline=$((SECONDS + TIMEOUT))
+          while [ $SECONDS -lt $deadline ]; do
+            if bash -c "$CMD" >/dev/null 2>&1; then
+              echo "health check passed"
+              echo "status=healthy" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "  health check not ready, retrying in ${INTERVAL}s..."
+            sleep "$INTERVAL"
+          done
+          echo "::error::Health check failed after ${TIMEOUT}s"
+          echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Rollback on health failure
+        id: rollback
+        if: failure() && needs.read-mcp-config.outputs.rollback_on_health_fail == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::warning::Rolling back to previous image tags"
+          cd "${{ needs.read-mcp-config.outputs.nexus_path }}"
+          if [ ! -f /tmp/rollback-${{ github.run_id }}.txt ]; then
+            echo "::error::No rollback snapshot found — cannot roll back"
+            echo "rolled_back=failed-no-snapshot" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          while IFS='=' read -r svc img; do
+            [ -z "$svc" ] || [ -z "$img" ] && continue
+            tag="${img##*:}"
+            echo "rolling $svc back to $img (IMAGE_TAG=$tag)"
+            IMAGE_TAG="$tag" docker compose -f "${{ needs.read-mcp-config.outputs.compose_file }}" up -d --force-recreate "$svc"
+          done < /tmp/rollback-${{ github.run_id }}.txt
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup snapshot
+        if: always()
+        shell: bash
+        run: rm -f /tmp/rollback-${{ github.run_id }}.txt || true
+
+  update-client-pins:
+    # Only runs on a healthy deploy — never bump pins to point at an image
+    # that didn't come up. Runs on the self-hosted runner because the pin
+    # files live on NEXUS / dev hosts, not in any cloud-runner filesystem.
+    needs: [read-mcp-config, build-and-push, deploy]
+    if: needs.deploy.result == 'success' && needs.deploy.outputs.deploy_status != 'unhealthy'
+    runs-on: [self-hosted, nexus-deploy]
+    outputs:
+      updated_count: ${{ steps.update.outputs.updated_count }}
+      missing_paths: ${{ steps.update.outputs.missing_paths }}
+    steps:
+      - name: Update version pins in client mcp.json files
+        id: update
+        shell: bash
+        env:
+          PIN_PATHS_JSON: ${{ needs.read-mcp-config.outputs.client_pin_paths }}
+          PIN_KEY_B64: ${{ needs.read-mcp-config.outputs.pin_key }}
+          NEW_VERSION: v${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+          PIN_KEY=$(printf '%s' "$PIN_KEY_B64" | base64 -d)
+          echo "pin_key: ${PIN_KEY}"
+          echo "new_version: ${NEW_VERSION}"
+
+          # Use Python's json module instead of sed: the pin files are JSON,
+          # and a regex substitution is fragile when the same key name appears
+          # at multiple nesting levels or when adjacent keys also end in
+          # `"version": "..."`. The script:
+          #   - loads the JSON
+          #   - walks the tree looking for an object literally keyed PIN_KEY
+          #     (any depth) whose value is itself an object with a `version`
+          #     field, and updates that field to NEW_VERSION
+          #   - writes back atomically (temp file + rename) preserving 2-space
+          #     indent (the convention used by Claude / VS Code mcp.json)
+          # Idempotent: running twice with the same NEW_VERSION is a no-op.
+          updater=$(mktemp --suffix=.py)
+          cat > "$updater" <<'PY'
+          import json, os, sys, tempfile
+          path = sys.argv[1]
+          pin_key = sys.argv[2]
+          new_version = sys.argv[3]
+          with open(path, 'r', encoding='utf-8') as fh:
+              data = json.load(fh)
+          changed = 0
+          def walk(node):
+              global changed
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      if k == pin_key and isinstance(v, dict) and 'version' in v:
+                          if v['version'] != new_version:
+                              v['version'] = new_version
+                              changed += 1
+                      walk(v)
+              elif isinstance(node, list):
+                  for item in node:
+                      walk(item)
+          walk(data)
+          if changed == 0:
+              # Not an error — pin_key may not be present in every file (different
+              # mcp clients pin different subsets). Report and exit cleanly.
+              print(f"  no matching '{pin_key}' entry in {path}")
+              sys.exit(0)
+          tmp = tempfile.NamedTemporaryFile('w', encoding='utf-8', delete=False,
+                                             dir=os.path.dirname(path) or '.')
+          try:
+              json.dump(data, tmp, indent=2)
+              tmp.write('\n')
+              tmp.close()
+              os.replace(tmp.name, path)
+          except Exception:
+              os.unlink(tmp.name)
+              raise
+          print(f"  updated {changed} entr{'y' if changed == 1 else 'ies'} in {path}")
+          PY
+
+          updated_count=0
+          missing_paths=""
+          # Iterate the JSON array of pin paths, expanding `~` against $HOME.
+          while IFS= read -r raw_path; do
+            [ -z "$raw_path" ] && continue
+            # Expand `~` and `~/` (POSIX-portable; envsubst-free).
+            case "$raw_path" in
+              "~")    expanded="$HOME" ;;
+              "~/"*)  expanded="$HOME/${raw_path#~/}" ;;
+              *)      expanded="$raw_path" ;;
+            esac
+            if [ ! -f "$expanded" ]; then
+              echo "::warning::pin path not found on this runner: $expanded — skipping"
+              missing_paths+="${expanded};"
+              continue
+            fi
+            echo "processing $expanded"
+            python3 "$updater" "$expanded" "$PIN_KEY" "$NEW_VERSION"
+            updated_count=$((updated_count + 1))
+          done < <(echo "$PIN_PATHS_JSON" | jq -r '.[]')
+
+          rm -f "$updater"
+          echo "updated_count=$updated_count" >> "$GITHUB_OUTPUT"
+          echo "missing_paths=$missing_paths" >> "$GITHUB_OUTPUT"
+          {
+            echo "## mcp client pin update"
+            echo ""
+            echo "- pin_key: \`${PIN_KEY}\`"
+            echo "- new version: \`${NEW_VERSION}\`"
+            echo "- files processed: ${updated_count}"
+            if [ -n "$missing_paths" ]; then
+              echo "- missing paths: \`${missing_paths}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    needs: [read-mcp-config, build-and-push, deploy, update-client-pins]
+    if: always()
+    runs-on: [self-hosted, nexus-deploy]
+    steps:
+      - name: Publish ntfy
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT='${{ needs.read-mcp-config.outputs.project }}'
+          VERSION='v${{ needs.build-and-push.outputs.version }}'
+          DEPLOY_STATUS='${{ needs.deploy.outputs.deploy_status }}'
+          ROLLED_BACK='${{ needs.deploy.outputs.rolled_back }}'
+          DEPLOY_RESULT='${{ needs.deploy.result }}'
+          PIN_RESULT='${{ needs.update-client-pins.result }}'
+          PIN_COUNT='${{ needs.update-client-pins.outputs.updated_count }}'
+
+          if [ "$DEPLOY_RESULT" = "success" ] && [ "$PIN_RESULT" = "success" ]; then
+            TITLE="MCP ${PROJECT} ${VERSION} deployed + pins updated"
+            BODY="Container healthy on NEXUS; ${PIN_COUNT} client pin file(s) bumped."
+            PRIO="default"
+            TAGS="rocket,${PROJECT}"
+          elif [ "$DEPLOY_RESULT" = "success" ] && [ "$PIN_RESULT" != "success" ]; then
+            TITLE="MCP ${PROJECT} ${VERSION} deployed but pin update FAILED"
+            BODY="Container is healthy but client pins were not bumped — clients may still resolve old version. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            PRIO="high"
+            TAGS="warning,${PROJECT}"
+          elif [ "$ROLLED_BACK" = "true" ]; then
+            TITLE="MCP ${PROJECT} ${VERSION} rolled back"
+            BODY="Health check failed; reverted to previous image. Pins not updated."
+            PRIO="high"
+            TAGS="warning,${PROJECT}"
+          else
+            TITLE="MCP ${PROJECT} ${VERSION} deploy FAILED"
+            BODY="Deploy job failed; manual intervention required. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            PRIO="urgent"
+            TAGS="rotating_light,${PROJECT}"
+          fi
+
+          curl -fsS -X POST \
+            -H "Title: ${TITLE}" \
+            -H "Priority: ${PRIO}" \
+            -H "Tags: ${TAGS}" \
+            -d "${BODY}" \
+            "${{ inputs.ntfy_host }}/${{ inputs.ntfy_topic }}" >/dev/null
+          echo "ntfy: ${TITLE}"
