@@ -1,0 +1,267 @@
+name: release-gates
+
+# Reusable composite gate workflow. Called as a prereq from each surface
+# release workflow (electron-release, docker-release, mcp-release, lib-release).
+# Reads the consumer's release-config.yml to decide which gates run.
+# Any failure aborts the release.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label for gate jobs.
+      node_version:
+        type: string
+        default: '20'
+        description: Node version for tests + npm-audit.
+    outputs:
+      version:
+        description: Version asserted to match the pushed tag.
+        value: ${{ jobs.tag-matches-version.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  read-config:
+    runs-on: ${{ inputs.runs_on }}
+    outputs:
+      project: ${{ steps.parse.outputs.project }}
+      surface: ${{ steps.parse.outputs.surface }}
+      tests_enabled: ${{ steps.parse.outputs.tests_enabled }}
+      test_command: ${{ steps.parse.outputs.test_command }}
+      gitleaks_enabled: ${{ steps.parse.outputs.gitleaks_enabled }}
+      size_guard_enabled: ${{ steps.parse.outputs.size_guard_enabled }}
+      npm_audit_severity: ${{ steps.parse.outputs.npm_audit_severity }}
+      conventional_commits_enabled: ${{ steps.parse.outputs.conventional_commits_enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse release-config.yml
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f release-config.yml ]; then
+            echo "::error::release-config.yml not found at repo root."
+            exit 1
+          fi
+          # yq is preinstalled on ubuntu-latest runners.
+          project=$(yq '.project // "unknown"' release-config.yml)
+          surface=$(yq '.surface // ""' release-config.yml)
+          tests_enabled=$(yq '.gates.tests // true' release-config.yml)
+          test_command=$(yq '.gates.test_command // "npm test"' release-config.yml)
+          gitleaks_enabled=$(yq '.gates.gitleaks // true' release-config.yml)
+          size_guard_enabled=$(yq '.gates.size_guard // true' release-config.yml)
+          npm_audit_severity=$(yq '.gates.npm_audit // "high"' release-config.yml)
+          conventional_commits_enabled=$(yq '.gates.conventional_commits // false' release-config.yml)
+
+          if [ -z "$surface" ]; then
+            echo "::error::release-config.yml missing required field: surface"
+            exit 1
+          fi
+
+          {
+            echo "project=$project"
+            echo "surface=$surface"
+            echo "tests_enabled=$tests_enabled"
+            echo "test_command=$test_command"
+            echo "gitleaks_enabled=$gitleaks_enabled"
+            echo "size_guard_enabled=$size_guard_enabled"
+            echo "npm_audit_severity=$npm_audit_severity"
+            echo "conventional_commits_enabled=$conventional_commits_enabled"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## release-gates configuration"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| project | ${{ steps.parse.outputs.project }} |"
+            echo "| surface | ${{ steps.parse.outputs.surface }} |"
+            echo "| tests | ${{ steps.parse.outputs.tests_enabled }} (\`${{ steps.parse.outputs.test_command }}\`) |"
+            echo "| gitleaks | ${{ steps.parse.outputs.gitleaks_enabled }} |"
+            echo "| size_guard | ${{ steps.parse.outputs.size_guard_enabled }} |"
+            echo "| npm_audit | ${{ steps.parse.outputs.npm_audit_severity }} |"
+            echo "| conventional_commits | ${{ steps.parse.outputs.conventional_commits_enabled }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    needs: read-config
+    if: needs.read-config.outputs.tests_enabled == 'true'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+      - run: npm ci
+      - name: Run tests
+        run: ${{ needs.read-config.outputs.test_command }}
+
+  gitleaks:
+    needs: read-config
+    if: needs.read-config.outputs.gitleaks_enabled == 'true'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          GL_VERSION=8.18.4
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan tagged commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Scan from the start of the new commits introduced since the previous tag.
+          # If no previous tag exists, scan full history (initial release).
+          if PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+            echo "scanning ${PREV_TAG}..HEAD"
+            gitleaks detect --no-banner --redact --log-opts="${PREV_TAG}..HEAD"
+          else
+            echo "no previous tag — scanning full history"
+            gitleaks detect --no-banner --redact
+          fi
+
+  size-guard:
+    needs: read-config
+    if: needs.read-config.outputs.size_guard_enabled == 'true'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject tracked files larger than 10 MB
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX=$((10 * 1024 * 1024))
+          violations=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            allow=0
+            if [ -f ".large-files-allowlist" ]; then
+              while IFS= read -r pat; do
+                [[ "$pat" =~ ^[[:space:]]*# || -z "$pat" ]] && continue
+                if [[ "$f" == $pat || "$f" == ${pat%/}/* ]]; then allow=1; break; fi
+              done <".large-files-allowlist"
+            fi
+            [ "$allow" -eq 1 ] && continue
+            size=$(wc -c <"$f" 2>/dev/null || echo 0)
+            if [ "$size" -gt "$MAX" ]; then
+              violations+=$'\n'"  $f ($((size / 1024 / 1024)) MB)"
+            fi
+          done < <(git ls-files)
+          if [ -n "$violations" ]; then
+            echo "::error::Tracked files exceed 10 MB:$violations"
+            exit 1
+          fi
+
+  npm-audit:
+    needs: read-config
+    if: needs.read-config.outputs.npm_audit_severity != 'off'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Run npm audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "no package.json — skipping (set gates.npm_audit: off in release-config.yml to silence)"
+            exit 0
+          fi
+          npm audit --audit-level=${{ needs.read-config.outputs.npm_audit_severity }}
+
+  tag-matches-version:
+    needs: read-config
+    runs-on: ${{ inputs.runs_on }}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert tag matches package version
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$TAG_VERSION" = "$GITHUB_REF" ]; then
+            echo "::error::Workflow not triggered by a v* tag (GITHUB_REF=$GITHUB_REF)"
+            exit 1
+          fi
+
+          # Source of truth precedence: package.json -> pyproject.toml ->
+          # release-config.yml:version.
+          if [ -f package.json ]; then
+            PKG_VERSION=$(jq -r .version package.json)
+            SOURCE=package.json
+          elif [ -f pyproject.toml ]; then
+            PKG_VERSION=$(yq '.project.version // .tool.poetry.version' -p toml pyproject.toml)
+            SOURCE=pyproject.toml
+          else
+            PKG_VERSION=$(yq '.version // ""' release-config.yml)
+            SOURCE=release-config.yml
+          fi
+
+          if [ -z "$PKG_VERSION" ] || [ "$PKG_VERSION" = "null" ]; then
+            echo "::error::No version found in $SOURCE"
+            exit 1
+          fi
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match $SOURCE version $PKG_VERSION"
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓ tag v$TAG_VERSION matches $SOURCE version $PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+  conventional-commits-lint:
+    needs: read-config
+    if: needs.read-config.outputs.conventional_commits_enabled == 'true'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint commits since previous tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+            range="${PREV_TAG}..HEAD"
+          else
+            range="HEAD"
+          fi
+          fail=0
+          # Conventional Commits header: type(scope?)!?: subject
+          re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+'
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            # Skip merge commits.
+            case "$msg" in
+              "Merge "*) continue ;;
+            esac
+            if ! [[ "$msg" =~ $re ]]; then
+              echo "::error::Non-conventional commit: $msg"
+              fail=1
+            fi
+          done < <(git log "$range" --no-merges --pretty=format:"%s")
+          [ "$fail" -eq 0 ] || exit 1

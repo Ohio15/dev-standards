@@ -1,0 +1,182 @@
+name: electron-release
+
+# Reusable workflow for Electron desktop apps.
+# On `push: tags: ['v*']` from a consumer repo:
+#   1. Run release-gates (tests, gitleaks, size-guard, npm-audit, tag-matches-version).
+#   2. Build the app for each target in release-config.yml:electron.targets.
+#   3. Code-sign per target (no-op if signing block absent).
+#   4. Publish artifacts + latest.yml to a new GitHub Release.
+#
+# Schema: see release/SPEC.md in dev-standards.
+
+on:
+  workflow_call:
+    secrets:
+      WIN_CSC_LINK:
+        required: false
+        description: Base64-encoded Windows code-signing cert (.pfx).
+      WIN_CSC_KEY_PASSWORD:
+        required: false
+        description: Password for the Windows code-signing cert.
+      MAC_DEVELOPER_ID:
+        required: false
+        description: Apple Developer ID identity name for macOS signing.
+      APPLE_ID:
+        required: false
+      APPLE_APP_SPECIFIC_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  gates:
+    uses: ./.github/workflows/release-gates.yml
+
+  read-electron-config:
+    needs: gates
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.parse.outputs.project }}
+      targets: ${{ steps.parse.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=$(yq '.project // "unknown"' release-config.yml)
+          # Default to win-only if targets unspecified.
+          targets=$(yq -o=json '.electron.targets // ["win"]' release-config.yml | jq -c)
+          {
+            echo "project=$project"
+            echo "targets=$targets"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [gates, read-electron-config]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.read-electron-config.outputs.targets) }}
+    runs-on: ${{ matrix.target == 'win' && 'windows-latest' || (matrix.target == 'mac' && 'macos-latest' || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        shell: bash
+        run: npm run build
+
+      - name: Build installer (Windows)
+        if: matrix.target == 'win'
+        shell: bash
+        env:
+          # electron-builder reads CSC_LINK + CSC_KEY_PASSWORD when set.
+          # When secrets aren't configured the env vars are empty -> unsigned build.
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npx electron-builder --win --publish=never
+
+      - name: Build installer (macOS)
+        if: matrix.target == 'mac'
+        shell: bash
+        env:
+          CSC_NAME: ${{ secrets.MAC_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx electron-builder --mac --publish=never
+
+      - name: Build installer (Linux)
+        if: matrix.target == 'linux'
+        shell: bash
+        run: npx electron-builder --linux --publish=never
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-installer
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/*.dmg
+            release/*.dmg.blockmap
+            release/*.AppImage
+            release/*.deb
+            release/*.snap
+            release/latest*.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [gates, read-electron-config, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+            range="${PREV_TAG}..HEAD"
+            echo "## Changes since ${PREV_TAG}" > release-notes.md
+          else
+            range="HEAD"
+            echo "## Initial release" > release-notes.md
+          fi
+          echo "" >> release-notes.md
+          git log "$range" --no-merges --pretty=format:"- %s (%h)" >> release-notes.md
+
+      - name: Stage publishable artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p publish
+          # Keep .exe / .dmg / .AppImage / .deb / .snap + their .blockmap +
+          # latest*.yml files. Drop anything else (build logs, intermediate).
+          find artifacts -type f \( \
+            -name '*.exe' -o -name '*.exe.blockmap' \
+            -o -name '*.dmg' -o -name '*.dmg.blockmap' \
+            -o -name '*.AppImage' \
+            -o -name '*.deb' -o -name '*.snap' \
+            -o -name 'latest*.yml' \
+          \) -exec cp -v {} publish/ \;
+          ls -la publish/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          PRERELEASE_FLAG=""
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            publish/* \
+            --title "$TAG — ${{ needs.read-electron-config.outputs.project }}" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG \
+            --repo "$GITHUB_REPOSITORY"
+          echo "Release URL: $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
