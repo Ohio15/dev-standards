@@ -186,6 +186,17 @@ Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack:
 - **Critique that forced the pivot:** shared-brain knowledge `7b258d5c-dcf4-49e9-973a-5e92b951a019`
 - **Original (superseded) scope:** shared-brain knowledge `7af0b998-9cd8-4d45-b709-647aeaf3abac`
 
+## Runner registration
+
+`scripts/register-nexus-runner.sh` automates per-repo NEXUS self-hosted runner registration. Personal-account GitHub repos can't share runners across repositories, so each consumer of `docker-release.yml` (Sentinel, ToolVault, APM, OpenClaw, ClaudeGateway, …) needs its own dedicated runner. The script encodes the ~6-step toil — mint a registration token via `gh api`, ssh to NEXUS, bootstrap a fresh `~/actions-runner-<repo>/` from the canonical install's tarball + `svc.sh` shim, run `config.sh --unattended --replace` with the standard label set (`self-hosted,Linux,X64,<repo>,nexus-deploy`), install the systemd service, and verify the runner shows `online` via the API. It's idempotent: re-running against an already-registered runner unregisters and re-registers cleanly using a separately-minted remove token.
+
+```bash
+./scripts/register-nexus-runner.sh APM nexus-apm
+./scripts/register-nexus-runner.sh OpenClaw nexus-openclaw gpu,cuda   # extra labels optional
+```
+
+Requirements: `gh` authenticated with `repo` scope, ssh access to `ohio_@100.98.48.63` (Tailscale), and passwordless sudo on NEXUS. On success the script prints `<runner-name>: online` and exits 0; on any failure it prints `<runner-name>: ERROR: <reason>` and exits 1.
+
 ## Hygiene automation
 
 Two scripts under `scripts/` keep repos honest. Both are stdlib-only (Python 3.8+ / bash + jq + curl), idempotent, and side-effect-free on the scanned repos.
