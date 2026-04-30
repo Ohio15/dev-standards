@@ -14,7 +14,7 @@ name: docker-release
 #   - Self-hosted runner labeled `nexus-deploy` registered against the consumer repo.
 #     User-owned accounts cannot share runners across repos; each consumer registers
 #     its own runner pointing at the same NEXUS host.
-#   - Compose file uses `image: ghcr.io/${{owner}}/${{repo}}-<svc>:${IMAGE_TAG:-latest}`
+#   - Compose file uses `image: ghcr.io/<owner>/<repo>-<svc>:dollar-IMAGE_TAG-or-latest`
 #     so the deploy can swap tags atomically and roll back.
 #
 # ─── Build-arg substitution ──────────────────────────────────────────────────
@@ -28,7 +28,7 @@ name: docker-release
 #
 #   ${secrets.NAME}   → resolved from a secrets JSON the CALLER must supply
 #                       via the `build_secrets_json` workflow input
-#                       (e.g. `build_secrets_json: ${{ toJson(secrets) }}`).
+#                       (caller passes the toJson(secrets) expression).
 #                       Reusable workflows cannot enumerate inherited secrets,
 #                       so opt-in is required. Each substitution emits a
 #                       ::warning:: in the build log because the resulting
@@ -38,9 +38,10 @@ name: docker-release
 #                       case; consider multi-stage builds + BuildKit secrets
 #                       mounts instead when possible).
 #
-# Note: the placeholder syntax is intentionally `${name.X}`, NOT `${{ name.X }}`,
-# so the YAML expression engine ignores it at workflow-eval time and the
-# substitution happens in bash at build time after yq has read the config.
+# Note: the placeholder syntax is intentionally a single dollar-brace,
+# NOT GitHub Actions' double-brace expression syntax. This way the YAML
+# expression engine ignores it at workflow-eval time and the substitution
+# happens in bash at build time after yq has read the config.
 #
 # Plain literal values (no placeholder) pass straight through. `build_args` is
 # optional; consumers without bake-time config can omit it entirely.
