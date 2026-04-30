@@ -16,6 +16,48 @@ name: docker-release
 #     its own runner pointing at the same NEXUS host.
 #   - Compose file uses `image: ghcr.io/${{owner}}/${{repo}}-<svc>:${IMAGE_TAG:-latest}`
 #     so the deploy can swap tags atomically and roll back.
+#
+# ─── Build-arg substitution ──────────────────────────────────────────────────
+# Each `docker.images[*].build_args` map in release-config.yml is passed to
+# `docker/build-push-action`. Values support two placeholder forms that are
+# expanded at runtime BEFORE the image is built:
+#
+#   ${vars.NAME}      → resolved from GitHub Actions repo/org Variables.
+#                       Workflow reads `toJson(vars)` once at build time and
+#                       substitutes by key. Missing variables fail the build.
+#
+#   ${secrets.NAME}   → resolved from a secrets JSON the CALLER must supply
+#                       via the `build_secrets_json` workflow input
+#                       (e.g. `build_secrets_json: ${{ toJson(secrets) }}`).
+#                       Reusable workflows cannot enumerate inherited secrets,
+#                       so opt-in is required. Each substitution emits a
+#                       ::warning:: in the build log because the resulting
+#                       image bakes the secret in plaintext layers — anyone
+#                       who pulls can extract it. Use sparingly (private
+#                       package registry tokens are the typical legitimate
+#                       case; consider multi-stage builds + BuildKit secrets
+#                       mounts instead when possible).
+#
+# Note: the placeholder syntax is intentionally `${name.X}`, NOT `${{ name.X }}`,
+# so the YAML expression engine ignores it at workflow-eval time and the
+# substitution happens in bash at build time after yq has read the config.
+#
+# Plain literal values (no placeholder) pass straight through. `build_args` is
+# optional; consumers without bake-time config can omit it entirely.
+#
+# Example release-config.yml:
+#
+#   docker:
+#     images:
+#       - name: ghcr.io/ohio15/sentinel-frontend
+#         dockerfile: frontend/Dockerfile
+#         context: ./frontend
+#         build_args:
+#           VITE_API_URL: https://${vars.DOMAIN}/api
+#           VITE_WS_URL: wss://${vars.DOMAIN}/ws
+#           BUILD_REVISION: ${vars.GIT_SHA_SHORT}
+#           NPM_TOKEN: ${secrets.NPM_READ_TOKEN}   # warns: bakes into image
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_call:
@@ -28,6 +70,15 @@ on:
         type: string
         default: http://192.168.1.20:2586
         description: ntfy base URL reachable from the self-hosted runner.
+      build_secrets_json:
+        type: string
+        default: '{}'
+        description: |
+          JSON object of secrets accessible to build_args ${secrets.X} placeholders.
+          Reusable workflows cannot enumerate inherited secrets, so the caller
+          must opt in by passing `${{ toJson(secrets) }}` (or a curated subset).
+          Default `{}` means no ${secrets.X} placeholders are resolvable; any
+          such reference in build_args will fail the build with a clear error.
 
 permissions:
   contents: read
@@ -120,12 +171,158 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve build args (substitute ${vars.X} / ${secrets.X})
+        id: buildargs
+        shell: bash
+        env:
+          # toJson(vars) is always available in reusable workflows.
+          VARS_JSON: ${{ toJson(vars) }}
+          # Caller-supplied; default '{}' means no ${secrets.X} placeholders allowed.
+          SECRETS_JSON: ${{ inputs.build_secrets_json }}
+          # Matrix value is a JSON object (or null/empty when build_args omitted).
+          BUILD_ARGS_JSON: ${{ toJson(matrix.image.build_args) }}
+        run: |
+          set -euo pipefail
+
+          # Empty / null / missing build_args -> emit empty output, done.
+          if [ -z "${BUILD_ARGS_JSON}" ] \
+             || [ "${BUILD_ARGS_JSON}" = "null" ] \
+             || [ "${BUILD_ARGS_JSON}" = "{}" ]; then
+            echo "no build_args for this image"
+            # Multiline-safe empty output via heredoc.
+            {
+              echo "args<<EOF_BUILD_ARGS"
+              echo "EOF_BUILD_ARGS"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate VARS/SECRETS JSON early so the user sees a clear error rather
+          # than a cryptic jq failure mid-substitution.
+          echo "$VARS_JSON" | jq -e 'type == "object"' >/dev/null \
+            || { echo "::error::VARS_JSON is not a JSON object: $VARS_JSON"; exit 1; }
+          echo "$SECRETS_JSON" | jq -e 'type == "object"' >/dev/null \
+            || { echo "::error::build_secrets_json input is not a JSON object: $SECRETS_JSON"; exit 1; }
+
+          # Walk each build-arg key/value pair; substitute placeholders.
+          #
+          # Supported placeholders: ${vars.NAME} and ${secrets.NAME} where NAME
+          # matches [A-Z_][A-Z0-9_]*. Anything that does not match (e.g. a
+          # literal `${HOME}` with no dot, or a Dockerfile-style `$IMAGE_TAG`)
+          # is passed through unchanged.
+          #
+          # Substitution uses a Python helper rather than bash parameter
+          # expansion / sed because the values may contain '/', '&', and other
+          # regex metacharacters; Python's str.replace is byte-literal safe
+          # and the JSON parsing is simpler than juggling quoted jq output.
+          declare -a out_lines=()
+          # Export JSON blobs so the helper can read them from env (avoids
+          # passing potentially-secret values on argv).
+          export VARS_JSON SECRETS_JSON
+
+          # `keys_unsorted` preserves declaration order for stable build cache.
+          mapfile -t arg_keys < <(echo "$BUILD_ARGS_JSON" | jq -r 'keys_unsorted[]')
+          for k in "${arg_keys[@]}"; do
+            # Pull the raw value as a JSON string so we don't lose embedded
+            # newlines or quote characters; then decode it once via jq -r.
+            v=$(echo "$BUILD_ARGS_JSON" | jq -r --arg n "$k" '.[$n]')
+
+            resolved=$(BUILD_ARG_KEY="$k" BUILD_ARG_VAL="$v" python3 - <<'PY'
+          import json, os, re, sys
+
+          key = os.environ["BUILD_ARG_KEY"]
+          val = os.environ["BUILD_ARG_VAL"]
+          vars_json = json.loads(os.environ.get("VARS_JSON", "{}") or "{}")
+          secrets_json = json.loads(os.environ.get("SECRETS_JSON", "{}") or "{}")
+
+          # Match ${vars.NAME} / ${secrets.NAME} — NAME is uppercase + underscores.
+          PLACEHOLDER = re.compile(r"\$\{(vars|secrets)\.([A-Z_][A-Z0-9_]*)\}")
+          # Catch malformed placeholders for explicit error (e.g. ${vars.lowercase},
+          # ${var.X} typo). Anything else `${...}` without a dot is left alone.
+          ANY_DOTTED = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\.[^}]*\}")
+
+          substituted_any = False
+          secret_subs = []
+
+          def repl(match):
+              global substituted_any
+              kind, name = match.group(1), match.group(2)
+              src = vars_json if kind == "vars" else secrets_json
+              if name not in src:
+                  if kind == "vars":
+                      sys.stderr.write(
+                          f"::error::build_arg '{key}' references ${{vars.{name}}} but "
+                          f"no GitHub Actions Variable named '{name}' is defined for "
+                          f"this repo/org. Define it under Settings > Secrets and "
+                          f"variables > Actions > Variables, or remove the reference.\n"
+                      )
+                  else:
+                      sys.stderr.write(
+                          f"::error::build_arg '{key}' references ${{secrets.{name}}} "
+                          f"but the caller workflow did not pass it via "
+                          f"build_secrets_json. Add `build_secrets_json: "
+                          f"${{{{ toJson(secrets) }}}}` (or a curated subset) to the "
+                          f"caller's `with:` block, then ensure '{name}' is defined as "
+                          f"a repo/org secret.\n"
+                      )
+                  sys.exit(1)
+              substituted_any = True
+              if kind == "secrets":
+                  secret_subs.append(name)
+              return str(src[name])
+
+          resolved = PLACEHOLDER.sub(repl, val)
+
+          # Any dotted ${name.X} still present after valid subs is a typo or
+          # unsupported namespace — fail loudly rather than silently shipping it.
+          leftover = ANY_DOTTED.search(resolved)
+          if leftover:
+              sys.stderr.write(
+                  f"::error::build_arg '{key}' value contains an unrecognized "
+                  f"placeholder '{leftover.group(0)}'. Supported: ${{vars.NAME}} and "
+                  f"${{secrets.NAME}} where NAME is uppercase + underscores.\n"
+              )
+              sys.exit(1)
+
+          # Loud warning per secret substitution — baking a secret into an
+          # image leaks it to anyone who can pull.
+          for name in secret_subs:
+              sys.stderr.write(
+                  f"::warning::build_arg '{key}' had ${{secrets.{name}}} substituted "
+                  f"into it. The built image will contain this secret in its layers — "
+                  f"anyone who can pull the image can extract it. Confirm this is "
+                  f"intentional (e.g. private package registry token consumed at "
+                  f"build time and not retained); otherwise switch to BuildKit "
+                  f"`--mount=type=secret` or runtime env vars.\n"
+              )
+
+          # Status line to workflow log on stderr; resolved value on stdout.
+          status = "substituted" if substituted_any else "literal"
+          sys.stderr.write(f"build_arg {key}: {status}\n")
+          sys.stdout.write(resolved)
+          PY
+            )
+            out_lines+=("${k}=${resolved}")
+          done
+
+          # Emit as multiline output. Use a randomized heredoc delimiter to avoid
+          # any chance of collision with a substituted value containing 'EOF'.
+          DELIM="EOF_BUILDARGS_$(openssl rand -hex 8)"
+          {
+            echo "args<<${DELIM}"
+            for line in "${out_lines[@]}"; do
+              echo "$line"
+            done
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.image.name }}
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
           push: true
+          build-args: ${{ steps.buildargs.outputs.args }}
           tags: |
             ${{ matrix.image.name }}:v${{ needs.gates.outputs.version }}
             ${{ matrix.image.name }}:latest
@@ -142,6 +339,16 @@ jobs:
       rolled_back: ${{ steps.rollback.outputs.rolled_back }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Auth NEXUS docker daemon to GHCR for the duration of this deploy.
+          # GITHUB_TOKEN inherits the workflow's `permissions: packages: write`
+          # so the runner can pull private packages owned by the same account.
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Sync nexus_path to tagged commit
         shell: bash
@@ -231,6 +438,8 @@ jobs:
         id: rollback
         if: failure() && needs.read-docker-config.outputs.rollback_on_health_fail == 'true'
         shell: bash
+        env:
+          NEW_VERSION: v${{ needs.build-and-push.outputs.version }}
         run: |
           set -euo pipefail
           echo "::warning::Rolling back to previous image tags"
@@ -240,13 +449,33 @@ jobs:
             echo "rolled_back=failed-no-snapshot" >> "$GITHUB_OUTPUT"
             exit 1
           fi
+          rolled_any=false
           while IFS='=' read -r svc img; do
             [ -z "$svc" ] || [ -z "$img" ] && continue
+            # Image format: `<registry>/<repo>:<tag>` or `<repo>:<tag>` or just `<id>`.
+            # Skip rollback if the snapshot tag isn't a meaningful previous version:
+            #   - tag is `latest` (would re-pull the new release that was just published)
+            #   - tag matches NEW_VERSION (we'd just redeploy what failed)
+            #   - no `:` in img (locally-built untagged image, can't be re-pulled)
+            if [[ "$img" != *:* ]]; then
+              echo "::warning::skip rollback for $svc — snapshot image '$img' has no tag, can't pull"
+              continue
+            fi
             tag="${img##*:}"
+            if [ "$tag" = "latest" ] || [ "$tag" = "$NEW_VERSION" ]; then
+              echo "::warning::skip rollback for $svc — snapshot tag '$tag' is not a meaningful previous version (would redeploy or repull current). Manual intervention required."
+              continue
+            fi
             echo "rolling $svc back to $img (IMAGE_TAG=$tag)"
             IMAGE_TAG="$tag" docker compose -f "${{ needs.read-docker-config.outputs.compose_file }}" up -d --force-recreate "$svc"
+            rolled_any=true
           done < /tmp/rollback-${{ github.run_id }}.txt
-          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          if [ "$rolled_any" = "true" ]; then
+            echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rolled_back=skipped-no-meaningful-target" >> "$GITHUB_OUTPUT"
+            echo "::error::Deploy failed and no meaningful rollback target available. Containers are in their post-deploy state — manual intervention required."
+          fi
 
       - name: Cleanup snapshot
         if: always()

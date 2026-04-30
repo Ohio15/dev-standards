@@ -71,10 +71,40 @@ docker:
     - name: ghcr.io/ohio15/sentinel-backend
       dockerfile: server/Dockerfile
       context: ./server
-      build_args: {}            # optional, passed as --build-arg
+      # build_args is optional — omit entirely if no bake-time config needed.
     - name: ghcr.io/ohio15/sentinel-frontend
       dockerfile: frontend/Dockerfile
       context: ./frontend
+      # build_args: passed as --build-arg to docker build. Values support two
+      # placeholder forms expanded at runtime, before the image is built:
+      #
+      #   ${vars.NAME}     resolved from GitHub Actions repo/org Variables.
+      #                    Missing variables fail the build with a clear error.
+      #   ${secrets.NAME}  resolved from a secrets JSON the CALLER must opt
+      #                    into by passing `build_secrets_json: ${{ toJson(secrets) }}`
+      #                    to the reusable workflow. Each substitution emits a
+      #                    ::warning:: in the build log because the resulting
+      #                    image bakes the secret in plaintext layers — anyone
+      #                    who can pull it can extract the secret. Use sparingly
+      #                    (private package registry tokens are the typical
+      #                    legitimate case; prefer BuildKit `--mount=type=secret`
+      #                    when possible).
+      #
+      # NAME must match [A-Z_][A-Z0-9_]*. Plain literals (no placeholder) pass
+      # straight through. Dollar-brace expressions without a dot — e.g.
+      # `${HOME}` for Dockerfile-time shell expansion — are NOT interpreted by
+      # the substitution layer and pass through as-is.
+      #
+      # Note: the syntax is `${name.X}`, NOT `${{ name.X }}`, so the YAML
+      # expression engine ignores it at workflow-eval time and substitution
+      # happens after release-config.yml is parsed at build time.
+      build_args:
+        VITE_API_URL: https://${vars.DOMAIN}/api
+        VITE_WS_URL: wss://${vars.DOMAIN}/ws
+        BUILD_REVISION: ${vars.GIT_SHA_SHORT}
+        STATIC_VAL: literal-value
+        # Rare: bake a secret into the image. Emits a ::warning:: per build.
+        # NPM_TOKEN: ${secrets.NPM_READ_TOKEN}
   deploy:
     nexus_path: ~/Sentinel      # cwd on NEXUS for `docker compose up -d`
     compose_file: docker-compose.yml
@@ -149,6 +179,29 @@ jobs:
 `@v1` is a moving major-version tag in dev-standards. Patch updates to the
 reusable workflow are picked up automatically; breaking changes ship as
 `@v2` and consumers migrate when they choose.
+
+### Build-arg secrets (docker / mcp surfaces)
+
+If the docker `build_args` block uses any `${secrets.X}` placeholders, the
+caller must opt in by forwarding the secrets context as a JSON input.
+Reusable workflows cannot enumerate `secrets: inherit` programmatically, so
+the caller has to make it explicit:
+
+```yaml
+jobs:
+  release:
+    uses: Ohio15/dev-standards/.github/workflows/docker-release.yml@v1
+    secrets: inherit
+    with:
+      # Required only if any build_args value references ${secrets.X}.
+      # Pass the whole secrets context, or curate a subset by hand.
+      build_secrets_json: ${{ toJson(secrets) }}
+```
+
+Without this input, any `${secrets.X}` reference in `build_args` fails the
+build with an explicit error pointing the user at this section. `${vars.X}`
+references work without any caller change because `vars` is always
+enumerable from inside the reusable workflow.
 
 ## Drift detection
 
