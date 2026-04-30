@@ -65,14 +65,23 @@ electron:
       notarize: true
 
 docker:
-  image: ghcr.io/ohio15/sentinel
-  dockerfile: Dockerfile
-  context: .
-  build_args: {}               # passed as --build-arg
+  # One or more images per release. Each is built in parallel on a cloud
+  # runner, tagged `:vX.Y.Z` + `:latest` + `:<sha>`, and pushed to GHCR.
+  images:
+    - name: ghcr.io/ohio15/sentinel-backend
+      dockerfile: server/Dockerfile
+      context: ./server
+      build_args: {}            # optional, passed as --build-arg
+    - name: ghcr.io/ohio15/sentinel-frontend
+      dockerfile: frontend/Dockerfile
+      context: ./frontend
   deploy:
-    nexus_path: ~/Sentinel     # cwd on NEXUS for `docker compose up -d`
+    nexus_path: ~/Sentinel      # cwd on NEXUS for `docker compose up -d`
     compose_file: docker-compose.yml
-    services: [frontend, backend]   # which services to roll
+    services: [backend, frontend]   # which services to roll. Compose entries
+                                # for these must use
+                                # `image: ghcr.io/<owner>/<repo>-<svc>:${IMAGE_TAG:-latest}`
+                                # so the deploy can swap tags atomically.
     health_check:
       command: curl -fsS http://localhost:3001/health
       timeout_seconds: 60

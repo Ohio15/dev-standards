@@ -42,9 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       project: ${{ steps.parse.outputs.project }}
-      image: ${{ steps.parse.outputs.image }}
-      dockerfile: ${{ steps.parse.outputs.dockerfile }}
-      context: ${{ steps.parse.outputs.context }}
+      images: ${{ steps.parse.outputs.images }}
       nexus_path: ${{ steps.parse.outputs.nexus_path }}
       compose_file: ${{ steps.parse.outputs.compose_file }}
       services: ${{ steps.parse.outputs.services }}
@@ -64,13 +62,15 @@ jobs:
             if [ "$val" = "null" ] || [ -z "$val" ]; then echo "$default"; else echo "$val"; fi
           }
           project=$(read_with_default '.project' 'unknown')
-          image=$(read_with_default '.docker.image' '')
-          if [ -z "$image" ]; then
-            echo "::error::release-config.yml missing required field: docker.image"
+
+          # docker.images is required; must be a non-empty array.
+          images_count=$(yq '.docker.images | length' release-config.yml)
+          if [ "$images_count" = "null" ] || [ "$images_count" -lt 1 ]; then
+            echo "::error::release-config.yml missing required field: docker.images (non-empty array)"
             exit 1
           fi
-          dockerfile=$(read_with_default '.docker.dockerfile' 'Dockerfile')
-          context=$(read_with_default '.docker.context' '.')
+          images=$(yq -o=json '.docker.images' release-config.yml | jq -c)
+
           nexus_path=$(read_with_default '.docker.deploy.nexus_path' '')
           compose_file=$(read_with_default '.docker.deploy.compose_file' 'docker-compose.yml')
           services=$(yq -o=json '.docker.deploy.services // []' release-config.yml | jq -c)
@@ -80,9 +80,7 @@ jobs:
           rollback_on_health_fail=$(read_with_default '.docker.deploy.rollback_on_health_fail' 'true')
           {
             echo "project=$project"
-            echo "image=$image"
-            echo "dockerfile=$dockerfile"
-            echo "context=$context"
+            echo "images=$images"
             echo "nexus_path=$nexus_path"
             echo "compose_file=$compose_file"
             echo "services=$services"
@@ -95,8 +93,11 @@ jobs:
   build-and-push:
     needs: [gates, read-docker-config]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJson(needs.read-docker-config.outputs.images) }}
     outputs:
-      image_ref: ${{ steps.meta.outputs.image_ref }}
       version: ${{ needs.gates.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -111,30 +112,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMAGE='${{ needs.read-docker-config.outputs.image }}'
-          VERSION='${{ needs.gates.outputs.version }}'
-          {
-            echo "image_ref=${IMAGE}:v${VERSION}"
-            echo "image_latest=${IMAGE}:latest"
-            echo "image_sha=${IMAGE}:${GITHUB_SHA::7}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
+      - name: Build and push ${{ matrix.image.name }}
         uses: docker/build-push-action@v5
         with:
-          context: ${{ needs.read-docker-config.outputs.context }}
-          file: ${{ needs.read-docker-config.outputs.dockerfile }}
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
           push: true
           tags: |
-            ${{ steps.meta.outputs.image_ref }}
-            ${{ steps.meta.outputs.image_latest }}
-            ${{ steps.meta.outputs.image_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ matrix.image.name }}:v${{ needs.gates.outputs.version }}
+            ${{ matrix.image.name }}:latest
+            ${{ matrix.image.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
           platforms: linux/amd64
 
   deploy:
