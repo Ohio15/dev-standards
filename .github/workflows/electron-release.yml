@@ -85,10 +85,19 @@ jobs:
         shell: bash
         env:
           # electron-builder reads CSC_LINK + CSC_KEY_PASSWORD when set.
-          # When secrets aren't configured the env vars are empty -> unsigned build.
+          # An empty CSC_LINK is interpreted as a path ('') and fails — must
+          # be unset, not empty. Secrets fall through to env as empty when
+          # not configured, so we explicitly unset on empty.
           CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
-        run: npx electron-builder --win --publish=never
+        run: |
+          if [ -z "${CSC_LINK:-}" ]; then
+            unset CSC_LINK CSC_KEY_PASSWORD
+            echo "no signing cert configured — building unsigned"
+          else
+            echo "signing cert present — signed build"
+          fi
+          npx electron-builder --win --publish=never
 
       - name: Build installer (macOS)
         if: matrix.target == 'mac'
@@ -98,7 +107,12 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx electron-builder --mac --publish=never
+        run: |
+          if [ -z "${CSC_NAME:-}" ]; then
+            unset CSC_NAME APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+            echo "no Apple Developer ID configured — building unsigned"
+          fi
+          npx electron-builder --mac --publish=never
 
       - name: Build installer (Linux)
         if: matrix.target == 'linux'
