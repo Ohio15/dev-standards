@@ -135,6 +135,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Sync nexus_path to tagged commit
+        shell: bash
+        env:
+          NEXUS_PATH: ${{ needs.read-docker-config.outputs.nexus_path }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "${NEXUS_PATH}/.git" ]; then
+            echo "::error::${NEXUS_PATH} is not a git working tree — cannot sync"
+            exit 1
+          fi
+          cd "${NEXUS_PATH}"
+          git fetch --tags origin
+          git checkout "${TAG}"
+          echo "synced ${NEXUS_PATH} to ${TAG} ($(git rev-parse --short HEAD))"
+
       - name: Record current image digests for rollback
         id: snapshot
         shell: bash
