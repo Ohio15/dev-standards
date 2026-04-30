@@ -33,7 +33,10 @@ permissions:
 
 jobs:
   gates:
-    uses: ./.github/workflows/release-gates.yml
+    # Absolute ref — `./` would resolve against the consumer repo when this
+    # workflow is called cross-repo, which fails. Pinned to @v1 (moving
+    # major tag) so bug fixes propagate without consumer changes.
+    uses: Ohio15/dev-standards/.github/workflows/release-gates.yml@v1
 
   read-electron-config:
     needs: gates
