@@ -74,7 +74,15 @@ jobs:
           nexus_path=$(read_with_default '.docker.deploy.nexus_path' '')
           compose_file=$(read_with_default '.docker.deploy.compose_file' 'docker-compose.yml')
           services=$(yq -o=json '.docker.deploy.services // []' release-config.yml | jq -c)
-          health_check_command=$(read_with_default '.docker.deploy.health_check.command' '')
+          # Health-check command is potentially multiline (yaml `|` block).
+          # GITHUB_OUTPUT requires single-line key=value, so base64-encode for
+          # transport; the deploy job decodes before exec. Empty -> empty.
+          raw_health_cmd=$(yq '.docker.deploy.health_check.command' release-config.yml)
+          if [ "$raw_health_cmd" = "null" ] || [ -z "$raw_health_cmd" ]; then
+            health_check_command=""
+          else
+            health_check_command=$(printf '%s' "$raw_health_cmd" | base64 -w0)
+          fi
           health_check_timeout=$(read_with_default '.docker.deploy.health_check.timeout_seconds' '60')
           health_check_interval=$(read_with_default '.docker.deploy.health_check.interval_seconds' '5')
           rollback_on_health_fail=$(read_with_default '.docker.deploy.rollback_on_health_fail' 'true')
@@ -196,12 +204,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CMD='${{ needs.read-docker-config.outputs.health_check_command }}'
-          if [ -z "$CMD" ]; then
+          CMD_B64='${{ needs.read-docker-config.outputs.health_check_command }}'
+          if [ -z "$CMD_B64" ]; then
             echo "no health_check.command in release-config — skipping (set rollback_on_health_fail: false to silence)"
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          CMD=$(printf '%s' "$CMD_B64" | base64 -d)
           TIMEOUT=${{ needs.read-docker-config.outputs.health_check_timeout }}
           INTERVAL=${{ needs.read-docker-config.outputs.health_check_interval }}
           deadline=$((SECONDS + TIMEOUT))
