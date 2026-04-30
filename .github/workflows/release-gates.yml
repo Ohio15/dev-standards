@@ -49,14 +49,27 @@ jobs:
             exit 1
           fi
           # yq is preinstalled on ubuntu-latest runners.
-          project=$(yq '.project // "unknown"' release-config.yml)
-          surface=$(yq '.surface // ""' release-config.yml)
-          tests_enabled=$(yq '.gates.tests // true' release-config.yml)
-          test_command=$(yq '.gates.test_command // "npm test"' release-config.yml)
-          gitleaks_enabled=$(yq '.gates.gitleaks // true' release-config.yml)
-          size_guard_enabled=$(yq '.gates.size_guard // true' release-config.yml)
-          npm_audit_severity=$(yq '.gates.npm_audit // "high"' release-config.yml)
-          conventional_commits_enabled=$(yq '.gates.conventional_commits // false' release-config.yml)
+          # Read each value, default to a literal default when the key is null
+          # (yq's `// default` returns the literal "null" string for missing
+          # keys, not the default — we handle that explicitly here so a key
+          # set to `false` doesn't get coerced to the default `true`).
+          read_with_default() {
+            local path="$1" default="$2" val
+            val=$(yq "$path" release-config.yml)
+            if [ "$val" = "null" ] || [ -z "$val" ]; then
+              echo "$default"
+            else
+              echo "$val"
+            fi
+          }
+          project=$(read_with_default '.project' 'unknown')
+          surface=$(read_with_default '.surface' '')
+          tests_enabled=$(read_with_default '.gates.tests' 'true')
+          test_command=$(read_with_default '.gates.test_command' 'npm test')
+          gitleaks_enabled=$(read_with_default '.gates.gitleaks' 'true')
+          size_guard_enabled=$(read_with_default '.gates.size_guard' 'true')
+          npm_audit_severity=$(read_with_default '.gates.npm_audit' 'high')
+          conventional_commits_enabled=$(read_with_default '.gates.conventional_commits' 'false')
 
           if [ -z "$surface" ]; then
             echo "::error::release-config.yml missing required field: surface"
