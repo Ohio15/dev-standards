@@ -535,10 +535,20 @@ jobs:
             TAGS="rotating_light,${PROJECT}"
           fi
 
-          curl -fsS -X POST \
-            -H "Title: ${TITLE}" \
-            -H "Priority: ${PRIO}" \
-            -H "Tags: ${TAGS}" \
-            -d "${BODY}" \
-            "${{ inputs.ntfy_host }}/${{ inputs.ntfy_topic }}" >/dev/null
-          echo "ntfy: ${TITLE}"
+          # Best-effort publish. ntfy is an alert side-channel, not a deploy
+          # guarantee — when the topic is unreachable (host down, DNS fail,
+          # 5xx) we surface a workflow warning but never fail the run. The
+          # deploy success signal is owned by the `deploy` job's result, not
+          # by whether the alert was delivered.
+          if curl -fsS -X POST \
+               -H "Title: ${TITLE}" \
+               -H "Priority: ${PRIO}" \
+               -H "Tags: ${TAGS}" \
+               -d "${BODY}" \
+               "${{ inputs.ntfy_host }}/${{ inputs.ntfy_topic }}" >/dev/null; then
+            echo "ntfy: ${TITLE}"
+          else
+            rc=$?
+            echo "::warning::ntfy publish failed (curl exit $rc) to ${{ inputs.ntfy_host }}/${{ inputs.ntfy_topic }}. Deploy result is unaffected."
+            echo "ntfy: SKIPPED (publish failed) - ${TITLE}"
+          fi
