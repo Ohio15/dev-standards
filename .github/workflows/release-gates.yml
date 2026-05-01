@@ -278,3 +278,311 @@ jobs:
             fi
           done < <(git log "$range" --no-merges --pretty=format:"%s")
           [ "$fail" -eq 0 ] || exit 1
+
+  # IMPL-5 — version-uniqueness gate.
+  # Structural rule (no input toggle). Motivating scar: APM v0.9.2 had two
+  # version.json files (root=0.9.2, server/=0.9.1). Gate-green + runtime-wrong.
+  # This gate makes that state impossible by construction.
+  version-uniqueness:
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert all version.json files agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Find every version.json, excluding common build/vendor/VCS dirs.
+          mapfile -t files < <(find . -type f -name version.json \
+            -not -path './node_modules/*' \
+            -not -path '*/node_modules/*' \
+            -not -path './vendor/*' \
+            -not -path '*/vendor/*' \
+            -not -path './.git/*' \
+            -not -path './dist/*' \
+            -not -path '*/dist/*' \
+            -not -path './build/*' \
+            -not -path '*/build/*' \
+            -not -path './target/*' \
+            -not -path '*/target/*')
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no version.json files found — nothing to compare"
+            exit 0
+          fi
+
+          if [ "${#files[@]}" -eq 1 ]; then
+            v=$(jq -r .version "${files[0]}")
+            echo "single version.json: ${files[0]} = $v"
+            exit 0
+          fi
+
+          # Multiple files — extract every value and compare.
+          declare -a pairs
+          first=""
+          divergent=0
+          for f in "${files[@]}"; do
+            v=$(jq -r .version "$f")
+            pairs+=("  $f : $v")
+            if [ -z "$first" ]; then
+              first="$v"
+            elif [ "$v" != "$first" ]; then
+              divergent=1
+            fi
+          done
+
+          if [ "$divergent" -eq 1 ]; then
+            echo "::error::version.json drift detected"
+            for p in "${pairs[@]}"; do
+              echo "$p"
+            done
+            exit 1
+          fi
+
+          {
+            echo "## version-uniqueness"
+            echo ""
+            echo "All ${#files[@]} version.json files agree on \`$first\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # IMPL-7 — Go vulnerability gate (warn-mode soak ends 2026-05-15).
+  # To flip to blocking after the soak: remove `continue-on-error: true` below
+  # and delete this comment block.
+  # Motivating scar: APM had 1 critical (pgx memory-safety) + 7 high Go-side
+  # CVEs invisible to the npm-only `npm_audit` gate.
+  govulncheck:
+    runs-on: ${{ inputs.runs_on }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Go modules
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t mods < <(find . -type f -name go.mod \
+            -not -path './vendor/*' \
+            -not -path '*/vendor/*' \
+            -not -path './.git/*')
+          if [ "${#mods[@]}" -eq 0 ]; then
+            echo "no go.mod found — skipping govulncheck"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${mods[@]}" > /tmp/go-mods.txt
+          echo "Go modules detected:"
+          cat /tmp/go-mods.txt
+
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.found == 'true'
+        with:
+          go-version: 'stable'
+
+      - name: Install govulncheck
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run govulncheck on every module
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r mod; do
+            dir=$(dirname "$mod")
+            echo "::group::govulncheck $dir"
+            if ! ( cd "$dir" && govulncheck ./... ); then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < /tmp/go-mods.txt
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::govulncheck found call-graph-reachable vulnerabilities"
+            exit 1
+          fi
+
+  # IMPL-7 — Python vulnerability gate (warn-mode soak ends 2026-05-15).
+  # To flip to blocking after the soak: remove `continue-on-error: true` below
+  # and delete this comment block.
+  # Motivating scar: same as govulncheck — Python deps invisible to npm_audit.
+  pip_audit:
+    runs-on: ${{ inputs.runs_on }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Python dependency manifests
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/py-manifests.txt
+          # requirements*.txt anywhere
+          find . -type f \( -name 'requirements.txt' -o -name 'requirements-*.txt' -o -name 'requirements_*.txt' \) \
+            -not -path './node_modules/*' -not -path '*/node_modules/*' \
+            -not -path './vendor/*' -not -path '*/vendor/*' \
+            -not -path './.git/*' \
+            -not -path './dist/*' -not -path '*/dist/*' \
+            -not -path './build/*' -not -path '*/build/*' \
+            >> /tmp/py-manifests.txt || true
+          # Pipfile / pyproject.toml / poetry.lock
+          find . -type f \( -name 'Pipfile' -o -name 'pyproject.toml' -o -name 'poetry.lock' \) \
+            -not -path './node_modules/*' -not -path '*/node_modules/*' \
+            -not -path './vendor/*' -not -path '*/vendor/*' \
+            -not -path './.git/*' \
+            -not -path './dist/*' -not -path '*/dist/*' \
+            -not -path './build/*' -not -path '*/build/*' \
+            >> /tmp/py-manifests.txt || true
+
+          if [ ! -s /tmp/py-manifests.txt ]; then
+            echo "no Python dependency manifests found — skipping pip-audit"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "Python manifests detected:"
+          cat /tmp/py-manifests.txt
+
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.found == 'true'
+        with:
+          python-version: '3.x'
+
+      - name: Install pip-audit
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pip-audit
+
+      - name: Run pip-audit on every manifest
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # Deduplicate: pyproject.toml + poetry.lock at the same dir audit once.
+          # We resolve each manifest to its dir and the manifest type, then audit.
+          declare -A seen_dirs
+          while IFS= read -r manifest; do
+            [ -z "$manifest" ] && continue
+            base=$(basename "$manifest")
+            dir=$(dirname "$manifest")
+            case "$base" in
+              requirements*.txt)
+                echo "::group::pip-audit -r $manifest"
+                if ! pip-audit --strict --vulnerability-service osv -r "$manifest"; then
+                  fail=1
+                fi
+                echo "::endgroup::"
+                ;;
+              Pipfile|pyproject.toml|poetry.lock)
+                key="$dir"
+                if [ -n "${seen_dirs[$key]:-}" ]; then continue; fi
+                seen_dirs[$key]=1
+                echo "::group::pip-audit project $dir"
+                if ! ( cd "$dir" && pip-audit --strict --vulnerability-service osv ); then
+                  fail=1
+                fi
+                echo "::endgroup::"
+                ;;
+            esac
+          done < /tmp/py-manifests.txt
+
+          # pip-audit's severity model is per-vuln; --strict ensures non-zero
+          # exit on any finding. We treat any high+critical as a fail; pip-audit
+          # itself reports all findings — we filter at the gate level by parsing
+          # if needed. For the warn-mode soak we surface every finding.
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::pip-audit found vulnerabilities (high/critical block in non-warn mode)"
+            exit 1
+          fi
+
+  # IMPL-7 — Rust vulnerability gate (warn-mode soak ends 2026-05-15).
+  # To flip to blocking after the soak: remove `continue-on-error: true` below
+  # and delete this comment block.
+  # Motivating scar: same blind-spot pattern as Go/Python — Cargo deps invisible
+  # to the npm-only audit.
+  cargo_audit:
+    runs-on: ${{ inputs.runs_on }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Cargo manifests
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t cargos < <(find . -type f -name Cargo.toml \
+            -not -path './node_modules/*' -not -path '*/node_modules/*' \
+            -not -path './vendor/*' -not -path '*/vendor/*' \
+            -not -path './.git/*' \
+            -not -path './target/*' -not -path '*/target/*' \
+            -not -path './dist/*' -not -path '*/dist/*' \
+            -not -path './build/*' -not -path '*/build/*')
+          if [ "${#cargos[@]}" -eq 0 ]; then
+            echo "no Cargo.toml found — skipping cargo-audit"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${cargos[@]}" > /tmp/cargo-manifests.txt
+          echo "Cargo manifests detected:"
+          cat /tmp/cargo-manifests.txt
+
+      - name: Install cargo-audit
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-audit ships as a static binary via rustsec releases.
+          CA_VERSION=0.21.1
+          curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CA_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}.tgz" \
+            | tar -xz -C /tmp
+          install -m 0755 "/tmp/cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}/cargo-audit" /usr/local/bin/cargo-audit
+          cargo-audit --version
+
+      - name: Run cargo-audit on every manifest
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # cargo-audit operates on the lockfile next to each Cargo.toml.
+          # Workspace members share their workspace's Cargo.lock, so we
+          # deduplicate by the directory containing Cargo.lock.
+          declare -A seen_locks
+          while IFS= read -r manifest; do
+            [ -z "$manifest" ] && continue
+            dir=$(dirname "$manifest")
+            # Walk up to find the nearest Cargo.lock (workspace members share
+            # the workspace root's lockfile).
+            lockdir="$dir"
+            while [ "$lockdir" != "." ] && [ "$lockdir" != "/" ] && [ ! -f "$lockdir/Cargo.lock" ]; do
+              lockdir=$(dirname "$lockdir")
+            done
+            if [ ! -f "$lockdir/Cargo.lock" ]; then
+              echo "::warning::no Cargo.lock found alongside or above $manifest — skipping (a releasable Rust crate must commit Cargo.lock)"
+              continue
+            fi
+            key="$lockdir"
+            if [ -n "${seen_locks[$key]:-}" ]; then continue; fi
+            seen_locks[$key]=1
+            echo "::group::cargo-audit $lockdir/Cargo.lock"
+            if ! cargo-audit audit --file "$lockdir/Cargo.lock"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < /tmp/cargo-manifests.txt
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::cargo-audit found advisories"
+            exit 1
+          fi
