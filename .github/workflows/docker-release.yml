@@ -378,8 +378,13 @@ jobs:
             exit 1
           fi
           cd "${NEXUS_PATH}"
-          git fetch --tags origin
-          git checkout "${TAG}"
+          # --force: deploy hosts only consume tags, never publish them; if a
+          # local tag diverged from origin (older failed run, manual experiment)
+          # we want to overwrite, not abort. Without --force git refuses with
+          # `would clobber existing tag` and the deploy never reaches the
+          # IMAGE_TAG step.
+          git fetch --tags --force origin
+          git checkout --force "${TAG}"
           echo "synced ${NEXUS_PATH} to ${TAG} ($(git rev-parse --short HEAD))"
 
       - name: Record current image digests for rollback
