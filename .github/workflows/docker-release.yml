@@ -243,6 +243,20 @@ jobs:
           # ${var.X} typo). Anything else `${...}` without a dot is left alone.
           ANY_DOTTED = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\.[^}]*\}")
 
+          # Build dollar-brace placeholder strings via concatenation. GitHub
+          # Actions' workflow preprocessor scans this YAML's raw text — heredoc
+          # bodies included — for the literal `${` + `{` token before Python
+          # ever runs. Embedding `${vars.X}` patterns in f-string templates as
+          # the escape sequence `$` `{` `{` `vars.X` `}` `}` tripped 0s
+          # startup_failure on consumers. Composing from parts keeps the token
+          # out of the source.
+          _DB = "$" + "{"
+          _DBE = "$" + "{" + "{"
+          _DBE_END = "}" + "}"
+          def _ph_var(n):    return _DB + "vars."    + n + "}"
+          def _ph_secret(n): return _DB + "secrets." + n + "}"
+          _TOJSON_SECRETS = _DBE + " toJson(secrets) " + _DBE_END
+
           substituted_any = False
           secret_subs = []
 
@@ -253,17 +267,17 @@ jobs:
               if name not in src:
                   if kind == "vars":
                       sys.stderr.write(
-                          f"::error::build_arg '{key}' references ${{vars.{name}}} but "
+                          f"::error::build_arg '{key}' references {_ph_var(name)} but "
                           f"no GitHub Actions Variable named '{name}' is defined for "
                           f"this repo/org. Define it under Settings > Secrets and "
                           f"variables > Actions > Variables, or remove the reference.\n"
                       )
                   else:
                       sys.stderr.write(
-                          f"::error::build_arg '{key}' references ${{secrets.{name}}} "
+                          f"::error::build_arg '{key}' references {_ph_secret(name)} "
                           f"but the caller workflow did not pass it via "
                           f"build_secrets_json. Add `build_secrets_json: "
-                          f"${{{{ toJson(secrets) }}}}` (or a curated subset) to the "
+                          f"{_TOJSON_SECRETS}` (or a curated subset) to the "
                           f"caller's `with:` block, then ensure '{name}' is defined as "
                           f"a repo/org secret.\n"
                       )
@@ -281,8 +295,8 @@ jobs:
           if leftover:
               sys.stderr.write(
                   f"::error::build_arg '{key}' value contains an unrecognized "
-                  f"placeholder '{leftover.group(0)}'. Supported: ${{vars.NAME}} and "
-                  f"${{secrets.NAME}} where NAME is uppercase + underscores.\n"
+                  f"placeholder '{leftover.group(0)}'. Supported: {_ph_var('NAME')} and "
+                  f"{_ph_secret('NAME')} where NAME is uppercase + underscores.\n"
               )
               sys.exit(1)
 
@@ -290,7 +304,7 @@ jobs:
           # image leaks it to anyone who can pull.
           for name in secret_subs:
               sys.stderr.write(
-                  f"::warning::build_arg '{key}' had ${{secrets.{name}}} substituted "
+                  f"::warning::build_arg '{key}' had {_ph_secret(name)} substituted "
                   f"into it. The built image will contain this secret in its layers — "
                   f"anyone who can pull the image can extract it. Confirm this is "
                   f"intentional (e.g. private package registry token consumed at "
