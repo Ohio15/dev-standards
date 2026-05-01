@@ -31,10 +31,12 @@ mkdir -p "$target/.githooks" "$target/.github/workflows"
 cp "$here/hooks/pre-commit" "$target/.githooks/pre-commit"
 cp "$here/hooks/pre-commit-size-guard.sh" "$target/.githooks/pre-commit-size-guard.sh"
 cp "$here/hooks/pre-commit-secret-scan.sh" "$target/.githooks/pre-commit-secret-scan.sh"
+cp "$here/hooks/pre-commit-healthcheck-lint.sh" "$target/.githooks/pre-commit-healthcheck-lint.sh"
 chmod +x \
   "$target/.githooks/pre-commit" \
   "$target/.githooks/pre-commit-size-guard.sh" \
-  "$target/.githooks/pre-commit-secret-scan.sh"
+  "$target/.githooks/pre-commit-secret-scan.sh" \
+  "$target/.githooks/pre-commit-healthcheck-lint.sh"
 
 # CI workflows.
 #   size-guard.yml      — always-on tracked-file size guard
@@ -59,6 +61,7 @@ echo "Installed into $target"
 echo "  .githooks/pre-commit                  (chained dispatcher)"
 echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
 echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
+echo "  .githooks/pre-commit-healthcheck-lint.sh  (release-config.yml shape)"
 echo "  .github/workflows/size-guard.yml"
 echo "  .github/workflows/security-audit.yml  (Layer A — always on)"
 echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
