@@ -81,6 +81,19 @@ on:
           Default empty-object means no dollar-secrets placeholders are resolvable;
           any such reference in build_args will fail the build with a clear error.
           See header comment for placeholder syntax.
+      version_probe_url:
+        type: string
+        default: ''
+        description: |
+          Optional URL the post-deploy version-match probe (IMPL-15) hits to
+          assert the running binary's reported version equals the tag that was
+          just deployed. The URL must return JSON with a `.version` field
+          (STANDARDS section 8 / IMPL-26). Typical value:
+          `http://localhost:<port>/api/health` — runs from the nexus-deploy
+          self-hosted runner, so localhost is the deploy host.
+          Empty (the default) means the probe is skipped with a `::warning::`,
+          which is intentional during the soak window so consumers without an
+          IMPL-26-compliant /health shape are not auto-blocked.
 
 permissions:
   contents: read
@@ -454,6 +467,80 @@ jobs:
           echo "::error::Health check failed after ${TIMEOUT}s"
           echo "status=unhealthy" >> "$GITHUB_OUTPUT"
           exit 1
+
+      - name: Verify deployed version (IMPL-15 post-deploy probe)
+        id: version_probe
+        # Runs only if Health check succeeded (default `success()` condition).
+        # Pure addition — does not change Health check or Rollback behavior.
+        #
+        # Rollout discipline (soak window 2026-05-01 → 2026-05-15):
+        #   - Probe-skip (no URL configured) → `::warning::`, exit 0.
+        #   - /health response missing `.version` field → `::warning::`, exit 0.
+        #   - Version mismatch → `::warning::`, exit 0  ← FLIP TO `::error::`,
+        #     exit 1 on or after 2026-05-15 once IMPL-26 (standard /health
+        #     shape) has propagated and consumers with multiple version.json
+        #     files (IMPL-5 root-cause class) have migrated.
+        # Search this file for "SOAK_END_2026-05-15" when flipping.
+        shell: bash
+        env:
+          PROBE_URL: ${{ inputs.version_probe_url }}
+          NEXUS_PATH: ${{ needs.read-docker-config.outputs.nexus_path }}
+          EXPECTED_VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROBE_URL}" ]; then
+            echo "::warning::version_probe_url not set on caller workflow — post-deploy version-match probe (IMPL-15) skipped. Add `version_probe_url: http://localhost:<port>/api/health` to the caller's \`with:\` block to enable. See dev-standards STANDARDS section 8."
+            echo "status=skipped-no-url" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve expected version from the synced nexus_path's version.json
+          # rather than trusting the build-and-push output blindly. The
+          # checked-out tag on NEXUS is the source of truth at deploy time;
+          # if it disagrees with build-and-push.outputs.version that itself is
+          # a bug worth surfacing.
+          VERSION_FILE="${NEXUS_PATH}/version.json"
+          if [ ! -f "${VERSION_FILE}" ]; then
+            echo "::warning::No version.json at ${VERSION_FILE} — falling back to build job output (${EXPECTED_VERSION}). Add a root version.json (STANDARDS section 3)."
+            EXPECTED="${EXPECTED_VERSION}"
+          else
+            EXPECTED=$(jq -r '.version // empty' "${VERSION_FILE}")
+            if [ -z "${EXPECTED}" ]; then
+              echo "::warning::version.json at ${VERSION_FILE} has no .version field — falling back to build job output (${EXPECTED_VERSION})."
+              EXPECTED="${EXPECTED_VERSION}"
+            fi
+          fi
+
+          # Probe the runtime /health endpoint. -fsS so non-2xx fails the curl;
+          # -m 5 caps the call so a hung backend can't stall the deploy job.
+          RUNTIME_RAW=$(curl -fsS -m 5 "${PROBE_URL}" 2>&1) || {
+            rc=$?
+            echo "::warning::version probe could not reach ${PROBE_URL} (curl exit ${rc}). Health check passed earlier so the service is live; the probe URL or its routing may be wrong. Probe skipped."
+            echo "status=unreachable" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          RUNTIME=$(printf '%s' "${RUNTIME_RAW}" | jq -r '.version // empty' 2>/dev/null || true)
+          if [ -z "${RUNTIME}" ]; then
+            echo "::warning::${PROBE_URL} did not return a JSON .version field; cannot verify version match. Add 'version' to the health response shape (STANDARDS section 8 / IMPL-26)."
+            echo "status=no-version-field" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${RUNTIME}" != "${EXPECTED}" ]; then
+            # SOAK_END_2026-05-15: flip the next two lines to
+            #   echo "::error::Deployed version mismatch: ..."
+            #   echo "status=mismatch" >> "$GITHUB_OUTPUT"; exit 1
+            # so version drift becomes a blocking rollback trigger. Until then,
+            # warn-only so consumers carrying the IMPL-5 / IMPL-26 debt are not
+            # auto-blocked while migrating.
+            echo "::warning::Deployed version mismatch (warn-only until 2026-05-15): image tag claims v${EXPECTED} but ${PROBE_URL} reports v${RUNTIME}. This is the APM v0.9.2 bug class — see STANDARDS section 3."
+            echo "status=mismatch-warn" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::notice::Version match confirmed: ${RUNTIME} (probe: ${PROBE_URL})"
+          echo "status=match" >> "$GITHUB_OUTPUT"
 
       - name: Rollback on health failure
         id: rollback
