@@ -345,6 +345,19 @@ jobs:
             echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Purge stale build artifacts from Docker build context
+        shell: bash
+        run: |
+          # Defensive: remove any `dist/` and `*.tsbuildinfo` files that snuck
+          # into the checkout via accidental commits. These files are included
+          # in the Docker build context sent to the daemon; if the Dockerfile
+          # COPYs them in and runs `tsc --composite`, the stale buildinfo causes
+          # silent under-emit identically to the PDFManager v2.12.5 incident
+          # (commit 77c9995). Purge here, before context is packaged.
+          rm -rf dist
+          find . -name '*.tsbuildinfo' -not -path './node_modules/*' -delete
+          echo 'Purged stale build artifacts.'
+
       - name: Build and push ${{ matrix.image.name }}
         uses: docker/build-push-action@v5
         with:

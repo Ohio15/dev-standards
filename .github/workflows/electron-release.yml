@@ -76,6 +76,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Purge stale build artifacts
+        shell: bash
+        run: |
+          # Defensive: remove any `dist/` and `*.tsbuildinfo` files that snuck
+          # into the checkout via accidental commits. With composite: true,
+          # a stale committed `*.tsbuildinfo` causes `tsc` to read the
+          # incremental cache and silently under-emit on a fresh CI checkout —
+          # TypeScript trusts the buildinfo's record over reality.
+          # See PDFManager v2.12.5 incident (commit 77c9995).
+          rm -rf dist
+          find . -name '*.tsbuildinfo' -not -path './node_modules/*' -delete
+          echo 'Purged stale build artifacts.'
+
       - name: Build app
         shell: bash
         run: npm run build
