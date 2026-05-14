@@ -276,3 +276,57 @@ schtasks /Create /TN "DevStandards-NpmAudit" /SC WEEKLY /D SUN /ST 06:00 /F `
 ### Brain integration
 
 `--brain-store` posts the markdown summary to `https://shared-brain.us/api/memory` as an `ingest`-action observation, tagged `hygiene-scan-<DATE>` or `npm-audit-<DATE>`. Requires the API key at `~/.config/shared-brain/api-key`. Failures are logged to stderr; the scan still writes its local JSON report regardless.
+
+## Shared-Brain CLI (`scripts/sb.py`)
+
+Direct-HTTPS client for `shared-brain.us/mcp`. Use it when the MCP host is unavailable, broken, or absent — fresh VMs, remote desktops, CI runners, shell sessions, anything that can run Python 3.8+ and reach `shared-brain.us`. No MCP client, no pip dependencies.
+
+Hardcodes the post-v7.8.0 auth contract (`Authorization: Bearer` on `/mcp`) so future header-scheme drifts cannot strand it silently. Token is never echoed — only the 8-char generation prefix appears in logs/errors.
+
+### Token resolution (first hit wins)
+
+1. `--token <value>` flag
+2. `$SHARED_BRAIN_TOKEN` environment variable
+3. `~/.config/shared-brain/api-key` (single-line file; gitignored)
+4. `op item get "shared-brain" --fields password` (1Password CLI, if signed in)
+
+### Subcommands
+
+```bash
+# Auth + endpoint health (real check via MCP initialize — NOT /health, which is unauth)
+python scripts/sb.py health
+python scripts/sb.py status         # token source, redacted prefix, endpoint
+
+# Search
+python scripts/sb.py recall "shared-brain rotation" --project shared-brain --max-results 5
+python scripts/sb.py --quiet recall "..." --max-results 10   # prints memory IDs only
+
+# Write
+python scripts/sb.py store "Lesson body here" \
+  --type lesson --project dev-standards --importance 0.8 --tags "ci,hygiene"
+
+# Boost recalled memories
+python scripts/sb.py reinforce <uuid> [<uuid> ...]
+
+# Remove (default mode: suppress; use --mode delete for hard removal)
+python scripts/sb.py forget <uuid> --mode delete --reason "duplicate of <uuid>"
+```
+
+### When to use
+
+- MCP client lost connection mid-session and `ToolSearch` can't reload tool schemas
+- Working from a remote VM / CI runner without an MCP host installed
+- Diagnosing auth issues — the redacted prefix in `status` tells you immediately whether you're on the right generation
+- Cron jobs / one-shot scripts that need a single recall or store without holding an MCP session
+
+### When NOT to use
+
+- Inside an interactive Claude session where MCP shared-brain is reachable — synchronous `brain_store` / `brain_recall` MCP tool calls remain the preferred path (richer integration, in-conversation context).
+- For high-volume writes — open a persistent MCP session instead; this CLI does a full `initialize` handshake per invocation.
+
+### Endpoint override
+
+```bash
+SHARED_BRAIN_URL=https://staging.shared-brain.us python scripts/sb.py health
+python scripts/sb.py --endpoint http://localhost:8080 health    # local proxy
+```

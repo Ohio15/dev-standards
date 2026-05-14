@@ -434,6 +434,8 @@ This is the single check that would have caught the APM dual-version.json bug at
 
 **Credential rotation:** follow the 8-phase SOP at `dev-standards/credential-rotation/PROTOCOL.md`. No deviation. Watch-window cadence (see the Apr 27 entry in MEMORY.md as recent example).
 
+**Phase 8 consumer-class checklist:** every rotation rollout must touch (a) every file-based `.env` / config consumer, (b) the 1Password vault item for the credential, (c) every MCP-client config (`headers.Authorization` value), and (d) every cron/systemd unit that reads the credential. Verify post-rotation by running `python dev-standards/scripts/sb.py status` on each consumer host and confirming the redacted prefix matches the new generation. Header scheme drift (e.g., legacy `X-API-Key:` on `/api/*` vs current `Authorization: Bearer` on `/mcp`) survives token-only updates and fails silently — `sb.py health` is the canonical post-rotation auth check because `/health` is unauthenticated and cannot detect it.
+
 **Bug-class detection — when does a bug deserve a canary variant?**
 
 A bug is "recurring" and warrants a permanent canary case when ANY of:
