@@ -32,11 +32,13 @@ cp "$here/hooks/pre-commit" "$target/.githooks/pre-commit"
 cp "$here/hooks/pre-commit-size-guard.sh" "$target/.githooks/pre-commit-size-guard.sh"
 cp "$here/hooks/pre-commit-secret-scan.sh" "$target/.githooks/pre-commit-secret-scan.sh"
 cp "$here/hooks/pre-commit-healthcheck-lint.sh" "$target/.githooks/pre-commit-healthcheck-lint.sh"
+cp "$here/hooks/pre-commit-tests.sh" "$target/.githooks/pre-commit-tests.sh"
 chmod +x \
   "$target/.githooks/pre-commit" \
   "$target/.githooks/pre-commit-size-guard.sh" \
   "$target/.githooks/pre-commit-secret-scan.sh" \
-  "$target/.githooks/pre-commit-healthcheck-lint.sh"
+  "$target/.githooks/pre-commit-healthcheck-lint.sh" \
+  "$target/.githooks/pre-commit-tests.sh"
 
 # CI workflows.
 #   size-guard.yml      — always-on tracked-file size guard
