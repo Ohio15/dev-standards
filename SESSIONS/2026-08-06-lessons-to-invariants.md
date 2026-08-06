@@ -114,12 +114,37 @@ on a **32-core** machine. Agents batch changes and skip verification because it'
 the pre-commit hook costs 3 minutes per commit.
 
 `pytest-xdist` 3.8.0 was installed 2026-08-06 and is behaviorally inert until `-n` is used.
-**Before enabling by default**, verify equivalence in an isolated worktree — the suite has
-HTTP-server tests that bind ports and SQLite session tests that share files, exactly the
-kind that go flaky under parallel execution. If equivalent, add to `addopts` so every
-invocation (agents *and* the hook) parallelises with no prompt changes.
-If it flakes, do **not** enable it: flaky verification on a safety-critical build is worse
-than slow verification.
+
+**MEASURED RESULT — do NOT enable `-n auto` as-is.** Verified in an isolated worktree at
+`def10ff` (serial baseline: 2186 passed in 180s):
+
+```
+pytest tests/ -q -n auto   ->  23 failed, 2112 passed, 51 errors in 77s
+```
+
+Every failure is in `tests/test_webui.py` (browser-driver and port contention between
+workers), not a real defect — the same tests pass serially. This is exactly the trap worth
+naming: **it is 2.3x faster and completely wrong.** Enabling it would have sent agents
+chasing phantom failures through safety-critical code, which is strictly worse than a slow
+suite.
+
+The prize is real (180s -> 77s), so the fix is isolation, not abandonment. Options in order
+of preference:
+
+1. ~~`--dist loadfile`~~ — **MEASURED, WORSE:** `33 failed, 2102 passed, 51 errors in 128s`.
+   Keeping a file's tests on one worker does not help, which confirms the contention is
+   *cross-file* (`test_app.py` and `test_webui.py` racing for the same ports/driver), not
+   intra-file. Do not retry a different `--dist` mode expecting a different answer.
+2. **An ephemeral-port fixture** so two workers can never claim the same port, and/or
+   `@pytest.mark.xdist_group` on the server-binding tests. This is the actual fix — it
+   addresses the cause rather than reshuffling the schedule.
+3. Two-command split: parallel for the pure/unit majority, serial for `test_webui.py` +
+   `test_app.py`. Least elegant, works today, and worth doing first to get the 60% win
+   cheaply while the fixture is built.
+
+Whichever lands, put it in `addopts` so agents *and* the pre-commit hook get it without any
+prompt change. **Re-verify equivalence against the serial baseline every time this config
+changes** — a parallel suite that silently drops tests looks identical to a fast one.
 
 ### 5. Fix the instruction template that caused this
 
