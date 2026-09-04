@@ -49,6 +49,13 @@ cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
 cp "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
 cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
+# Security register (security/REVIEW-MODEL.md): the per-session gate reads
+# <repo>/SECURITY-CHECKS.md and falls back to the canonical copy, reporting
+# the fallback as a finding — so every repo gets its own copy. Always
+# overwritten: the register is a contract, not repo-specific tuning; local
+# additions go through the audit's "Proposed additions" path.
+cp "$here/security/SECURITY-CHECKS.md" "$target/SECURITY-CHECKS.md"
+
 # Templates: copy only if absent so we don't clobber repo-specific tuning.
 if [ ! -f "$target/.large-files-allowlist" ]; then
   cp "$here/templates/.large-files-allowlist" "$target/.large-files-allowlist"
@@ -67,6 +74,7 @@ echo "  .githooks/pre-commit-healthcheck-lint.sh  (release-config.yml shape)"
 echo "  .github/workflows/size-guard.yml"
 echo "  .github/workflows/security-audit.yml  (Layer A — always on)"
 echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
+echo "  SECURITY-CHECKS.md                    (security register — always refreshed)"
 echo "  .large-files-allowlist                (if not present)"
 echo "  .gitleaks.toml                        (if not present)"
 echo "  git config core.hooksPath .githooks   (local)"

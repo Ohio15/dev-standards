@@ -18,6 +18,8 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 | `scripts/repo-hygiene-scan.py` | Weekly hygiene scanner — drift, misconfig, noise, idle repos. |
 | `scripts/npm-audit-weekly.sh` | Weekly `npm audit` roll-up + KEV cross-reference. |
 | `credential-rotation/PROTOCOL.md` | Credential rotation protocol v1. |
+| `security/SECURITY-CHECKS.md` | The per-session security REGISTER: enumerated defect shapes (SC-01…SC-15), each with a mechanical check. `install.sh` copies it to the target repo root; `/security-gate` reviews every change against it. |
+| `security/REVIEW-MODEL.md` | The two-tier review model (capped per-session gate + scheduled routine audit with dead-man), operator knobs, and the load-bearing rule. Ratified 2026-09-04. |
 
 ## Hook distribution model
 
