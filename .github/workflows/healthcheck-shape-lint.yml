@@ -36,7 +36,8 @@ jobs:
   healthcheck-shape-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.1.7 — SHA-pinned (mutable tags are a supply-chain vector)
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           # Need history for `git diff` against the base ref on PRs.
           fetch-depth: 0
@@ -88,7 +89,11 @@ jobs:
             [ -z "$f" ] && continue
             [ -f "$f" ] || continue
 
-            cmd="$(yq -r '.docker.deploy.health_check.command // "__ABSENT__"' "$f" 2>/dev/null || echo "__ABSENT__")"
+            # Non-zero yq exit = parse failure: fail closed, do not treat as absent.
+            if ! cmd="$(yq -r '.docker.deploy.health_check.command // "__ABSENT__"' "$f" 2>&1)"; then
+              echo "::error file=$f::healthcheck-shape-lint: yq failed to parse $f — $cmd" >&2
+              exit 1
+            fi
 
             # Pass: key absent (lib/electron/mcp surfaces).
             if [ "$cmd" = "__ABSENT__" ]; then

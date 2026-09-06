@@ -78,9 +78,16 @@ fi
 read_health_check_command() {
   local file="$1"
   if [ "$parser" = "yq" ]; then
-    # yq prints "null" for missing keys; coerce to __ABSENT__.
-    local out
-    out="$(yq -r '.docker.deploy.health_check.command // "__ABSENT__"' "$file" 2>/dev/null || echo "__ABSENT__")"
+    # yq prints "null" for missing keys; the // alternative coerces that to
+    # __ABSENT__ with exit 0. A NON-ZERO exit is a parse failure (corrupt or
+    # unreadable YAML) and must fail closed, exactly like the Python backend
+    # below — never fold it into the benign "absent" token.
+    local out rc=0
+    out="$(yq -r '.docker.deploy.health_check.command // "__ABSENT__"' "$file" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf 'healthcheck-lint: failed to parse %s with yq (exit %s): %s\n' "$file" "$rc" "$out" >&2
+      exit 2
+    fi
     printf '%s' "$out"
   else
     "$python_bin" - "$file" <<'PYEOF'
