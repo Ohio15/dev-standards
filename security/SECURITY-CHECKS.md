@@ -230,6 +230,102 @@ A test double mirrors the assumption, not reality.
 **Fix form.** Probe first; the fix names what it probed.
 **Since.** 2026-09-02.
 
+### SC-16 · A helper family with a strong and a weak spelling; the enforcement
+site uses the weak one
+**Shape.** The module ships `programName()` and `verbForm()`, `commandClauses()`
+and `splitClauses(lexShell())`, a shared lexer and a private tokenizer — and
+the tier-3 consumer calls the one that does less. The comment beside the
+strong spelling says it is "the ONLY function that answers…", and the grep
+says otherwise.
+**Check.** For every exported pair where one function is documented as the
+blessed answer, `grep -n` every call site of the OTHER; each hit outside the
+defining module is a finding unless a comment at the site states why the weak
+form is correct there. A source-derived test enumerates the roster.
+**Fix form.** Delete or un-export the weak spelling; derived call-site test.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09 (findings: verbForm/programName,
+splitClauses/commandClauses, workspace-guard tokenize).
+
+### SC-17 · Quoting treated as semantics
+**Shape.** A detector skips a word because `quoted === true`, in a position
+(argv[0], subcommand, flag, operand) where the shell hands the program the
+identical argv either way. Written to fix a false positive on
+`git commit -m "…"` that the POSITION check already prevented.
+**Check.** `grep -n "\.quoted" hooks/*.ts`; every hit must be in a
+switch/wrapper/value position. Fixture pairs (`X`, `'X'`, `"X"`, `X'Y'`) for
+every flag and verb in every detector must classify identically; a test that
+asserts that pairwise.
+**Fix form.** Gate on argv position; `quoted` only where it distinguishes an
+option's VALUE.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09.
+
+### SC-18 · A guard's own inputs at a weaker protection level than the guard
+**Shape.** A guard reads a runtime config file, spawns a script, or renders a
+cache into the model — and that file sits in a warn-only tree, an uncovered
+directory, or off the floor entirely. The env channel for the same value was
+carefully closed; the file it resolved to was never checked against the
+policy.
+**Check.** Derive, from the source, every path a hook reads at runtime
+(`resolve(here`, `readFileSync`, `spawn(`, `homePath(`), and assert each is
+covered by `floorGlobs()` or `enforced_file_path_globs`, with a reasoned
+allow-list whose criterion includes "reaches no model-facing prompt" as well
+as "gates no enforcement decision".
+**Fix form.** Runtime inputs on the enforced side; executed scripts on the
+code floor; policy parity test between canon and mirror.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09 (findings: workspace-layout.json,
+canonical-hostnames.json, scripts/**, governance/check.mjs, conformance.json,
+hooks-win mirror).
+
+### SC-19 · A stand-in parser models a subset of the real grammar and treats
+the unmodelled construct as data
+**Shape.** The lexer that stands in for bash has no backslash case, no `>|`,
+matches `-c` but not `-lc`, drops here-strings and heredocs fed to an
+interpreter, and does not know `eval`. Each unmodelled construct silently
+becomes an opaque word, i.e. an allow.
+**Check.** A fixture table of shell grammar constructs — backslash escape,
+every redirection operator in the bash manual, combined short flags,
+long-option prefixes, `eval`, here-string, heredoc into
+`bash`/`sh`/`node`/`python`/`psql`, path-qualified and wrapper-prefixed
+programs — each asserted to classify the same as its plain spelling in every
+detector. Any construct absent from the table is a finding when added to the
+lexer.
+**Fix form.** Model the construct, or treat its presence as an evasion signal
+that fails closed.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09.
+
+### SC-20 · A source-scan guard anchored on one spelling of the construct it
+checks for
+**Shape.** The SC-12 enforcer matches `process.env.NAME` and is blind to
+`env: NodeJS.ProcessEnv = process.env`; the audit verifier inspects report
+bytes rather than construction path. The mechanical check exists, is green,
+and does not see the shape.
+**Check.** For every source-scan test, write the guarded construct in each
+alternate spelling the language allows (parameter form, destructuring,
+indexed access, alias import) and confirm the scan is red for each; a
+self-test that the scan found ≥ N real sites.
+**Fix form.** Anchor the scan on the READ (a typed value, a single accessor)
+rather than the token; route the construct through one chokepoint the scan can
+name.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09.
+
+### SC-21 · An append-only enforcement journal with no cap, justified by a
+benign-traffic rate
+**Shape.** "Rows are rare (27 in 19 days), so no rotation." The rate is a
+property of an agent that is not trying; the guarded party writes a row per
+matched call at tool-call rate, and a full volume silently stops every other
+best-effort journal on it.
+**Check.** `grep -n "appendFileSync" hooks/*.ts`; every enforcement writer has
+a byte cap or a ring AND a named overflow condition that is itself never
+silent.
+**Fix form.** Cap that refuses new rows and raises `<journal>_full`; never
+drop-oldest on evidence.
+**Since.** 2026-09-09.
+**Origin.** audit-cortex-hooks-2026-09-09.
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
