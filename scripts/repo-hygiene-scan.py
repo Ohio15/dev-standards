@@ -16,6 +16,13 @@ Findings (severity-tagged):
     LOW     last commit older than 30 days (idle warning)
     LOW     noise files (.DS_Store, *.swp, Thumbs.db) tracked or
             untracked
+    Workspace layout floor (STANDARDS.md §2), synthetic "[layout]",
+    "[worktrees]" and "[scratch]" entries:
+    HIGH    linked worktree or clutter/probe folder under the Projects root
+            (incl. one level inside namespace dirs)
+    MEDIUM  duplicate clones of one origin; loose files at a root;
+            clean+merged worktree under D:/Worktrees; orphan folder there
+    LOW     non-git orphan folder; D:/Scratch entry older than 30 days
 
 Output:
     JSON      <output-dir>/hygiene-scan-<YYYY-MM-DD>.json
@@ -50,6 +57,18 @@ BINARY_SUFFIXES = {
 MAX_TRACKED_BYTES = 5 * 1024 * 1024  # 5 MB
 IDLE_DAYS = 30
 SEVERITIES = ("HIGH", "MEDIUM", "LOW")
+# --- Workspace layout floor (root-level hygiene; peer to per-repo checks) -
+# Mirrors dev-standards STANDARDS.md §2 "Workspace layout floor". The three
+# machine roots on paxson: D:/Projects (durable repos, grouped by namespace),
+# D:/Worktrees/<repo>/<branch> (parallel checkouts), D:/Scratch/<date>-<topic>
+# (one-off artifacts, purged on a cadence). Nothing else is a valid home for
+# a checkout or a probe copy.
+LAYOUT_ALLOWED_ROOT_DIRS = {".archive", ".staging-licenses", "data"}
+LAYOUT_CLUTTER_SUFFIXES = ("-wt-", "-c2", "-d2", "-copy", "-new", "-old", "-bak")
+LAYOUT_CLUTTER_PREFIXES = ("wt-", "_", "probe-", "rb-mirror-")
+WORKTREES_ROOT_DEFAULT = "D:/Worktrees"
+SCRATCH_ROOT_DEFAULT = "D:/Scratch"
+SCRATCH_MAX_AGE_DAYS = 30
 
 # Drift detection constants
 NEXUS_HOST = "ohio_@100.98.48.63"
@@ -1029,7 +1048,13 @@ def scan_repo_drift(repo: Path, cfg: dict[str, Any]) -> dict[str, Any]:
         package = img.rsplit("/", 1)[-1]
         tag, qerr = gh_ghcr_latest_tag(package)
         ghcr_latest_by_image[img] = tag
-        if qerr and "rc=" in qerr and ("403" in qerr or "401" in qerr or "scope" in qerr.lower()):
+        if qerr and "rc=" in qerr and (
+            "403" in qerr or "401" in qerr or "404" in qerr or "scope" in qerr.lower()
+        ):
+            # 404 from this endpoint typically indicates no read:packages
+            # scope (private packages appear as not-found). Treat alongside
+            # 401/403 rather than spamming drift-ghcr-query-failed for each
+            # image.
             ghcr_unauth = True
         elif qerr:
             findings.append({
@@ -1086,6 +1111,27 @@ def scan_repo_drift(repo: Path, cfg: dict[str, Any]) -> dict[str, Any]:
                 "latest": image_latest,
                 "lag": lag,
                 "note": f"{svc_name} on NEXUS is {lag} releases behind latest",
+            })
+        elif (
+            running_tag
+            and image_latest
+            and not SEMVER_TAG_RE.match(running_tag)
+            and SEMVER_TAG_RE.match(image_latest)
+        ):
+            # Running tag is non-semver (likely legacy local-build flow) while
+            # a tagged release exists. Surface as MEDIUM — it's an unknown
+            # rather than a confirmed lag, but operationally it means the
+            # service isn't being managed by the release pipeline.
+            findings.append({
+                "severity": "MEDIUM",
+                "code": "drift-untagged-running",
+                "service": svc_name,
+                "container": container_name,
+                "running": running_tag,
+                "latest": image_latest,
+                "note": f"{svc_name} container running an untagged image while "
+                        f"{image_latest} is the latest release — likely a "
+                        f"pre-release-pipeline build",
             })
 
     version_block["services"] = services_block
@@ -1164,6 +1210,235 @@ def write_versions_yml(out_path: Path, drift: dict[str, Any]) -> None:
     out_path.write_text(text, encoding="utf-8")
 
 
+def is_namespace_dir(path: Path) -> bool:
+    """Non-git dir whose immediate children include git repos (a family group)."""
+    if is_git_repo(path):
+        return False
+    try:
+        return any(c.is_dir() and is_git_repo(c) for c in path.iterdir())
+    except (PermissionError, OSError):
+        return False
+
+
+def is_worktree_checkout(path: Path) -> bool:
+    """A linked worktree has a `.git` FILE (gitdir: ...), a clone has a dir."""
+    return (path / ".git").is_file()
+
+
+def is_clutter_name(name: str) -> bool:
+    return any(suf in name for suf in LAYOUT_CLUTTER_SUFFIXES) or any(
+        name.startswith(pre) for pre in LAYOUT_CLUTTER_PREFIXES
+    )
+
+
+def origin_url(repo: Path) -> str:
+    rc, out, _ = run(["git", "-C", str(repo), "remote", "get-url", "origin"])
+    return out.strip().lower().removesuffix(".git") if rc == 0 else ""
+
+
+def _layout_finding(code: str, severity: str, items: list[str], note: str) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "code": code,
+        "count": len(items),
+        "items": items[:20],
+        "note": note,
+    }
+
+
+def scan_root_layout(root: Path) -> dict[str, Any]:
+    """Root-level layout hygiene, emitted as a synthetic repo entry so it
+    flows through the existing totals / markdown / JSON path unchanged.
+
+    Checks the root AND one level inside each namespace dir (the 2026-09-09
+    cleanup found 60+ worktrees and probe copies under D:/Projects/brain that
+    a root-only pass could never see). Flags loose files, clutter-named
+    folders, linked worktrees living under the Projects root, duplicate
+    clones of one origin, and non-git / non-namespace orphan folders.
+    Side-effect-free.
+    """
+    findings: list[dict[str, Any]] = []
+    loose: list[str] = []
+    clutter: list[str] = []
+    worktrees: list[str] = []
+    orphans: list[str] = []
+    clones_by_origin: dict[str, list[str]] = {}
+
+    def classify(entry: Path, rel: str, depth: int) -> None:
+        if entry.is_file():
+            loose.append(rel)
+            return
+        if depth == 1 and entry.name in LAYOUT_ALLOWED_ROOT_DIRS:
+            return
+        if is_worktree_checkout(entry):
+            worktrees.append(rel)
+            return
+        if is_clutter_name(entry.name):
+            clutter.append(rel)
+            return
+        if is_git_repo(entry):
+            url = origin_url(entry)
+            if url:
+                clones_by_origin.setdefault(url, []).append(rel)
+            return
+        if depth == 1 and is_namespace_dir(entry):
+            for child in sorted(entry.iterdir()):
+                classify(child, f"{rel}/{child.name}", 2)
+            return
+        orphans.append(rel)
+
+    try:
+        entries = sorted(root.iterdir())
+    except (PermissionError, OSError):
+        entries = []
+    for entry in entries:
+        classify(entry, entry.name, 1)
+
+    duplicates = [
+        f"{', '.join(paths)}  (origin {url})"
+        for url, paths in sorted(clones_by_origin.items())
+        if len(paths) > 1
+    ]
+    if worktrees:
+        findings.append(_layout_finding(
+            "layout-worktree-in-projects", "HIGH", worktrees,
+            f"linked worktrees belong in {WORKTREES_ROOT_DEFAULT}/<repo>/<branch>: git worktree move <path> <dest>",
+        ))
+    if clutter:
+        findings.append(_layout_finding(
+            "layout-clutter-folder", "HIGH", clutter,
+            f"probe/copy folders belong in {SCRATCH_ROOT_DEFAULT}/<yyyy-mm-dd>-<topic> (or a worktree)",
+        ))
+    if duplicates:
+        findings.append(_layout_finding(
+            "layout-duplicate-clone", "MEDIUM", duplicates,
+            "one clone per origin under the Projects root; a parallel checkout is a worktree",
+        ))
+    if loose:
+        findings.append(_layout_finding(
+            "layout-loose-root-file", "MEDIUM", loose,
+            "the Projects root and namespace dirs hold repos only",
+        ))
+    if orphans:
+        findings.append(_layout_finding(
+            "layout-orphan-folder", "LOW", orphans,
+            "non-git folder: git init + remote, move to .archive/<name>-<date>, or to Scratch",
+        ))
+    return {
+        "name": f"{root.name or str(root)} [layout]",
+        "path": str(root),
+        "tracked_count": 0,
+        "findings": findings,
+    }
+
+
+def scan_worktrees_root(root: Path) -> dict[str, Any]:
+    """D:/Worktrees/<repo>/<branch> hygiene: every leaf must be a registered
+    linked worktree; a worktree whose branch is fully merged into the
+    default branch and whose tree is clean is finished and should be
+    removed (`git worktree remove` + `git worktree prune`)."""
+    findings: list[dict[str, Any]] = []
+    stale: list[str] = []
+    orphans: list[str] = []
+    loose: list[str] = []
+    try:
+        repos = sorted(root.iterdir())
+    except (PermissionError, OSError):
+        repos = []
+    for repo_dir in repos:
+        if repo_dir.is_file():
+            loose.append(repo_dir.name)
+            continue
+        try:
+            leaves = sorted(repo_dir.iterdir())
+        except (PermissionError, OSError):
+            continue
+        for leaf in leaves:
+            rel = f"{repo_dir.name}/{leaf.name}"
+            if leaf.is_file():
+                loose.append(rel)
+                continue
+            if not is_worktree_checkout(leaf):
+                orphans.append(rel)
+                continue
+            rc, dirty, _ = run(["git", "-C", str(leaf), "status", "--porcelain"])
+            if rc != 0 or dirty.strip():
+                continue  # dirty or unreadable: in use, never flag
+            rc, head_ref, _ = run(["git", "-C", str(leaf), "symbolic-ref", "-q", "--short", "HEAD"])
+            rc2, default_ref, _ = run(
+                ["git", "-C", str(leaf), "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]
+            )
+            default_ref = default_ref.strip() if rc2 == 0 else "origin/main"
+            rc3, _, _ = run(["git", "-C", str(leaf), "merge-base", "--is-ancestor", "HEAD", default_ref])
+            if rc3 == 0:
+                stale.append(f"{rel} [{head_ref.strip() or 'detached'}] merged into {default_ref}")
+    if stale:
+        findings.append(_layout_finding(
+            "worktree-stale-merged", "MEDIUM", stale,
+            "clean and fully merged: git worktree remove <path> && git worktree prune",
+        ))
+    if orphans:
+        findings.append(_layout_finding(
+            "worktree-orphan-folder", "MEDIUM", orphans,
+            "not a linked worktree (no .git file): move to Scratch or delete",
+        ))
+    if loose:
+        findings.append(_layout_finding(
+            "worktree-loose-file", "LOW", loose, "the worktrees root holds <repo>/<branch> dirs only",
+        ))
+    return {
+        "name": f"{root.name or str(root)} [worktrees]",
+        "path": str(root),
+        "tracked_count": 0,
+        "findings": findings,
+    }
+
+
+def scan_scratch_root(root: Path, max_age_days: int = SCRATCH_MAX_AGE_DAYS) -> dict[str, Any]:
+    """D:/Scratch/<yyyy-mm-dd>-<topic> hygiene: entries older than the
+    retention window are purge candidates; the root holds dated dirs only."""
+    findings: list[dict[str, Any]] = []
+    expired: list[str] = []
+    undated: list[str] = []
+    now = dt.datetime.now(dt.timezone.utc)
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}-.+")
+    try:
+        entries = sorted(root.iterdir())
+    except (PermissionError, OSError):
+        entries = []
+    for entry in entries:
+        if not date_re.match(entry.name):
+            undated.append(entry.name)
+        try:
+            mtime = dt.datetime.fromtimestamp(entry.stat().st_mtime, dt.timezone.utc)
+        except OSError:
+            continue
+        age = (now - mtime).days
+        m = date_re.match(entry.name)
+        if m:
+            try:
+                created = dt.datetime.strptime(entry.name[:10], "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+                age = max(age, (now - created).days)
+            except ValueError:
+                pass
+        if age > max_age_days:
+            expired.append(f"{entry.name} ({age}d)")
+    if expired:
+        findings.append(_layout_finding(
+            "scratch-expired", "LOW", expired,
+            f"older than {max_age_days} days: review and delete (Ron-run; recursive deletes are circuit-breaker blocked for agents)",
+        ))
+    if undated:
+        findings.append(_layout_finding(
+            "scratch-undated-entry", "LOW", undated, "scratch entries are named <yyyy-mm-dd>-<topic>",
+        ))
+    return {
+        "name": f"{root.name or str(root)} [scratch]",
+        "path": str(root),
+        "tracked_count": 0,
+        "findings": findings,
+    }
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Repo hygiene scanner")
     ap.add_argument(
@@ -1205,7 +1480,32 @@ def main() -> int:
         "--no-ntfy", action="store_true",
         help="Skip the ntfy alert even when drift is detected",
     )
+    ap.add_argument(
+        "--worktrees-root", default=None,
+        help=f"Worktrees root to audit for stale/orphan checkouts (default on Windows: {WORKTREES_ROOT_DEFAULT})",
+    )
+    ap.add_argument(
+        "--scratch-root", default=None,
+        help=f"Scratch root to audit for expired entries (default on Windows: {SCRATCH_ROOT_DEFAULT})",
+    )
+    ap.add_argument(
+        "--scratch-max-age", type=int, default=SCRATCH_MAX_AGE_DAYS,
+        help=f"Days before a scratch entry is a purge candidate (default {SCRATCH_MAX_AGE_DAYS})",
+    )
+    ap.add_argument(
+        "--no-layout", action="store_true",
+        help="Skip the workspace layout floor passes (Projects root, worktrees root, scratch root)",
+    )
     args = ap.parse_args()
+
+    # Task Scheduler / cmd.exe stdout is cp1252 on Windows; any non-Latin-1
+    # character in a path or note would otherwise abort the whole scan at
+    # print time (seen 2026-09-09 with U+2192). Never let encoding kill a run.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     # Default roots
     roots = [Path(r) for r in args.root]
@@ -1246,6 +1546,19 @@ def main() -> int:
                 by_name[host_repo["name"]] = host_repo
             host_repo["findings"].extend(dr["findings"])
 
+    # Workspace layout floor — root-level hygiene as synthetic entries.
+    if not args.no_layout:
+        repo_reports.extend(scan_root_layout(r) for r in roots if r.is_dir())
+        worktrees_root = Path(args.worktrees_root) if args.worktrees_root else None
+        scratch_root = Path(args.scratch_root) if args.scratch_root else None
+        if worktrees_root is None and sys.platform.startswith("win"):
+            worktrees_root = Path(WORKTREES_ROOT_DEFAULT)
+        if scratch_root is None and sys.platform.startswith("win"):
+            scratch_root = Path(SCRATCH_ROOT_DEFAULT)
+        if worktrees_root is not None and worktrees_root.is_dir():
+            repo_reports.append(scan_worktrees_root(worktrees_root))
+        if scratch_root is not None and scratch_root.is_dir():
+            repo_reports.append(scan_scratch_root(scratch_root, args.scratch_max_age))
     total_findings = sum(len(r["findings"]) for r in repo_reports)
     totals_by_severity: dict[str, int] = {s: 0 for s in SEVERITIES}
     for r in repo_reports:

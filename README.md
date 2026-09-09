@@ -217,6 +217,22 @@ Weekly scanner that walks one or more configured roots and flags:
 | LOW | `idle-repo` | No commits in 30+ days |
 | LOW | `noise-files` | `.DS_Store`, `*.swp`, `Thumbs.db` tracked or untracked |
 
+Workspace layout floor (STANDARDS.md §2) — emitted as synthetic `[layout]`, `[worktrees]` and `[scratch]` entries. The `[layout]` pass covers the Projects root **and one level inside each namespace dir** (a root-only pass missed 60+ worktrees and probe copies under `brain/` before 2026-09-09):
+
+| Severity | Code | What it catches |
+|---|---|---|
+| HIGH | `layout-worktree-in-projects` | A linked worktree (`.git` file) anywhere under the Projects root — belongs in `D:/Worktrees/<repo>/<branch>` |
+| HIGH | `layout-clutter-folder` | Probe / copy folders: `wt-*`, `_*`, `probe-*`, `rb-mirror-*`, `-wt-`, `-c2`, `-copy`, `-old`, `-bak`, … |
+| MEDIUM | `layout-duplicate-clone` | Two clones of the same origin under the root — one is a worktree in disguise |
+| MEDIUM | `layout-loose-root-file` | Files at the root or inside a namespace dir |
+| LOW | `layout-orphan-folder` | Non-git, non-namespace folder (allowed: `.archive`, `.staging-licenses`, `data`) |
+| MEDIUM | `worktree-stale-merged` | `D:/Worktrees` entry that is clean and fully merged into the default branch — `git worktree remove` + `prune` |
+| MEDIUM | `worktree-orphan-folder` | `D:/Worktrees/<repo>/<x>` that is not a linked worktree |
+| LOW | `scratch-expired` | `D:/Scratch` entry older than `--scratch-max-age` (30) days — Ron purges |
+| LOW | `scratch-undated-entry` | `D:/Scratch` entry not named `<yyyy-mm-dd>-<topic>` |
+
+Flags: `--worktrees-root`, `--scratch-root` (default `D:/Worktrees`, `D:/Scratch` on Windows), `--scratch-max-age`, `--no-layout`.
+
 Output: structured JSON to `<output-dir>/hygiene-scan-<YYYY-MM-DD>.json` plus a human-readable markdown summary on stdout. Exit code reflects severity (HIGH=2, MEDIUM=1, else 0) so cron alerts naturally.
 
 ```bash

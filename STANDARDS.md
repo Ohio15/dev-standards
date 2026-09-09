@@ -90,12 +90,24 @@ Every Ron-owned repo, before it can be release-piloted via dev-standards reusabl
 5. Phase 1C drift: `gh release list` + GHCR API + NEXUS `docker inspect` → writes `release/versions.yml`
 6. ntfy alert to `nexus-alerts` when N≥2 releases behind
 7. Output: JSON to `<output-dir>/hygiene-scan-<YYYY-MM-DD>.json`, optional `--brain-store` for shared-brain ingestion
+8. Workspace layout floor (synthetic `[layout]`, `[worktrees]`, `[scratch]` entries): linked worktrees and clutter/probe folders under the Projects root or one level inside a namespace dir (HIGH), duplicate clones of one origin and loose root files (MEDIUM), non-git orphan folders (LOW); clean+merged or orphan entries under `D:/Worktrees` (MEDIUM); `D:/Scratch` entries older than 30 days (LOW)
 
 Findings are advisory, not blocking — Ron triages weekly.
 
 **Version control everything (no opt-out):** any directory containing infra config, deployment config, or source code is a git repo with a private GitHub remote. Including `~/infra/`, `~/AdGuardHome/config/`, `D:/Projects/*`. Bootstrap: `dev-standards/scripts/init-repo.sh <path>` (TO-BE — IMPL-3).
 
 **Hooks single-source-of-truth:** dev-standards itself currently has `hooks/` and `.githooks/` as byte-identical duplicates. `install.sh` reads from `hooks/`; dev-standards' own pre-commit chain runs from `.githooks/`. This is a drift hazard. Tracked as IMPL-4: collapse to one path with a build step or symlink.
+
+**Workspace layout floor (machine-level, ratified 2026-09-09):** three roots, each with exactly one job. `D:/Projects` holds durable repos only — not a scratchpad. Enforced at action time by the `workspace-guard` Claude Code PreToolUse hook (cortex-hooks, rules WG1–WG4 below) and audited weekly by `repo-hygiene-scan.py` (finding 8 above). Rules:
+- **One repo per folder.** Group same-namespace repos under a parent folder (`D:/Projects/<namespace>/<repo>`, e.g. `brain/Shared-Brain`, `aibrowser/AIWebBrowser`); never nest one repo working tree inside another (group, do not nest). A namespace dir contains repos and nothing else — no worktrees, no probes, no copies.
+- **Worktrees live in `D:/Worktrees/<repo>/<branch-with-slashes-as-dashes>`**, never under `D:/Projects` at any depth (the 2026-08-04 `truck-mcp/worktrees/` convention is retired). Create with `git worktree add D:/Worktrees/<repo>/<branch> <branch>`; a finished worktree (clean, branch merged) is removed the same session with `git worktree remove` then `git worktree prune`. Worktrees a Claude session creates in its scratchpad are fine (they die with the session) but must be pruned from the repo afterwards.
+- **One-off scripts, probe copies, review mirrors and artifacts go in `D:/Scratch/<yyyy-mm-dd>-<topic>`**, never the Projects root or a namespace dir. Retention 30 days; the weekly scan lists expired entries and Ron purges them (recursive deletes are circuit-breaker blocked for agents — an agent quarantines to Scratch, it never `rm -rf`s).
+- **No folder-copy clones** (`-c2`, `-copy`, `rb-mirror-*`, `probe-*`, ...) and no second full clone of an origin already under `D:/Projects`; a parallel checkout is a worktree.
+- **Only non-repo root entries allowed:** `.archive`, `.staging-licenses`, `data`. Retired repos move to `.archive/<name>-<date>`. Every other folder at the root or inside a namespace is a git repo with a private `Ohio15` remote (loose docs get a repo of their own — cf. `aibrowser/chrome-ui-review`, 2026-09-09).
+- **Repos launched by absolute path** (MCP servers, hooks, scheduled tasks) are referenced in `~/.claude.json`, `~/.mcp.json`, `~/.claude/settings.json` and Task Scheduler; update those (with a `*.bak` first) whenever such a repo moves, and re-verify the service starts.
+- **Handoffs and brain memories cite paths.** When a worktree moves, store the old→new path map in shared-brain in the same session so a successor recalling a brief finds the tree (2026-09-09 map: brain `see tag layout-2026-09-09`).
+
+`workspace-guard` rules (PreToolUse on Bash, PowerShell and the file tools; blocks, journals `workspace_guard_blocked` to hook-health): **WG1** `git worktree add` targeting any path under `D:/Projects`; **WG2** recursive copy (`cp -r`, `Copy-Item -Recurse`, `robocopy`, `xcopy`) whose destination is a new folder at the root or inside a namespace dir; **WG3** `mkdir`/`New-Item -ItemType Directory` creating a direct child of the root unless the same command also `git init`s or `git clone`s; **WG4** a file tool or shell redirection writing a loose file at the root. Config: `cortex-hooks/hooks/workspace-layout.json` (roots). Read-only commands never trip it.
 
 ---
 
