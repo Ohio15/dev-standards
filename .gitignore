@@ -6,3 +6,6 @@
 credential-rotation/replacements.txt
 credential-rotation/replacements*.txt
 **/replacements.txt
+__pycache__/
+*.pyc
+.pytest_cache/

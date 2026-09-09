@@ -216,6 +216,11 @@ Weekly scanner that walks one or more configured roots and flags:
 | MEDIUM | `hooks-path-misconfigured` | `.githooks/` exists but `core.hooksPath` doesn't point at it |
 | LOW | `idle-repo` | No commits in 30+ days |
 | LOW | `noise-files` | `.DS_Store`, `*.swp`, `Thumbs.db` tracked or untracked |
+| MEDIUM | `submodule-pointer-lag` | A superproject's recorded submodule pointer lags the child's `origin/<branch>` head across a version bump (`bump`/semver subject, or a changed `"version"` field in `package.json`/`version.json`) — cortex-core ADR 0012 |
+| LOW | `submodule-pointer-lag` | Any other pointer lag, or a pointer the remote branch does not contain (unpushed / off-branch) |
+| LOW | `submodule-pointer-unverified` | The child's remote could not be read (`git ls-remote`, 20 s timeout, prompts disabled) |
+
+The submodule check is read-only: the remote head comes from `git ls-remote`, lag is measured in the child's existing checkout (`lag=?` when that checkout has not fetched the remote head), and no ref is ever written. Fix: `git -C <superproject> submodule update --remote -- <path>` then commit the pointer. Tests: `python -m pytest scripts/tests -q` (builds throwaway repos under pytest's tmp dir; no network).
 
 Workspace layout floor (STANDARDS.md §2) — emitted as synthetic `[layout]`, `[worktrees]` and `[scratch]` entries. The `[layout]` pass covers the Projects root **and one level inside each namespace dir** (a root-only pass missed 60+ worktrees and probe copies under `brain/` before 2026-09-09):
 
