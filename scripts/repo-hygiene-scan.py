@@ -1358,6 +1358,15 @@ def scan_worktrees_root(root: Path) -> dict[str, Any]:
             if leaf.is_file():
                 loose.append(rel)
                 continue
+            if leaf.is_symlink():
+                # Dependency shim for `file:../<sibling>` package links (e.g.
+                # D:/Worktrees/cortex-hooks/cortex-core -> D:/Projects/cortex/cortex-core)
+                # so a worktree resolves the same relative path as the main
+                # checkout. Allowed when it points at a git repo; never a
+                # checkout of its own.
+                if not is_git_repo(leaf):
+                    orphans.append(f"{rel} (symlink to non-repo)")
+                continue
             if not is_worktree_checkout(leaf):
                 orphans.append(rel)
                 continue
