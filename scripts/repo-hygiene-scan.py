@@ -16,6 +16,10 @@ Findings (severity-tagged):
     LOW     last commit older than 30 days (idle warning)
     LOW     noise files (.DS_Store, *.swp, Thumbs.db) tracked or
             untracked
+    Submodule pointer lag (cortex-core ADR 0012), per superproject:
+    MEDIUM  a recorded submodule pointer lags the child's remote branch
+            head across a version-bump commit
+    LOW     any other lag, or a pointer the remote branch does not contain
     Workspace layout floor (STANDARDS.md §2), synthetic "[layout]",
     "[worktrees]" and "[scratch]" entries:
     HIGH    linked worktree or clutter/probe folder under the Projects root
@@ -70,6 +74,18 @@ WORKTREES_ROOT_DEFAULT = "D:/Worktrees"
 SCRATCH_ROOT_DEFAULT = "D:/Scratch"
 SCRATCH_MAX_AGE_DAYS = 30
 
+# --- Submodule pointer lag (cortex-core ADR 0012) -----------------------
+# A superproject's recorded pointer is supposed to name "the deployed
+# child". Nothing bumps it on a child merge, so it drifts silently (2026-09-09:
+# Ohio15/cortex was six cortex-hooks releases behind). Read-only: the child's
+# remote head comes from `git ls-remote`, never from a fetch.
+SUBMODULE_DEFAULT_BRANCH = "main"
+SUBMODULE_LS_REMOTE_TIMEOUT = 20  # seconds; a hung remote must not stall the scan
+# Commit subjects that mark a release in the child (conventional "bump" or a
+# bare semver); complements the version-field diff check on package/version.json.
+VERSION_BUMP_SUBJECT_RE = re.compile(r"\bbump\b|\bv?\d+\.\d+\.\d+\b", re.IGNORECASE)
+VERSION_FILES = ("package.json", "version.json")
+
 # Drift detection constants
 NEXUS_HOST = "ohio_@100.98.48.63"
 NTFY_URL = "http://192.168.1.20:2586/nexus-alerts"
@@ -78,15 +94,31 @@ GH_OWNER = "Ohio15"
 SEMVER_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 
 
-def run(cmd: list[str], cwd: Path | None = None, check: bool = False) -> tuple[int, str, str]:
-    """Run a subprocess. Returns (rc, stdout, stderr)."""
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+def run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    check: bool = False,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run a subprocess. Returns (rc, stdout, stderr).
+
+    A timeout expiry is reported as rc 124 (the coreutils convention) with
+    the message in stderr rather than raised, so a single hung remote can
+    never abort the whole scan.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=check,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s: {' '.join(cmd)}"
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -213,6 +245,161 @@ def noise_files(repo: Path, tracked: list[str]) -> list[str]:
     return sorted(hits)
 
 
+def parse_gitmodules(repo: Path) -> list[dict[str, str]]:
+    """Return [{name, path, url, branch}] from the superproject's .gitmodules
+    (branch defaults to SUBMODULE_DEFAULT_BRANCH). Uses git's own parser so
+    quoting/whitespace edge cases match what `git submodule` would see."""
+    gm = repo / ".gitmodules"
+    if not gm.is_file():
+        return []
+    rc, out, _ = run(["git", "config", "-f", str(gm), "--get-regexp", r"^submodule\..*\.path$"], cwd=repo)
+    if rc != 0:
+        return []
+    mods: list[dict[str, str]] = []
+    for line in out.splitlines():
+        key, _, path = line.partition(" ")
+        name = key[len("submodule."):-len(".path")]
+        if not name or not path:
+            continue
+        rc_u, url, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.url"], cwd=repo)
+        rc_b, branch, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.branch"], cwd=repo)
+        mods.append({
+            "name": name,
+            "path": path.strip(),
+            "url": url.strip() if rc_u == 0 else "",
+            "branch": branch.strip() if rc_b == 0 and branch.strip() else SUBMODULE_DEFAULT_BRANCH,
+        })
+    return mods
+
+
+def submodule_pointer(repo: Path, path: str) -> str | None:
+    """The commit the superproject's HEAD records for <path> (gitlink mode
+    160000), or None if HEAD has no gitlink there."""
+    rc, out, _ = run(["git", "ls-tree", "HEAD", "--", path], cwd=repo)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        meta, _, _ = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[0] == "160000" and parts[1] == "commit":
+            return parts[2]
+    return None
+
+
+def remote_branch_head(url: str, branch: str) -> tuple[str | None, str]:
+    """(sha, error). Read-only: `git ls-remote` never touches local refs.
+    Prompts are disabled so a private remote without cached credentials
+    fails fast instead of hanging the cron run."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    rc, out, err = run(
+        ["git", "ls-remote", "--", url, f"refs/heads/{branch}"],
+        timeout=SUBMODULE_LS_REMOTE_TIMEOUT, env=env,
+    )
+    if rc != 0:
+        return None, err.strip() or f"ls-remote rc={rc}"
+    for line in out.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.strip() == f"refs/heads/{branch}" and len(sha) >= 40:
+            return sha.strip(), ""
+    return None, f"refs/heads/{branch} not found on {url}"
+
+
+def submodule_lag(child: Path, pointer: str, head: str) -> tuple[int | None, bool]:
+    """(lag, crosses_version_bump) for pointer..head measured in the child's
+    checkout. lag is None when the checkout lacks either object (a fetch would
+    resolve it, but the scan is read-only). A bump is a commit in the range
+    whose subject looks like a release OR whose diff changes the "version"
+    field of package.json / version.json."""
+    if not is_git_repo(child):
+        return None, False
+    rng = f"{pointer}..{head}"
+    rc, out, _ = run(["git", "rev-list", "--count", rng], cwd=child)
+    if rc != 0:
+        return None, False
+    try:
+        lag = int(out.strip())
+    except ValueError:
+        return None, False
+    if lag == 0:
+        return 0, False
+    rc, subjects, _ = run(["git", "log", "--format=%s", rng], cwd=child)
+    if rc == 0 and any(VERSION_BUMP_SUBJECT_RE.search(s) for s in subjects.splitlines()):
+        return lag, True
+    # Compare the parsed "version" value at both ends rather than pickaxing
+    # the diff: a reformat or a dependency edit rewrites the line without
+    # changing the release, and must not be reported as one.
+    for rel in VERSION_FILES:
+        if version_field_at(child, pointer, rel) != version_field_at(child, head, rel):
+            return lag, True
+    return lag, False
+
+
+def version_field_at(child: Path, rev: str, rel: str) -> str | None:
+    """The top-level "version" string of <rel> at <rev>, or None when the file
+    is absent, unparseable, or has no such field."""
+    rc, out, _ = run(["git", "show", f"{rev}:{rel}"], cwd=child)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    v = data.get("version") if isinstance(data, dict) else None
+    return v if isinstance(v, str) else None
+
+
+def scan_submodule_pointer_lag(repo: Path) -> list[dict[str, Any]]:
+    """cortex-core ADR 0012: one `submodule-pointer-lag` finding per submodule
+    whose recorded pointer is not the child's remote branch head. MEDIUM when
+    the lag range contains a version bump, LOW otherwise (including the
+    unknown-lag and pointer-not-on-branch cases). Side-effect-free."""
+    findings: list[dict[str, Any]] = []
+    for mod in parse_gitmodules(repo):
+        path, url, branch = mod["path"], mod["url"], mod["branch"]
+        fix = f"git -C {repo} submodule update --remote -- {path} && git add {path} && commit the pointer bump"
+        pointer = submodule_pointer(repo, path)
+        if pointer is None:
+            continue  # declared but not a gitlink at HEAD: nothing to compare
+        if not url:
+            continue
+        head, err = remote_branch_head(url, branch)
+        if head is None:
+            findings.append({
+                "severity": "LOW",
+                "code": "submodule-pointer-unverified",
+                "submodule": path,
+                "branch": branch,
+                "pointer": pointer,
+                "note": f"could not read {url} {branch}: {err}",
+            })
+            continue
+        if head == pointer:
+            continue
+        lag, bump = submodule_lag(repo / path, pointer, head)
+        if lag == 0:
+            # head is reachable from pointer: the pointer is AHEAD of (or off)
+            # the remote branch -- an unpushed or non-branch commit.
+            severity, detail = "LOW", f"pointer {pointer[:7]} is not an ancestor of origin/{branch} {head[:7]} (unpushed or off-branch)"
+        elif lag is None:
+            severity, detail = "LOW", f"pointer {pointer[:7]} != origin/{branch} {head[:7]}; lag unknown (child checkout lacks the remote head)"
+        elif bump:
+            severity, detail = "MEDIUM", f"pointer {pointer[:7]} lags origin/{branch} {head[:7]} by {lag} commit(s) across a version bump"
+        else:
+            severity, detail = "LOW", f"pointer {pointer[:7]} lags origin/{branch} {head[:7]} by {lag} commit(s)"
+        findings.append({
+            "severity": severity,
+            "code": "submodule-pointer-lag",
+            "submodule": path,
+            "branch": branch,
+            "pointer": pointer,
+            "remote_head": head,
+            "lag": lag,
+            "crosses_version_bump": bump,
+            "note": f"{detail}; superproject pointer lags child: {fix}",
+        })
+    return findings
+
+
 def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
     name = repo.name
     findings: list[dict[str, Any]] = []
@@ -300,6 +487,9 @@ def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
             "last_commit_age_days": age,
         })
 
+    # MEDIUM/LOW: superproject submodule pointer lag (ADR 0012)
+    findings.extend(scan_submodule_pointer_lag(repo))
+
     # LOW: noise
     noise = noise_files(repo, tracked)
     if noise:
@@ -357,6 +547,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 extras.append(f"age={f['last_commit_age_days']}d")
             if "oldest_age_days" in f:
                 extras.append(f"oldest={f['oldest_age_days']}d")
+            if "submodule" in f:
+                extras.append(f"submodule={f['submodule']}")
+            if "lag" in f:
+                extras.append(f"lag={'?' if f['lag'] is None else f['lag']}")
             if extras:
                 head += " (" + ", ".join(extras) + ")"
             lines.append(head)

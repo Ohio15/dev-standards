@@ -91,6 +91,7 @@ Every Ron-owned repo, before it can be release-piloted via dev-standards reusabl
 6. ntfy alert to `nexus-alerts` when N≥2 releases behind
 7. Output: JSON to `<output-dir>/hygiene-scan-<YYYY-MM-DD>.json`, optional `--brain-store` for shared-brain ingestion
 8. Workspace layout floor (synthetic `[layout]`, `[worktrees]`, `[scratch]` entries): linked worktrees and clutter/probe folders under the Projects root or one level inside a namespace dir (HIGH), duplicate clones of one origin and loose root files (MEDIUM), non-git orphan folders (LOW); clean+merged or orphan entries under `D:/Worktrees` (MEDIUM); `D:/Scratch` entries older than 30 days (LOW)
+9. Submodule pointer lag (cortex-core ADR 0012, ratified 2026-09-09): for every superproject with a `.gitmodules`, each recorded pointer is compared read-only (`git ls-remote`, never a fetch) to the child's `origin/<branch>` head. Lag across a version bump in the child — a `bump`/semver commit subject or a changed `"version"` field in `package.json`/`version.json` — is MEDIUM (`submodule-pointer-lag`); any other lag, a pointer the remote branch does not contain, or an unreadable remote (`submodule-pointer-unverified`) is LOW. Interim rule that the finding enforces: a session that merges into a submodule child (e.g. `cortex-core`, `cortex-hooks`) bumps the `Ohio15/cortex` superproject pointer in the same session.
 
 Findings are advisory, not blocking — Ron triages weekly.
 
