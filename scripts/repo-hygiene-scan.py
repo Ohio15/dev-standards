@@ -1358,7 +1358,9 @@ def scan_worktrees_root(root: Path) -> dict[str, Any]:
             if leaf.is_file():
                 loose.append(rel)
                 continue
-            if leaf.is_symlink():
+            # Git Bash `ln -s` on Windows produces a JUNCTION, which Python
+            # reports via is_junction() (3.12+), not is_symlink().
+            if leaf.is_symlink() or getattr(leaf, "is_junction", lambda: False)():
                 # Dependency shim for `file:../<sibling>` package links (e.g.
                 # D:/Worktrees/cortex-hooks/cortex-core -> D:/Projects/cortex/cortex-core)
                 # so a worktree resolves the same relative path as the main
