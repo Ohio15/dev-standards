@@ -3,7 +3,8 @@
 Repo hygiene scanner — flags drift, misconfig, and noise across git repos.
 
 Scans one or more configured root directories, walks each immediate
-subdirectory that contains a .git folder, and produces a structured
+subdirectory that contains a .git folder (plus one namespace level:
+<root>/<namespace>/<repo>, per STANDARDS.md §2), and produces a structured
 report. Designed to run from cron weekly; idempotent and side-effect-free
 on the scanned repos.
 
@@ -138,10 +139,15 @@ def is_git_repo(path: Path) -> bool:
 
 
 def discover_repos(roots: list[Path]) -> list[Path]:
-    """Find immediate-subdirectory git repos under each root.
+    """Find git repos under each root: immediate subdirectories, plus one
+    namespace level (STANDARDS.md §2: `D:/Projects/<namespace>/<repo>`).
 
-    Does not recurse — keeps the scan bounded and predictable. If a root
-    is itself a git repo, it's included.
+    A non-repo, non-hidden child directory is treated as a namespace and its
+    immediate git-repo children are included (2026-09-11: AIWebBrowser,
+    Shared-Brain and cortex-hooks were invisible to every per-repo finding
+    because the scan stopped at the top level). Recursion stops there —
+    the scan stays bounded and predictable. If a root is itself a git repo,
+    it's included.
     """
     found: list[Path] = []
     seen: set[Path] = set()
@@ -151,8 +157,19 @@ def discover_repos(roots: list[Path]) -> list[Path]:
         candidates = [root] if is_git_repo(root) else []
         try:
             for child in sorted(root.iterdir()):
-                if child.is_dir() and is_git_repo(child):
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                if is_git_repo(child):
                     candidates.append(child)
+                    continue
+                if child.name in LAYOUT_ALLOWED_ROOT_DIRS:
+                    continue
+                try:
+                    for grandchild in sorted(child.iterdir()):
+                        if grandchild.is_dir() and is_git_repo(grandchild):
+                            candidates.append(grandchild)
+                except PermissionError:
+                    continue
         except PermissionError:
             continue
         for c in candidates:

@@ -16,7 +16,8 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 | `templates/.large-files-allowlist` | Annotated template for per-repo large-file exemptions. |
 | `templates/.gitleaks.toml` | Baseline gitleaks ruleset (default rules + Ron-specific patterns). |
 | `install.sh` | One-shot installer that wires the guards into a target repo. |
-| `scripts/repo-hygiene-scan.py` | Weekly hygiene scanner — drift, misconfig, noise, idle repos. |
+| `scripts/repo-hygiene-scan.py` | Weekly hygiene scanner — drift, misconfig, noise, idle repos. Scans top-level repos plus one namespace level (`<root>/<ns>/<repo>`). |
+| `scripts/hygiene-scan-cron.sh` | Cron entry point: fast-forwards the dev-standards checkout, then runs the scanner. The NEXUS checkout was found 46 commits behind on 2026-09-11 because nothing else advanced it. |
 | `scripts/npm-audit-weekly.sh` | Weekly `npm audit` roll-up + KEV cross-reference. |
 | `credential-rotation/PROTOCOL.md` | Credential rotation protocol v1. |
 | `security/SECURITY-CHECKS.md` | The per-session security REGISTER: enumerated defect shapes (SC-01…SC-21), each with a mechanical check. `install.sh` copies it to the target repo root; `/security-gate` reviews every change against it. |

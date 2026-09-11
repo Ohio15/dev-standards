@@ -35,9 +35,12 @@ name: promote-canary
 #
 #   Canary contract (owned by Ohio15/dev-standards-canary, IMPL-11 sibling):
 #     - canary `release.yml` must trigger on `push: tags: ['v1-rc*']`.
-#     - canary `release.yml` must call dev-standards reusable workflows at
-#       the matching ref (`@${{ github.ref_name }}`), not `@main` — so that
-#       v1-rcN actually exercises the dev-standards commit being promoted.
+#     - canary `release.yml` calls dev-standards reusable workflows at
+#       `@main`. GitHub does not evaluate expressions in `uses:` for
+#       reusable workflows, so `@${{ github.ref_name }}` is not possible.
+#       Because tag-rc tags `main` HEAD, `@main` exercises the RC commit
+#       unless another merge lands during the watch window — accepted
+#       approximation (issue #7, 2026-09-11).
 #     - canary runs MUST set head_branch to the tag name (default for
 #       tag-push events; documented here so the monitor query stays valid).
 #
