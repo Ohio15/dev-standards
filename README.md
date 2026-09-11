@@ -215,6 +215,8 @@ Weekly scanner that walks one or more configured roots and flags:
 | MEDIUM | `stale-working-tree` | Modified or untracked files older than `--age-threshold` days (default 7) |
 | MEDIUM | `hooks-path-legacy` | `core.hooksPath` still pointing at retired `D:/Projects/git-hooks` |
 | MEDIUM | `hooks-path-misconfigured` | `.githooks/` exists but `core.hooksPath` doesn't point at it |
+| MEDIUM | `hook-drift` | A `.githooks/` file differs (line endings ignored) from the canonical copy in `hooks/` — dev-standards #5; re-run `install.sh` |
+| MEDIUM | `hook-missing` | A canonical `hooks/` file is not installed in the repo's `.githooks/` — re-run `install.sh` |
 | LOW | `idle-repo` | No commits in 30+ days |
 | LOW | `noise-files` | `.DS_Store`, `*.swp`, `Thumbs.db` tracked or untracked |
 | MEDIUM | `submodule-pointer-lag` | A superproject's recorded submodule pointer lags the child's `origin/<branch>` head across a version bump (`bump`/semver subject, or a changed `"version"` field in `package.json`/`version.json`) — cortex-core ADR 0012 |
