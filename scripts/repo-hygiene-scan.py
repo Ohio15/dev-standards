@@ -13,6 +13,9 @@ Findings (severity-tagged):
     MEDIUM  working-tree drift older than --age-threshold days
     MEDIUM  core.hooksPath misconfigured (legacy or non-.githooks while
             .githooks/ exists)
+    MEDIUM  hook drift: a .githooks/ file differs from the canonical copy in
+            dev-standards hooks/ (hook-drift), or a canonical hook is not
+            installed at all (hook-missing) — re-run install.sh
     LOW     last commit older than 30 days (idle warning)
     LOW     noise files (.DS_Store, *.swp, Thumbs.db) tracked or
             untracked
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -52,6 +56,13 @@ from pathlib import Path
 from typing import Any
 
 LEGACY_HOOKSPATH = "D:/Projects/git-hooks"
+# --- Hook drift (dev-standards #5) -----------------------------------------
+# install.sh copies hooks/* into <repo>/.githooks/. Nothing re-syncs them, so
+# the copies diverge by hand (2026-09-11: 26 repos carried an unversioned
+# commit-msg hook in three different states). The canonical set is the hooks/
+# directory next to this script's parent; compare after normalising CRLF so a
+# core.autocrlf checkout is not reported as drift.
+CANONICAL_HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
 NOISE_NAMES = {".DS_Store", "Thumbs.db"}
 NOISE_SUFFIXES = {".swp"}
 BINARY_SUFFIXES = {
@@ -400,6 +411,56 @@ def scan_submodule_pointer_lag(repo: Path) -> list[dict[str, Any]]:
     return findings
 
 
+def _hook_digest(path: Path) -> str:
+    """sha256 of a hook file with CRLF folded to LF (checkout-neutral)."""
+    data = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
+def scan_hook_drift(repo: Path, canonical_dir: Path = CANONICAL_HOOKS_DIR) -> list[dict[str, Any]]:
+    """MEDIUM `hook-drift` / `hook-missing` for a repo onboarded to .githooks/.
+
+    Read-only. Only repos that already have a `.githooks/` directory are
+    judged — a repo with none is simply not onboarded, which the layout and
+    hooksPath checks cover. Every file in the canonical `hooks/` directory is
+    expected verbatim (modulo line endings) under `.githooks/`; local edits are
+    drift because install.sh overwrites them on the next run anyway.
+    """
+    githooks_dir = repo / ".githooks"
+    if not githooks_dir.is_dir() or not canonical_dir.is_dir():
+        return []
+
+    drifted: list[dict[str, str]] = []
+    missing: list[str] = []
+    for canon in sorted(p for p in canonical_dir.iterdir() if p.is_file()):
+        installed = githooks_dir / canon.name
+        if not installed.is_file():
+            missing.append(canon.name)
+            continue
+        want, have = _hook_digest(canon), _hook_digest(installed)
+        if want != have:
+            drifted.append({"hook": canon.name, "canonical": want[:12], "installed": have[:12]})
+
+    findings: list[dict[str, Any]] = []
+    if drifted:
+        findings.append({
+            "severity": "MEDIUM",
+            "code": "hook-drift",
+            "count": len(drifted),
+            "items": drifted,
+            "note": ".githooks/ copy differs from dev-standards hooks/; re-run install.sh",
+        })
+    if missing:
+        findings.append({
+            "severity": "MEDIUM",
+            "code": "hook-missing",
+            "count": len(missing),
+            "items": missing,
+            "note": "canonical hook not installed in .githooks/; re-run install.sh",
+        })
+    return findings
+
+
 def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
     name = repo.name
     findings: list[dict[str, Any]] = []
@@ -477,6 +538,9 @@ def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
             "value": hp,
             "note": ".githooks/ exists but core.hooksPath does not point at it",
         })
+
+    # MEDIUM: installed hooks diverged from dev-standards hooks/ (issue #5)
+    findings.extend(scan_hook_drift(repo))
 
     # LOW: idle
     age = last_commit_age_days(repo)
