@@ -6,6 +6,7 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 
 | Path | Purpose |
 |---|---|
+| `hooks/commit-msg` | Subject must be `<type>[(scope)][!]: <summary>` (feat, fix, refactor, chore, docs, test, perf, security, build, ci); merge/revert exempt; past tense rejected. Attribution trailers (`Co-Authored-By:`, `Claude-Session:`) are **allowed**; PR boilerplate (`Generated with`, `Auditor:`) is rejected. Tests: `scripts/tests/test_commit_msg_hook.py`. |
 | `hooks/pre-commit` | Chained dispatcher. Runs every `pre-commit-*.sh` sub-hook in sorted order; first failure aborts the commit. |
 | `hooks/pre-commit-size-guard.sh` | Rejects staged files >10 MB unless allowlisted. |
 | `hooks/pre-commit-secret-scan.sh` | Runs `gitleaks protect --staged` to block commits introducing secrets. |
@@ -39,7 +40,7 @@ This replaces the earlier `core.hooksPath = D:/Projects/git-hooks` global model,
 ```bash
 ./install.sh /path/to/target-repo
 cd /path/to/target-repo
-git add .githooks .github/workflows/size-guard.yml .large-files-allowlist .gitleaks.toml
+git add .githooks .github/workflows/size-guard.yml .large-files-allowlist .gitleaks.toml SECURITY-CHECKS.md
 git commit -m "ci: install dev-standards guards"
 git push
 ```

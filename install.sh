@@ -33,7 +33,12 @@ cp "$here/hooks/pre-commit-size-guard.sh" "$target/.githooks/pre-commit-size-gua
 cp "$here/hooks/pre-commit-secret-scan.sh" "$target/.githooks/pre-commit-secret-scan.sh"
 cp "$here/hooks/pre-commit-healthcheck-lint.sh" "$target/.githooks/pre-commit-healthcheck-lint.sh"
 cp "$here/hooks/pre-commit-tests.sh" "$target/.githooks/pre-commit-tests.sh"
+# commit-msg: conventional subject + attribution-trailer policy (issue #5).
+# Always overwritten — the per-repo copies diverged for five months before
+# this file existed; the hook is a contract, not repo-specific tuning.
+cp "$here/hooks/commit-msg" "$target/.githooks/commit-msg"
 chmod +x \
+  "$target/.githooks/commit-msg" \
   "$target/.githooks/pre-commit" \
   "$target/.githooks/pre-commit-size-guard.sh" \
   "$target/.githooks/pre-commit-secret-scan.sh" \
@@ -67,6 +72,7 @@ fi
 git -C "$target" config core.hooksPath .githooks
 
 echo "Installed into $target"
+echo "  .githooks/commit-msg                  (conventional subject; attribution trailers allowed)"
 echo "  .githooks/pre-commit                  (chained dispatcher)"
 echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
 echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
