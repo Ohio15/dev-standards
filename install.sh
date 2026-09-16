@@ -44,6 +44,11 @@ chmod +x \
   "$target/.githooks/pre-commit-secret-scan.sh" \
   "$target/.githooks/pre-commit-healthcheck-lint.sh" \
   "$target/.githooks/pre-commit-tests.sh"
+# chmod alone is lost on every fresh clone and is invisible on Windows
+# (core.filemode=false): git decides whether to RUN a hook from the mode in
+# the index. Record 100755 there, so a POSIX clone does not silently skip the
+# whole chain (audit-openos-2026-09-16: 31 of 32 repos carried 100644).
+git -C "$target" add --chmod=+x   ".githooks/commit-msg"   ".githooks/pre-commit"   ".githooks/pre-commit-size-guard.sh"   ".githooks/pre-commit-secret-scan.sh"   ".githooks/pre-commit-healthcheck-lint.sh"   ".githooks/pre-commit-tests.sh"
 
 # CI workflows.
 #   size-guard.yml      — always-on tracked-file size guard
@@ -84,6 +89,7 @@ echo "  SECURITY-CHECKS.md                    (security register — always refr
 echo "  .large-files-allowlist                (if not present)"
 echo "  .gitleaks.toml                        (if not present)"
 echo "  git config core.hooksPath .githooks   (local)"
+echo "  hooks staged with mode 100755          (git add --chmod=+x)"
 echo
 echo "Layer B (weekly auto-apply) is OPT-IN per repo. To enable, create an"
 echo "empty enrollment file (NOT done by this installer):"

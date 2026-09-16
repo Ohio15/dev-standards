@@ -85,18 +85,31 @@ keywords = ["sk-"]
 # Allowlists: paths and patterns that are scanned but never reported.
 # ---------------------------------------------------------------------------
 
-[allowlist]
-description = "Project-wide allowlist for dev-standards baseline"
+# One allowlist per intent (gitleaks >= 8.21 syntax). Within an allowlist the
+# default is OR across paths/regexes; `condition = "AND"` makes a placeholder
+# regex apply ONLY inside fixture paths. A global regex over the secret body
+# would suppress any real credential that happens to contain "xxx" or eight
+# zeroes, repo-wide and silently (audit-openos-2026-09-16).
 
 # Don't flag the gitleaks config itself; the regexes contain the exact patterns
 # they're meant to catch.
+[[allowlists]]
+description = "gitleaks config files"
 paths = [
   '''(?i)\.gitleaks\.toml$''',
   '''(?i)gitleaks\.toml\.template$''',
 ]
 
-# Don't flag obvious example/placeholder values inside fixture and sample files.
+# Placeholder values, but only inside fixture / sample / test paths.
+[[allowlists]]
+description = "placeholder values inside fixture paths"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''(^|/)(test|tests|__tests__|testdata|fixtures?|samples?|examples?)/''',
+]
 regexes = [
   '''(?i)\b(example|sample|placeholder|changeme|your[_\-]?token|xxx+|0{8,}|f{8,}|deadbeef)\b''',
   '''(?i)\bsk-(ant-)?(api|proj)[0-9]{2}?-?[Xx0]{10,}''',
 ]
+
