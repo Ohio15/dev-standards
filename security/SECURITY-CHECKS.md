@@ -326,15 +326,74 @@ drop-oldest on evidence.
 **Since.** 2026-09-09.
 **Origin.** audit-cortex-hooks-2026-09-09.
 
+### SC-22 · A plain-object map indexed by attacker-chosen text
+**Shape.** A lookup table (`{}` literal, `Record<K, …>` under any key type,
+or `x in obj`) keyed by a program name, verb, subcommand, tool name or any
+other string the guarded party supplies. `__proto__`, `constructor`,
+`toString` and every other `Object.prototype` name resolve to a truthy
+non-handler; the code then calls it (throw → every fail-open consumer allows)
+or interpolates it (a native-function body reaches a message). The canon
+lexer had two, and one word took the whole shell-side plane down.
+**Check.** `grep -nE "\[(program|programName\(|verb|sub|name|key|tool)[A-Za-z]*\]" hooks/*.ts`
+and `grep -nE "\bin [A-Z_]+\b" hooks/*.ts`; every hit keyed by external text
+must be a `Map`, an `Object.create(null)` table, or guarded by
+`Object.hasOwn` on the read. A fixture that feeds `__proto__`, `constructor`,
+`toString`, `hasOwnProperty` as the program/verb/sub to every detector and
+asserts the plain-command verdict, plus a derived scan over every
+module-level table read with a variable key, in every spelling of the
+declaration and in every module that reads it (SC-20 applies to the scan
+itself). Reference fixture: cortex-hooks `hooks/hostile-program-names.test.ts`.
+**Fix form.** Null-prototype tables or a `Map`; `hasOwn` at the lookup; the
+lexer asserts the resolved handler is a function.
+**Since.** 2026-09-16.
+**Origin.** audit-cortex-hooks-2026-09-15 (CRITICAL; approved by Ron
+2026-09-16).
+
+### SC-23 · A hook's registration or tool family is narrower than the
+predicate it implements
+**Shape.** The detector matches every MCP alias, every file tool, every
+process channel — and the settings matcher, the `CONTENT_TOOLS` set, or the
+`SHELL_TOOLS` set the entry point consults names fewer. The conformance check
+confirms the matcher is present, not that it covers the predicate. One added
+alias or one added tool channel and a block-tier rule enforces nothing, while
+the CHANGELOG says "every row enforced".
+**Check.** For every PreToolUse guard, derive the predicate's tool set from
+source (the regex or set the core exports) and the registered matcher from
+the live settings block the generator emits; assert matcher ⊇ predicate. One
+exported tool-family constant per channel (shell, content, MCP file/process)
+consumed by every guard and by the resource layer, with a derived membership
+test that fails when a member is added to one set and not the others.
+**Fix form.** Generate the settings matcher from the predicate; one family
+constant; conformance asserts inclusion, not presence.
+**Since.** 2026-09-16.
+**Origin.** audit-cortex-hooks-2026-09-15 (HIGH; approved by Ron 2026-09-16).
+
+### SC-24 · A transport exemption that never checks the destination
+**Shape.** "Under ssh it is remote, so it is allowed"; "`-H ssh://` means
+another machine". The exemption is keyed on the transport's presence and
+never on where it goes, so `localhost`, `127.0.0.1`, `::1`, the machine's
+own hostname and `ssh://localhost` all earn the remote exemption while acting
+on this host. The refusal text advertises the exemption as the intended
+alternative.
+**Check.** `grep -n "remote = true\|ssh://\|isRemote\|transport" hooks/*.ts`;
+every exemption must classify the destination against a loopback/own-host set
+before it applies. Fixture pairs (`ssh <host> X` vs `ssh localhost X`,
+`-H ssh://<host>` vs `-H ssh://127.0.0.1`) for every rule that carries a
+remote exemption, asserted to differ.
+**Fix form.** Resolve the destination first; loopback and own-hostname are
+local; only then apply the transport exemption.
+**Since.** 2026-09-16.
+**Origin.** audit-cortex-hooks-2026-09-15 (HIGH; approved by Ron 2026-09-16).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
 
 Audits append proposals here in the format above with a
 `**Proposed by.** audit-<repo>-<date>` line; the operator moves an approved
-proposal into the register and bumps its `Since` date. SC-22..SC-24 are
-reserved by audit-cortex-hooks-2026-09-15 (recorded in that run's file,
-pending the operator); the next free number is used below.
+proposal into the register and bumps its `Since` date. SC-22..SC-24 were
+graduated from audit-cortex-hooks-2026-09-15 on 2026-09-16; the next free
+number is used below.
 
 ### SC-25 · A third-party CI Action referenced by a floating tag or branch
 rather than a commit SHA
