@@ -1,0 +1,5 @@
+# Test-only dependencies of scripts/tests (python -m pytest scripts/tests -q).
+# Declared so the Layer A gate (security-audit.yml) has a manifest to audit here
+# rather than an opt-out: this repo does depend on these.
+pytest==9.1.1
+PyYAML==6.0.3
