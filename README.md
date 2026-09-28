@@ -116,13 +116,20 @@ Two-layer model for keeping dependencies patched without burning weekly attentio
 
 ### Layer A — `security-audit.yml` (always on)
 
-Drop-in CI gate that runs on every pull request, every push to `main`/`master`, and on manual dispatch. Detect-and-dispatch: each ecosystem job is conditional on the presence of its lockfile or manifest, so the same workflow file works in pure-Node, pure-Go, polyglot, or empty repos.
+Drop-in CI gate that runs on every pull request, every push to `main`/`master`, and on manual dispatch. Detect-and-dispatch: every tracked manifest **anywhere in the tree** (`git ls-files`, never `node_modules`) selects its ecosystem, and each ecosystem job runs once per manifest directory. The same workflow file works in pure-Node, pure-Go, polyglot and monorepo layouts.
 
-| Ecosystem | Trigger | Tool | Gate |
+| Ecosystem | Trigger (any directory) | Tool | Gate |
 |---|---|---|---|
-| npm    | `package.json` present | `npm audit` (or `pnpm audit`) | fails on **high** or **critical** |
-| Go     | `go.mod` present       | `govulncheck`                 | fails on any reachable vulnerability |
-| Python | `requirements*.txt` or `pyproject.toml` | `pip-audit --strict` | fails on any vuln |
+| npm    | `package.json` | `npm audit` (or `pnpm audit`) | fails on **high** or **critical** |
+| Go     | `go.mod`       | `govulncheck`                 | fails on any reachable vulnerability |
+| Python | `requirements*.txt` or `pyproject.toml` | `pip-audit --strict` (`pip-audit --strict .` for a pyproject) | fails on any vuln |
+
+**Unknown is never clean.** The summary job fails when:
+- a detected ecosystem's job did not succeed, including when it was `skipped`;
+- detection itself failed;
+- a job ran for an ecosystem that was not detected.
+
+A repo with no manifest at all fails too, unless it says why in `.github/security-audit-no-manifests`, which must not be empty. Until 2026-09-28 detection looked only at the repo root, and `skipped` counted as a pass. ai-console, whose manifests live in `console/`, was green on every PR having examined nothing (audit-ai-console-2026-09-28, proposed SC-26). `scripts/tests/test_security_audit_workflow.py` runs the shipped `detect` and `summary` scripts against throwaway repos, so that regression cannot return silently.
 
 Moderate / low findings are logged to the workflow summary but don't fail the build. Layer A is **not** opt-in — it runs unconditionally on every repo `install.sh` touches.
 
