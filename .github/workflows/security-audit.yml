@@ -65,6 +65,12 @@ jobs:
             git ls-files -z -- "$@" | python3 -c '
           import json, posixpath, sys
           paths = [p for p in sys.stdin.buffer.read().decode().split("\0") if p]
+          # A directory name is repo content a PR controls. A control character
+          # (a newline above all) could forge a `::command::` line when a later
+          # step echoes it, so refuse, never pass it on.
+          hostile = [p for p in paths if any(ord(c) < 0x20 or ord(c) == 0x7f for c in p)]
+          if hostile:
+              sys.exit("control character in manifest path(s): " + ", ".join(repr(p) for p in hostile))
           keep = sorted({posixpath.dirname(p) or "." for p in paths
                          if "node_modules" not in p.split("/")})
           print(json.dumps(keep))'
@@ -233,6 +239,11 @@ jobs:
 
       - name: Run pip-audit (--strict gates the workflow)
         shell: bash
+        # Values reach the script through env, never `${{ }}` inside run:
+        # a directory name is PR-controlled text, and an expression is
+        # pasted into the script before bash parses it (script injection).
+        env:
+          DIR: ${{ matrix.dir }}
         run: |
           set -euo pipefail
           # Prefer pyproject if both exist. The project PATH is required: a bare
@@ -247,7 +258,7 @@ jobs:
             if [ ${#files[@]} -eq 0 ]; then
               # detect chose this directory for a python manifest; finding none
               # here means detect and audit disagree, which is never a pass.
-              echo "::error::python detected in '${{ matrix.dir }}' but no requirements*.txt or pyproject.toml there; nothing was audited"
+              echo "::error::python detected in '$DIR' but no requirements*.txt or pyproject.toml there; nothing was audited"
               exit 1
             fi
             for f in "${files[@]}"; do
@@ -263,21 +274,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - shell: bash
+        # Every value through env, never `${{ }}` inside run: the *_DIRS lists
+        # are PR-controlled directory names (script injection otherwise).
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          HAS_NPM: ${{ needs.detect.outputs.has_npm }}
+          HAS_GO: ${{ needs.detect.outputs.has_go }}
+          HAS_PYTHON: ${{ needs.detect.outputs.has_python }}
+          NPM_DIRS: ${{ needs.detect.outputs.npm_dirs }}
+          GO_DIRS: ${{ needs.detect.outputs.go_dirs }}
+          PYTHON_DIRS: ${{ needs.detect.outputs.python_dirs }}
+          NPM_RESULT: ${{ needs.npm-audit.result }}
+          GO_RESULT: ${{ needs.go-vulncheck.result }}
+          PYTHON_RESULT: ${{ needs.pip-audit.result }}
         run: |
           set -euo pipefail
-          echo "## Security audit summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Ecosystem | Detected | Result |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| npm    | ${{ needs.detect.outputs.npm_dirs }}    | ${{ needs.npm-audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| go     | ${{ needs.detect.outputs.go_dirs }}     | ${{ needs.go-vulncheck.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| python | ${{ needs.detect.outputs.python_dirs }} | ${{ needs.pip-audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Security audit summary"
+            echo ""
+            echo "| Ecosystem | Detected | Result |"
+            echo "|---|---|---|"
+            echo "| npm    | $NPM_DIRS    | $NPM_RESULT |"
+            echo "| go     | $GO_DIRS     | $GO_RESULT |"
+            echo "| python | $PYTHON_DIRS | $PYTHON_RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
           # Three-valued: a detected ecosystem must SUCCEED (skipped, cancelled
           # or timed out is not examined, never clean); an undetected one must
           # have been skipped; and detection itself must have succeeded.
           fail=0
-          if [ "${{ needs.detect.result }}" != "success" ]; then
-            echo "::error::ecosystem detection did not succeed (${{ needs.detect.result }}); nothing can be called clean"
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "::error::ecosystem detection did not succeed ($DETECT_RESULT); nothing can be called clean"
             fail=1
           fi
           check() { # <ecosystem> <detected> <result>
@@ -291,9 +317,9 @@ jobs:
               fail=1
             fi
           }
-          check npm    "${{ needs.detect.outputs.has_npm }}"    "${{ needs.npm-audit.result }}"
-          check go     "${{ needs.detect.outputs.has_go }}"     "${{ needs.go-vulncheck.result }}"
-          check python "${{ needs.detect.outputs.has_python }}" "${{ needs.pip-audit.result }}"
+          check npm    "$HAS_NPM"    "$NPM_RESULT"
+          check go     "$HAS_GO"     "$GO_RESULT"
+          check python "$HAS_PYTHON" "$PYTHON_RESULT"
           if [ "$fail" -eq 1 ]; then
             echo "::error::the dependency audit is not clean. See the job logs."
             exit 1

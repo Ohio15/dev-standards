@@ -172,24 +172,34 @@ def test_an_empty_declaration_is_not_a_declaration(tmp_path, shim_path):
 
 # ─── summary ─────────────────────────────────────────────────────────────────
 
+EXPR = re.compile(r"^\$\{\{\s*([^}]+?)\s*\}\}$")
+
+
 def run_summary(tmp_path: Path, shim_path: str, *, detect: str = "success",
-                npm=("false", "skipped"), go=("false", "skipped"), py=("false", "skipped")):
+                npm=("false", "skipped"), go=("false", "skipped"), py=("false", "skipped"),
+                dirs=("[]", "[]", "[]")):
+    """Run the summary step the way Actions does: each `env:` entry's
+    expression is evaluated, and the script sees only environment variables."""
     values = {
         "needs.detect.result": detect,
         "needs.detect.outputs.has_npm": npm[0], "needs.npm-audit.result": npm[1],
         "needs.detect.outputs.has_go": go[0], "needs.go-vulncheck.result": go[1],
         "needs.detect.outputs.has_python": py[0], "needs.pip-audit.result": py[1],
-        "needs.detect.outputs.npm_dirs": "[]", "needs.detect.outputs.go_dirs": "[]",
-        "needs.detect.outputs.python_dirs": "[]",
+        "needs.detect.outputs.npm_dirs": dirs[0], "needs.detect.outputs.go_dirs": dirs[1],
+        "needs.detect.outputs.python_dirs": dirs[2],
     }
-    script = step_run("summary")
-    unknown = set(re.findall(r"\$\{\{\s*([^}]+?)\s*\}\}", script)) - set(values)
-    assert not unknown, f"summary uses expressions this test does not model: {unknown}"
-    script = re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", lambda m: values[m.group(1)], script)
+    [step] = [s for s in JOBS["summary"]["steps"] if "run" in s]
+    env = {}
+    for name, expr in step.get("env", {}).items():
+        m = EXPR.match(str(expr))
+        assert m and m.group(1) in values, f"summary env {name} uses an expression this test does not model: {expr}"
+        env[name] = values[m.group(1)]
     summ = tmp_path / "summary.md"
-    return subprocess.run([BASH, "-c", script], cwd=tmp_path,
-                          env={**os.environ, "PATH": shim_path, "GITHUB_STEP_SUMMARY": summ.as_posix()},
+    proc = subprocess.run([BASH, "-c", step["run"]], cwd=tmp_path,
+                          env={**os.environ, **env, "PATH": shim_path, "GITHUB_STEP_SUMMARY": summ.as_posix()},
                           capture_output=True, text=True)
+    proc.summary = summ.read_text(encoding="utf-8") if summ.exists() else ""
+    return proc
 
 
 @pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", "timed_out"])
@@ -215,6 +225,46 @@ def test_an_undetected_ecosystem_that_ran_is_a_disagreement(tmp_path, shim_path)
     proc = run_summary(tmp_path, shim_path, npm=("true", "success"), go=("false", "success"))
     assert proc.returncode == 1
     assert "go was not detected but its audit ran" in proc.stdout
+
+
+# ─── injection ───────────────────────────────────────────────────────────────
+# Directory names are repo content a pull request controls. Found by the
+# security gate on this change: `${{ matrix.dir }}` inside a run: body was pasted
+# into the script before bash parsed it.
+
+def test_no_expression_is_pasted_into_any_run_body():
+    offenders = [f"{name}: {step.get('name') or step.get('id') or '?'}"
+                 for name, job in JOBS.items() for step in job.get("steps", [])
+                 if "${{" in step.get("run", "")]
+    assert offenders == [], "values must reach run: through env, never ${{ }}: " + ", ".join(offenders)
+
+
+def test_a_hostile_directory_name_is_data_in_the_summary(tmp_path, shim_path):
+    evil = '["$(touch PWNED)", "`touch PWNED2`"]'
+    proc = run_summary(tmp_path, shim_path, npm=("true", "success"), dirs=(evil, "[]", "[]"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (tmp_path / "PWNED").exists() and not (tmp_path / "PWNED2").exists()
+    assert "$(touch PWNED)" in proc.summary, "the name must appear verbatim, as data"
+
+
+def test_a_control_character_in_a_manifest_path_fails_detection(tmp_path, shim_path):
+    # Git's index accepts a newline in a path even where the filesystem does
+    # not, so add the entry directly. Echoed later, such a name could start a
+    # line with `::` and forge a workflow command.
+    repo = git_repo(tmp_path, {"README.md": "x"})
+    blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input="",
+                          capture_output=True, text=True, check=True).stdout.strip()
+    # core.protectNTFS=false: Git for Windows refuses such paths by default,
+    # but a repo committed on Linux (where the runner lives) can carry them.
+    subprocess.run(["git", "-C", str(repo), "-c", "core.protectNTFS=false", "update-index", "--add", "--cacheinfo",
+                    f"100644,{blob},evil\n::error::forged/pyproject.toml"], check=True)
+    out = tmp_path / "o"
+    out.write_text("", encoding="utf-8")
+    proc = subprocess.run([BASH, "-c", step_run("detect", "detect")], cwd=repo,
+                          env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()},
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "control character in manifest path" in proc.stderr, proc.stderr
 
 
 # ─── structure ───────────────────────────────────────────────────────────────
