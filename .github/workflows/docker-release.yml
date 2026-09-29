@@ -81,6 +81,18 @@ on:
           Default empty-object means no dollar-secrets placeholders are resolvable;
           any such reference in build_args will fail the build with a clear error.
           See header comment for placeholder syntax.
+      runs_on:
+        type: string
+        default: ubuntu-latest
+        description: |
+          Runner label for the gates, read-docker-config and build-and-push jobs.
+          Default keeps GitHub-hosted behaviour for every existing consumer.
+          A single label only (e.g. `nexus-ci` for the fenced ephemeral-VM
+          fleet in Ohio15/infra ci-vm/). Deploy and notify always run on
+          [self-hosted, nexus-deploy] and are not affected by this input.
+          Do NOT pass a nexus-deploy runner's label here: builds on the prod
+          host are excluded by infra/runners/README.md (docker.sock is
+          root-equivalent and builds contend with live traffic).
       version_probe_url:
         type: string
         default: ''
@@ -102,10 +114,12 @@ permissions:
 jobs:
   gates:
     uses: Ohio15/dev-standards/.github/workflows/release-gates.yml@v1
+    with:
+      runs_on: ${{ inputs.runs_on }}
 
   read-docker-config:
     needs: gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       images: ${{ steps.parse.outputs.images }}
@@ -166,7 +180,7 @@ jobs:
 
   build-and-push:
     needs: [gates, read-docker-config]
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     strategy:
       fail-fast: true
       matrix:
