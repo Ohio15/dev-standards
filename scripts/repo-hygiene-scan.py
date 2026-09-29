@@ -39,6 +39,13 @@ Output:
 Optional --brain-store posts the JSON summary to shared-brain via curl
 using the API key at ~/.config/shared-brain/api-key.
 
+Exit codes (the contract schedulers branch on; see hygiene-scan-task.ps1):
+    0   scan completed, no MEDIUM/HIGH findings
+    1   scan completed, highest finding MEDIUM
+    2   scan completed, highest finding HIGH
+    3   scan completed but --brain-store FAILED (outranks findings)
+    70  the scanner itself crashed (EX_SOFTWARE)
+
 Stdlib only. Python 3.8+.
 """
 
@@ -1917,6 +1924,10 @@ def main() -> int:
         ok, msg = post_to_brain(md, scan_date)
         marker = "[brain-store ok]" if ok else "[brain-store failed]"
         print(f"\n{marker} {msg}", file=sys.stderr)
+        if not ok:
+            # Operational failure outranks findings: a report nobody received
+            # is not a report (see the exit-code contract in the docstring).
+            return EXIT_BRAIN_STORE_FAILED
 
     # Exit code reflects severity: HIGH findings = 2, MEDIUM = 1, else 0
     if totals_by_severity.get("HIGH", 0) > 0:
@@ -1926,5 +1937,26 @@ def main() -> int:
     return 0
 
 
+EXIT_BRAIN_STORE_FAILED = 3
+EXIT_CRASH = 70
+
+
+def run_main() -> int:
+    """main() with crashes mapped to EXIT_CRASH (see the exit-code contract).
+
+    An uncaught Python exception exits 1, which is indistinguishable from
+    "MEDIUM findings"; a crashed scan must never read as a normal week.
+    """
+    try:
+        return main()
+    except SystemExit:
+        raise  # argparse usage errors (2) and explicit exits keep their code
+    except Exception:  # noqa: BLE001 - every crash must surface as EXIT_CRASH
+        import traceback
+        traceback.print_exc()
+        print(f"\n[hygiene-scan CRASHED] exit {EXIT_CRASH}", file=sys.stderr)
+        return EXIT_CRASH
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_main())
