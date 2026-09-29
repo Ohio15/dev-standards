@@ -292,10 +292,13 @@ THRESH_CRIT=1 THRESH_HIGH=2 ./scripts/npm-audit-weekly.sh \
 **Windows (Task Scheduler):**
 
 ```powershell
-# Hygiene scan — Sundays 05:00 local
-schtasks /Create /TN "DevStandards-HygieneScan" /SC WEEKLY /D SUN /ST 05:00 /F `
-  /RL LIMITED `
-  /TR "python D:\Projects\dev-standards\scripts\repo-hygiene-scan.py --root D:/Projects --brain-store"
+# Hygiene scan — Sundays 05:00 local, catch-up when missed, logged to
+# ~/scans/hygiene-<date>.log. Registration is code, not a hand-typed line:
+# S4U needs an elevated PowerShell (or pass -LogonType Interactive).
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\Projects\dev-standards\dev-standards\scripts\register-hygiene-task.ps1
+# The task runs scripts/hygiene-scan-task.ps1, which exits 0 whenever the scan
+# RAN (findings of any severity are in the report); non-zero means the scan did
+# not do its job: 3 = brain-store failed, 70 = scanner crash.
 
 # npm audit — Sundays 06:00 local
 # Uses the .cmd wrapper because schtasks /TR doesn't tolerate the quoted
