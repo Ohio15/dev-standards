@@ -1,0 +1,10 @@
+# actionlint configuration. Read by the stability gate's health check
+# (.cortex/stability.json) and by any local `actionlint` run.
+#
+# nexus-deploy is the custom label on the NEXUS self-hosted runner that the
+# docker-release and mcp-release deploy jobs target (runs-on:
+# [self-hosted, nexus-deploy]). Declaring it here is what tells actionlint the
+# label is real; without it every such job is reported as an unknown label.
+self-hosted-runner:
+  labels:
+    - nexus-deploy

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "build": "python -c \"import subprocess as s,tomllib,json;ls=lambda *p:s.check_output(['git','ls-files',*p],text=True).splitlines();py=ls('*.py');assert py,'no python files found';[compile(open(p,'rb').read(),p,'exec') for p in py];tm=ls('*.toml');assert tm,'no toml files found';[tomllib.load(open(p,'rb')) for p in tm];js=ls('*.json');assert js,'no json files found';[json.load(open(p,encoding='utf-8')) for p in js];print('build: compiled',len(py),'python, parsed',len(tm),'toml,',len(js),'json')\"",
+  "test": "uv run --no-project --with-requirements requirements-dev.txt python -m pytest scripts/tests -q",
+  "health": "python -c \"import subprocess as s,sys;f=s.check_output(['git','ls-files','*.sh','hooks/*','.githooks/*'],text=True).splitlines();sys.exit(2 if not f else s.call(['uvx','--from','shellcheck-py==0.10.0.1','shellcheck',*f]))\" && python -c \"import subprocess as s,sys;f=s.check_output(['git','ls-files','.github/workflows/*.yml','templates/.github/workflows/*.yml','workflows/*.yml'],text=True).splitlines();sys.exit(2 if not f else s.call(['go','run','github.com/rhysd/actionlint/cmd/actionlint@v1.7.7','-shellcheck=','-pyflakes=','-oneline',*f]))\"",
+  "base": "origin/main"
+}
