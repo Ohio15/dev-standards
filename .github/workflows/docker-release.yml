@@ -376,6 +376,10 @@ jobs:
 
   deploy:
     needs: [read-docker-config, build-and-push]
+    # A consumer with no docker.deploy block (the canary) has nothing to
+    # deploy and no nexus-deploy runner; without this gate the job waits
+    # for a runner forever and the run never completes.
+    if: needs.read-docker-config.outputs.nexus_path != ''
     runs-on: [self-hosted, nexus-deploy]
     outputs:
       deploy_status: ${{ steps.healthcheck.outputs.status }}
@@ -606,7 +610,7 @@ jobs:
 
   notify:
     needs: [read-docker-config, build-and-push, deploy]
-    if: always()
+    if: always() && needs.read-docker-config.outputs.nexus_path != ''
     runs-on: [self-hosted, nexus-deploy]
     steps:
       - name: Publish ntfy

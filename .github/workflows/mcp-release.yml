@@ -175,6 +175,7 @@ jobs:
 
   deploy:
     needs: [read-mcp-config, build-and-push]
+    if: needs.read-mcp-config.outputs.nexus_path != ''
     runs-on: [self-hosted, nexus-deploy]
     outputs:
       deploy_status: ${{ steps.healthcheck.outputs.status }}
@@ -293,7 +294,7 @@ jobs:
     # that didn't come up. Runs on the self-hosted runner because the pin
     # files live on NEXUS / dev hosts, not in any cloud-runner filesystem.
     needs: [read-mcp-config, build-and-push, deploy]
-    if: needs.deploy.result == 'success' && needs.deploy.outputs.deploy_status != 'unhealthy'
+    if: needs.read-mcp-config.outputs.nexus_path != '' && needs.deploy.result == 'success' && needs.deploy.outputs.deploy_status != 'unhealthy'
     runs-on: [self-hosted, nexus-deploy]
     outputs:
       updated_count: ${{ steps.update.outputs.updated_count }}
@@ -400,7 +401,7 @@ jobs:
 
   notify:
     needs: [read-mcp-config, build-and-push, deploy, update-client-pins]
-    if: always()
+    if: always() && needs.read-mcp-config.outputs.nexus_path != ''
     runs-on: [self-hosted, nexus-deploy]
     steps:
       - name: Publish ntfy
