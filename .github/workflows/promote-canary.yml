@@ -25,9 +25,11 @@ name: promote-canary
 # release/canary-promotion.md.
 #
 # Cross-repo prereqs:
-#   secrets.CANARY_DISPATCH_TOKEN
-#     PAT (or GitHub App installation token) with `contents:write` on BOTH
-#     Ohio15/dev-standards and Ohio15/dev-standards-canary. Required because:
+#   vars.RELEASE_PROMOTER_APP_ID + secrets.RELEASE_PROMOTER_PRIVATE_KEY
+#     A GitHub App (ohio15-release-promoter) with `contents:write` installed on
+#     BOTH Ohio15/dev-standards and Ohio15/dev-standards-canary; each job mints a
+#     short-lived installation token (actions/create-github-app-token) instead of
+#     storing a PAT. Required because:
 #       (a) GITHUB_TOKEN cannot push to dev-standards-canary from this repo;
 #       (b) tag pushes made with GITHUB_TOKEN do not trigger downstream
 #           workflows (the recursion guard suppresses them), and we need the
@@ -108,23 +110,31 @@ jobs:
       skipped: ${{ steps.cut.outputs.skipped }}
     steps:
       # actions/checkout v4.1.7 — full history so `git tag` sees existing v1-rc*
+      - name: Mint release-promoter token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PROMOTER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: dev-standards,dev-standards-canary
       - name: Checkout
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           fetch-depth: 0
           # Use the cross-repo PAT so the tag push triggers downstream
           # workflows. GITHUB_TOKEN-pushed tags are silently suppressed.
-          token: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           persist-credentials: true
 
-      - name: Verify CANARY_DISPATCH_TOKEN is present
+      - name: Verify the promoter token was minted
         shell: bash
         env:
-          T: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          T: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           if [ -z "${T:-}" ]; then
-            echo "::error::CANARY_DISPATCH_TOKEN secret missing. Required to push v1-rcN tags and mirror to canary. See .github/workflows/promote-canary.yml header."
+            echo "::error::release-promoter token not minted. Set repository variable RELEASE_PROMOTER_APP_ID and secret RELEASE_PROMOTER_PRIVATE_KEY (GitHub App with contents:write on dev-standards and dev-standards-canary). See the header of this workflow."
             exit 1
           fi
 
@@ -183,7 +193,7 @@ jobs:
         if: steps.cut.outputs.skipped == 'false'
         shell: bash
         env:
-          T: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
           RC_TAG: ${{ steps.cut.outputs.rc_tag }}
           RC_SHA: ${{ steps.cut.outputs.rc_sha }}
@@ -304,11 +314,19 @@ jobs:
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.force_action == 'monitor' || github.event.inputs.force_action == 'reset'))
     runs-on: ubuntu-latest
     steps:
+      - name: Mint release-promoter token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PROMOTER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: dev-standards,dev-standards-canary
       - name: Checkout
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           fetch-depth: 0
-          token: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           persist-credentials: true
 
       - name: Reset state (manual override only)
@@ -445,13 +463,13 @@ jobs:
         if: steps.state.outputs.status == 'pending' && steps.age.outputs.expired != 'true'
         shell: bash
         env:
-          T: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
           RC: ${{ steps.state.outputs.rc }}
         run: |
           set -euo pipefail
           if [ -z "${T:-}" ]; then
-            echo "::error::CANARY_DISPATCH_TOKEN secret missing."
+            echo "::error::release-promoter token not minted (RELEASE_PROMOTER_APP_ID / RELEASE_PROMOTER_PRIVATE_KEY)."
             exit 1
           fi
           # head_branch is the tag name for tag-push events. Filter to that
@@ -564,7 +582,7 @@ jobs:
         if: steps.runs.outputs.verdict == 'green'
         shell: bash
         env:
-          T: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          T: ${{ steps.app.outputs.token }}
           STATE_FILE: ${{ env.STATE_FILE }}
           STABLE_TAG: ${{ env.STABLE_TAG }}
           RC: ${{ steps.state.outputs.rc }}
