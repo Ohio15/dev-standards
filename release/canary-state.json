@@ -1,9 +1,9 @@
 {
   "_doc": "Canary RC promotion state. Owned by .github/workflows/promote-canary.yml. Do not hand-edit unless recovering from a stuck state — the workflow rewrites this file on every run. Schema documented in release/canary-promotion.md.",
   "schema_version": 1,
-  "current_rc": "v1-rc5",
-  "current_rc_sha": "852d7865eb10a4d38a76a30af4f4ec0fc53c878b",
-  "current_rc_created_at": "2026-10-02T19:50:59Z",
+  "current_rc": "v1-rc6",
+  "current_rc_sha": "3fdb5cd71765af4cc4a8a8cd4a2be4c931852703",
+  "current_rc_created_at": "2026-10-02T20:25:06Z",
   "consecutive_green_runs": 0,
   "last_observed_run_id": null,
   "last_observed_run_conclusion": null,
@@ -40,6 +40,13 @@
       "status": "promoted",
       "green": 2,
       "at": "2026-10-02T19:28:21Z"
+    },
+    {
+      "rc": "v1-rc5",
+      "sha": "852d7865eb10a4d38a76a30af4f4ec0fc53c878b",
+      "status": "superseded",
+      "green": 0,
+      "at": "2026-10-02T20:25:06Z"
     }
   ]
 }
