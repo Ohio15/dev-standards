@@ -115,7 +115,10 @@ jobs:
   gates:
     uses: Ohio15/dev-standards/.github/workflows/release-gates.yml@v1
     with:
-      runs_on: ${{ inputs.runs_on }}
+      # Resolved here, not in release-gates: the gates call is pinned at @v1,
+      # whose runs_on has no fallback, and an empty label fails the called
+      # workflow at validation with no job created (canary v1-rc1, 2026-10-02).
+      runs_on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
 
   read-docker-config:
     needs: gates
