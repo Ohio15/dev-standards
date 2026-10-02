@@ -6,9 +6,9 @@
   "current_rc_created_at": "2026-10-02T17:42:50Z",
   "consecutive_green_runs": 0,
   "last_observed_run_id": null,
-  "last_observed_run_conclusion": null,
+  "last_observed_run_conclusion": "failure",
   "last_observed_run_at": null,
-  "status": "pending",
+  "status": "failed",
   "promoted_at": null,
   "promoted_to_sha": null,
   "history": [
@@ -25,6 +25,14 @@
       "status": "superseded",
       "green": 0,
       "at": "2026-10-02T17:42:50Z"
+    },
+    {
+      "rc": "v1-rc3",
+      "sha": "dcaa3550917b9b92d01c101f8e9c5036546ae8d2",
+      "status": "failed",
+      "conclusion": "failure",
+      "run_url": "https://github.com/Ohio15/dev-standards-canary/actions/runs/37042582820",
+      "at": "2026-10-02T18:46:45Z"
     }
   ]
 }
