@@ -17,8 +17,9 @@ if [ $# -ne 1 ]; then
 fi
 
 target="$1"
-if [ ! -d "$target/.git" ]; then
-  echo "ERROR: $target is not a git repo" >&2
+# A linked worktree has a .git FILE, not a directory; ask git instead of stat.
+if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: $target is not a git working tree" >&2
   exit 1
 fi
 
