@@ -83,7 +83,7 @@ on:
           See header comment for placeholder syntax.
       runs_on:
         type: string
-        default: ubuntu-latest
+        default: ''
         description: |
           Runner label for the gates, read-docker-config and build-and-push jobs.
           Default keeps GitHub-hosted behaviour for every existing consumer.
@@ -119,7 +119,7 @@ jobs:
 
   read-docker-config:
     needs: gates
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       images: ${{ steps.parse.outputs.images }}
@@ -180,7 +180,7 @@ jobs:
 
   build-and-push:
     needs: [gates, read-docker-config]
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: true
       matrix:
