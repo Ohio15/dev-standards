@@ -472,16 +472,25 @@ jobs:
             echo "::error::release-promoter token not minted (RELEASE_PROMOTER_APP_ID / RELEASE_PROMOTER_PRIVATE_KEY)."
             exit 1
           fi
-          # head_branch is the tag name for tag-push events. Filter to that
-          # and event=push so we only score runs triggered by the RC tag, not
-          # workflow_dispatch reruns or PR runs against canary main.
-          curl -fsS \
-            -H "Authorization: Bearer ${T}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=push&per_page=20" \
-            > /tmp/runs.json
+          # head_branch is the tag name for both the tag-push run and the
+          # monitor's own workflow_dispatch re-runs at that ref (below). Only
+          # release.yml fires on a v1-rcN tag, so one push yields one run; the
+          # re-dispatches are how three consecutive executions accumulate.
+          # PR runs against canary main never carry the tag as head_branch.
+          for ev in push workflow_dispatch; do
+            curl -fsS \
+              -H "Authorization: Bearer ${T}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=${ev}&per_page=20" \
+              > "/tmp/runs-${ev}.json"
+          done
+          jq -s '{total_count: (map(.total_count) | add),
+                  workflow_runs: (map(.workflow_runs) | add)}' \
+             /tmp/runs-push.json /tmp/runs-workflow_dispatch.json > /tmp/runs.json
 
           total=$(jq -r '.total_count' /tmp/runs.json)
+          in_flight=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' /tmp/runs.json)
+          echo "in_flight=${in_flight}" >> "$GITHUB_OUTPUT"
           echo "::notice::Canary has ${total} run(s) at ${RC}."
 
           # Reduce to runs that have terminated (status=completed). In-flight
@@ -537,6 +546,28 @@ jobs:
           else
             echo "verdict=accumulating" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Re-dispatch the canary release at the RC ref (next consecutive run)
+        if: >-
+          steps.runs.outputs.verdict == 'accumulating' &&
+          steps.runs.outputs.last_conclusion == 'success' &&
+          steps.runs.outputs.in_flight == '0'
+        shell: bash
+        env:
+          T: ${{ steps.app.outputs.token }}
+          CANARY_REPO: ${{ env.CANARY_REPO }}
+          RC: ${{ steps.state.outputs.rc }}
+        run: |
+          set -euo pipefail
+          # Same ref, fresh execution: this is how "3 consecutive green runs"
+          # is reachable for a single-workflow canary. The dispatched run has
+          # head_branch == the tag, so the query above scores it next cycle.
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${T}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/release.yml/dispatches" \
+            -d "{\"ref\":\"${RC}\"}"
+          echo "::notice::Re-dispatched canary release.yml at ${RC} (completed so far: ${{ steps.runs.outputs.completed }})."
 
       - name: Update state — accumulating (still building toward threshold)
         if: steps.runs.outputs.verdict == 'accumulating' || steps.runs.outputs.verdict == 'in_flight'

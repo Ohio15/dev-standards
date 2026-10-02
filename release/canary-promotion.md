@@ -140,7 +140,7 @@ canary repo's own header as a known gap tracked under IMPL-11.
 | Tag-rc | Every push to `main`. | Direct trigger; one RC per main commit. State guard skips self-induced `[canary state]` commits. |
 | Monitor | Every 10 minutes (cron) + on demand (`workflow_dispatch`). | Single-variant canary completes in 3-5 min; multi-variant in 8-12 min. 10 min cadence catches the run-completed transition with O(6) API calls/hour worst case. |
 | RC max age | 168 hours (7 days). | Mirrors STANDARDS.md section 5: "RCs older than 7 days without promotion auto-expire and get re-cut from latest main." |
-| Promotion threshold | 3 consecutive most-recent terminated runs at the RC ref, all `conclusion=success`, AND no red run anywhere in the RC's run history. | A transient red followed by 3 greens does NOT promote — STANDARDS section 5 requires "any canary red blocks v1 promotion". |
+| Promotion threshold | 3 consecutive most-recent terminated runs at the RC ref (the tag-push run plus the monitor's own `workflow_dispatch` re-runs of the canary `release.yml` at that ref, one per cycle after each green), all `conclusion=success`, AND no red run anywhere in the RC's run history. | A transient red followed by 3 greens does NOT promote — STANDARDS section 5 requires "any canary red blocks v1 promotion". |
 
 ## Concurrency
 
