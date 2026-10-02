@@ -244,3 +244,17 @@ repo waits its turn.
   workflow take over NEXUS. Mitigate with branch protection (only `main`
   + tags can dispatch deploy jobs) and required reviews on workflow file
   changes in this repo.
+
+## Runner selection
+
+Every job the standards run in a consumer repo picks its runner as
+`${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}` (reusable
+workflows) or `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` (synced guard
+workflows). Set the repository variable `CI_RUNNER` to a self-hosted label
+(for example `nexus-ci`, the fenced ephemeral-VM runners on NEXUS) to move
+gates, tests and image builds there without editing any workflow; unset it to
+fall back to GitHub-hosted runners. Deploy and notify jobs keep their explicit
+`[self-hosted, nexus-deploy]` label because they must reach the host.
+Only PRIVATE repositories may point `CI_RUNNER` at a self-hosted label: a
+pull request from a fork carries its own workflow file and would otherwise be
+able to request your runners.

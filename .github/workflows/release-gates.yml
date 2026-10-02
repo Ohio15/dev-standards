@@ -10,7 +10,7 @@ on:
     inputs:
       runs_on:
         type: string
-        default: ubuntu-latest
+        default: ''
         description: Runner label for gate jobs.
       node_version:
         type: string
@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   read-config:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       surface: ${{ steps.parse.outputs.surface }}
@@ -107,7 +107,7 @@ jobs:
   tests:
     needs: read-config
     if: needs.read-config.outputs.tests_enabled == 'true'
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -121,7 +121,7 @@ jobs:
   gitleaks:
     needs: read-config
     if: needs.read-config.outputs.gitleaks_enabled == 'true'
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -153,7 +153,7 @@ jobs:
   size-guard:
     needs: read-config
     if: needs.read-config.outputs.size_guard_enabled == 'true'
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -186,7 +186,7 @@ jobs:
   npm-audit:
     needs: read-config
     if: needs.read-config.outputs.npm_audit_severity != 'off'
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -204,7 +204,7 @@ jobs:
 
   tag-matches-version:
     needs: read-config
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
@@ -248,7 +248,7 @@ jobs:
   conventional-commits-lint:
     needs: read-config
     if: needs.read-config.outputs.conventional_commits_enabled == 'true'
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -284,7 +284,7 @@ jobs:
   # version.json files (root=0.9.2, server/=0.9.1). Gate-green + runtime-wrong.
   # This gate makes that state impossible by construction.
   version-uniqueness:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -351,7 +351,7 @@ jobs:
   # Motivating scar: APM had 1 critical (pgx memory-safety) + 7 high Go-side
   # CVEs invisible to the npm-only `npm_audit` gate.
   govulncheck:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -412,7 +412,7 @@ jobs:
   # and delete this comment block.
   # Motivating scar: same as govulncheck — Python deps invisible to npm_audit.
   pip_audit:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -511,7 +511,7 @@ jobs:
   # Motivating scar: same blind-spot pattern as Go/Python — Cargo deps invisible
   # to the npm-only audit.
   cargo_audit:
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

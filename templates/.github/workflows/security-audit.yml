@@ -40,7 +40,7 @@ concurrency:
 jobs:
   detect:
     name: Detect ecosystems
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     outputs:
       has_npm: ${{ steps.detect.outputs.has_npm }}
       has_go: ${{ steps.detect.outputs.has_go }}
@@ -102,7 +102,7 @@ jobs:
     name: npm audit (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_npm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -172,7 +172,7 @@ jobs:
     name: govulncheck (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -213,7 +213,7 @@ jobs:
     name: pip-audit (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -271,7 +271,7 @@ jobs:
     name: Audit summary (always runs)
     if: always()
     needs: [detect, npm-audit, go-vulncheck, pip-audit]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - shell: bash
         # Every value through env, never `${{ }}` inside run: the *_DIRS lists

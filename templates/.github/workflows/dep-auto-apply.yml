@@ -47,7 +47,7 @@ concurrency:
 
 jobs:
   apply:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     # Per-repo opt-in via .github/auto-apply-enabled. Implemented as a step
     # check (not job-level if:) so we can reach the brain ingest path from
     # within one job.
