@@ -294,6 +294,23 @@ jobs:
             -m "[skip canary]"
           git push origin main
 
+      - name: Kick off the monitor for this RC
+        # The */10 cron is throttled to ~6 h by GitHub; without this kick the
+        # first scoring pass would wait that long. Dispatched AFTER the state
+        # push above so it is the newest pending run in the concurrency group.
+        if: steps.cut.outputs.rc_tag != ''
+        shell: bash
+        env:
+          T: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${T}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/promote-canary.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"force_action":"monitor"}}'
+          echo "::notice::Monitor dispatched for ${{ steps.cut.outputs.rc_tag }}."
+
       - name: ntfy — RC cut
         if: steps.cut.outputs.skipped == 'false'
         shell: bash
@@ -624,9 +641,10 @@ jobs:
         # was cancelled by it (observed on v1-rc4). Queued last, the re-entry
         # is the newest pending run and the push run (a no-op skip) yields.
         if: >-
-          steps.runs.outputs.verdict == 'accumulating' &&
-          steps.runs.outputs.last_conclusion == 'success' &&
-          steps.runs.outputs.in_flight == '0'
+          steps.runs.outputs.verdict == 'in_flight' ||
+          (steps.runs.outputs.verdict == 'accumulating' &&
+           steps.runs.outputs.last_conclusion == 'success' &&
+           steps.runs.outputs.in_flight == '0')
         shell: bash
         env:
           T: ${{ steps.app.outputs.token }}
@@ -635,6 +653,7 @@ jobs:
           BEFORE: ${{ steps.runs.outputs.completed }}
         run: |
           set -euo pipefail
+          BEFORE="${BEFORE:-0}"          # empty when the first run is still in flight
           deadline=$(( $(date +%s) + 20*60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 30
