@@ -147,7 +147,12 @@ jobs:
         run: |
           set -euo pipefail
           last_msg=$(git log -1 --pretty=%B)
-          if grep -Eq '^\[skip canary\]|\[canary state\]' <<< "$last_msg"; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # An operator asked for a tag explicitly (typically after a red RC
+            # whose only later commits are state updates): always tag.
+            echo "::notice::Forced tag-rc: tagging HEAD regardless of the last commit."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif grep -Eq '^\[skip canary\]|\[canary state\]' <<< "$last_msg"; then
             echo "::notice::Last commit is a canary-state update; skipping tag-rc."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -568,6 +573,41 @@ jobs:
             "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/release.yml/dispatches" \
             -d "{\"ref\":\"${RC}\"}"
           echo "::notice::Re-dispatched canary release.yml at ${RC} (completed so far: ${{ steps.runs.outputs.completed }})."
+
+      - name: Wait for the re-dispatched run, then re-enter the monitor
+        # GitHub throttles this workflow's */10 cron to roughly every six
+        # hours, so without this a three-run promotion takes a day. Hosted
+        # minutes are free on this public repo; the wait is bounded.
+        if: >-
+          steps.runs.outputs.verdict == 'accumulating' &&
+          steps.runs.outputs.last_conclusion == 'success' &&
+          steps.runs.outputs.in_flight == '0'
+        shell: bash
+        env:
+          T: ${{ steps.app.outputs.token }}
+          CANARY_REPO: ${{ env.CANARY_REPO }}
+          RC: ${{ steps.state.outputs.rc }}
+          BEFORE: ${{ steps.runs.outputs.completed }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 20*60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 30
+            n=$(curl -fsS -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=workflow_dispatch&per_page=20" \
+                 | jq '[.workflow_runs[] | select(.status == "completed")] | length')
+            m=$(curl -fsS -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=push&per_page=20" \
+                 | jq '[.workflow_runs[] | select(.status == "completed")] | length')
+            if [ "$((n + m))" -gt "$BEFORE" ]; then
+              echo "::notice::Re-dispatched canary run completed ($((n + m)) completed at ${RC}); re-entering the monitor."
+              curl -fsS -X POST -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/promote-canary.yml/dispatches" \
+                -d '{"ref":"main","inputs":{"force_action":"monitor"}}'
+              exit 0
+            fi
+          done
+          echo "::warning::Re-dispatched canary run did not complete within 20 minutes; the next scheduled monitor will pick it up."
 
       - name: Update state — accumulating (still building toward threshold)
         if: steps.runs.outputs.verdict == 'accumulating' || steps.runs.outputs.verdict == 'in_flight'
