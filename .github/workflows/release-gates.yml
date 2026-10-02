@@ -216,6 +216,15 @@ jobs:
         run: |
           set -euo pipefail
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          # Promotion candidates (v1-rcN, cut by promote-canary.yml and mirrored
+          # to the canary) are not consumer releases: the tag names the
+          # dev-standards ref under test, not the canary's own version. The
+          # version still has to exist and parse; only the equality is waived.
+          PROMOTION_RC=false
+          if [[ "$TAG_VERSION" =~ ^[0-9]+-rc[0-9]+$ ]]; then
+            PROMOTION_RC=true
+            echo "::notice::Promotion candidate tag v$TAG_VERSION: version equality not applicable"
+          fi
           if [ "$TAG_VERSION" = "$GITHUB_REF" ]; then
             echo "::error::Workflow not triggered by a v* tag (GITHUB_REF=$GITHUB_REF)"
             exit 1
@@ -239,8 +248,12 @@ jobs:
             exit 1
           fi
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag v$TAG_VERSION does not match $SOURCE version $PKG_VERSION"
-            exit 1
+            if [ "$PROMOTION_RC" = "true" ]; then
+              echo "✓ promotion candidate v$TAG_VERSION; $SOURCE version is $PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Tag v$TAG_VERSION does not match $SOURCE version $PKG_VERSION"
+              exit 1
+            fi
           fi
           echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
           echo "✓ tag v$TAG_VERSION matches $SOURCE version $PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
