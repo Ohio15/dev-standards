@@ -7,11 +7,14 @@
 #
 # Policy (dev-standards issue #5, decided 2026-09-11; rule 0 reversed the
 # trailer allowance 2026-10-04):
-#   0. Attribution is SCRUBBED, not rejected: every `Co-Authored-By:` trailer
-#      (any author, any case, `Co-authored by:` too), every `Claude-Session:`
-#      trailer and the `Generated with … Claude …` line are deleted from the
-#      message file in place before any other rule runs — merge and revert
-#      messages included. git commits whatever this hook leaves in the file.
+#   0. Attribution is SCRUBBED, not rejected: every `Co-Authored-By: Name
+#      <email>` trailer (any author, any case, `Co-authored by:` too), every
+#      `Claude-Session: <url>` trailer and the `Generated with [Claude …` line
+#      are deleted from the message file in place before any other rule runs —
+#      merge and revert messages included. A line is removed only when its
+#      value has the trailer's shape (an <email>, a URL), so body prose that
+#      wraps onto a line starting `Claude-Session:` survives. git commits
+#      whatever this hook leaves in the file.
 #   1. Subject line is `<type>[(scope)][!]: <summary>`.
 #      types: feat fix refactor chore docs test perf security build ci
 #      (STANDARDS.md "Conventional commits"; scope and `!` per the
@@ -44,8 +47,9 @@ SCRUB_TMP=$(mktemp "${COMMIT_MSG_FILE}.scrub.XXXXXX") || exit 1
 trap 'rm -f "$SCRUB_TMP"' EXIT
 SCRUBBED=$(LC_ALL=C awk -v BINMODE=3 '
     { line = $0; sub(/\r$/, "", line); l = tolower(line) }
-    l !~ /^#/ && l ~ /^[ \t]*(co[- ]?authored[- ]by|claude-session)[ \t]*:/ { n++; next }
-    l !~ /^#/ && l ~ /^[^a-z0-9]*generated with .*claude/ { n++; next }
+    l ~ /^[ \t]*co[- ]?authored[- ]by[ \t]*:.*<[^<>]*@[^<>]*>[ \t]*$/ { n++; next }
+    l ~ /^[ \t]*claude-session[ \t]*:[ \t]*https?:\/\/[^ \t]+[ \t]*$/ { n++; next }
+    l ~ /^[^a-z0-9#]*generated with \[?claude/ { n++; next }
     line ~ /^[ \t]*$/ { blank = blank $0 ORS; next }
     { printf "%s", blank; blank = ""; print }
     END { print n + 0 > "/dev/stderr" }

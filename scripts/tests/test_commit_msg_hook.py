@@ -113,7 +113,12 @@ def test_git_authored_messages_are_scrubbed_too(tmp_path: Path, subject: str) ->
         "docs: explain how co-authored-by: trailers work\n",  # prose, not a trailer
         "docs: thanks\n\nSee the Co-Authored-By: docs for details.\n",
         "feat: x\n\nBody.\n\n\n",  # untouched: nothing scrubbed means no rewrite
-        "# Co-Authored-By: template comment\nfeat: x\n",
+        "# Co-Authored-By: template comment <c@example.com>\nfeat: x\n",
+        # Wrapped prose that happens to start with a trailer key (the 1e7b31c
+        # false positive): no <email> / URL value, so it is not a trailer.
+        "docs: x\n\nThe hook now deletes every Co-Authored-By: trailer, every\n"
+        "Claude-Session: trailer and the Generated-with line from the\nfile.\n",
+        "docs: x\n\nCo-Authored-By: is a standard git trailer.\n",
     ],
 )
 def test_non_attribution_messages_are_untouched(tmp_path: Path, message: str) -> None:
