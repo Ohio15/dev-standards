@@ -1,4 +1,4 @@
-"""hooks/commit-msg: conventional subject + attribution-trailer policy (issue #5).
+"""hooks/commit-msg: conventional subject + attribution scrub (issue #5; scrub 2026-10-04).
 
 Runs the real hook script under bash against a message file in pytest's tmp
 dir, exactly as git would. No repo, no network. Paths are passed POSIX-style
@@ -45,31 +45,103 @@ TRAILERS = (
 
 def run_hook(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
     msg_file = tmp_path / "COMMIT_EDITMSG"
-    msg_file.write_text(message, encoding="utf-8")
+    msg_file.write_text(message, encoding="utf-8", newline="")
     return subprocess.run(
         [BASH, HOOK.as_posix(), msg_file.as_posix()], capture_output=True, text=True, check=False
     )
 
 
+def scrubbed(tmp_path: Path) -> str:
+    return (tmp_path / "COMMIT_EDITMSG").read_bytes().decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("feat: add player stats dashboard" + TRAILERS, "feat: add player stats dashboard\n"),
+        (
+            "fix: resolve auth token expiry\n\nBody line.\n" + TRAILERS,
+            "fix: resolve auth token expiry\n\nBody line.\n",
+        ),
+        ("docs: note it\n\nCo-Authored-By: A Human <human@example.com>\n", "docs: note it\n"),
+        ("docs: note it\n\nco-authored-by: lower <l@example.com>\n", "docs: note it\n"),
+        ("docs: note it\n\nCo-authored by: Spaced <s@example.com>\n", "docs: note it\n"),
+        (
+            "feat: x\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n"
+            "\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n",
+            "feat: x\n",
+        ),
+        # A trailer in the middle of the body still goes; surrounding text stays.
+        (
+            "feat: x\n\nfirst\nCo-Authored-By: C <c@example.com>\nsecond\n",
+            "feat: x\n\nfirst\nsecond\n",
+        ),
+    ],
+)
+def test_attribution_is_scrubbed(tmp_path: Path, message: str, expected: str) -> None:
+    proc = run_hook(tmp_path, message)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert scrubbed(tmp_path) == expected
+    assert "removed" in proc.stdout
+
+
+def test_crlf_message_keeps_its_line_endings(tmp_path: Path) -> None:
+    msg = "feat: x\r\n\r\nBody.\r\n\r\nCo-Authored-By: C <c@example.com>\r\n"
+    msg_file = tmp_path / "COMMIT_EDITMSG"
+    msg_file.write_bytes(msg.encode("utf-8"))
+    proc = subprocess.run(
+        [BASH, HOOK.as_posix(), msg_file.as_posix()], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert msg_file.read_bytes() == b"feat: x\r\n\r\nBody.\r\n"
+
+
+@pytest.mark.parametrize(
+    "subject",
+    ["Merge branch 'main' into fix/x", 'Revert "feat: add x"'],
+)
+def test_git_authored_messages_are_scrubbed_too(tmp_path: Path, subject: str) -> None:
+    proc = run_hook(tmp_path, subject + TRAILERS)
+    assert proc.returncode == 0, proc.stdout
+    assert scrubbed(tmp_path) == subject + "\n"
+
+
 @pytest.mark.parametrize(
     "message",
     [
-        "feat: add player stats dashboard" + TRAILERS,
-        "fix: resolve auth token expiry" + TRAILERS,
-        "chore: merge main (v2.23.0) into fix/bridge-hardening → v2.23.1" + TRAILERS,
         "chore: plain human commit, no trailers\n",
-        "docs: note it\n\nCo-Authored-By: A Human <human@example.com>\n",
+        "docs: explain how co-authored-by: trailers work\n",  # prose, not a trailer
+        "docs: thanks\n\nSee the Co-Authored-By: docs for details.\n",
+        "feat: x\n\nBody.\n\n\n",  # untouched: nothing scrubbed means no rewrite
+        "# Co-Authored-By: template comment <c@example.com>\nfeat: x\n",
+        # Wrapped prose that happens to start with a trailer key (the 1e7b31c
+        # false positive): no <email> / URL value, so it is not a trailer.
+        "docs: x\n\nThe hook now deletes every Co-Authored-By: trailer, every\n"
+        "Claude-Session: trailer and the Generated-with line from the\nfile.\n",
+        "docs: x\n\nCo-Authored-By: is a standard git trailer.\n",
     ],
 )
-def test_attribution_trailers_are_accepted(tmp_path: Path, message: str) -> None:
+def test_non_attribution_messages_are_untouched(tmp_path: Path, message: str) -> None:
     proc = run_hook(tmp_path, message)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert scrubbed(tmp_path) == message
+    assert "removed" not in proc.stdout
+
+
+def test_trailer_only_message_is_rejected_not_committed_empty(tmp_path: Path) -> None:
+    proc = run_hook(tmp_path, "Co-Authored-By: C <c@example.com>\n")
+    assert proc.returncode == 1
+    assert "COMMIT REJECTED" in proc.stdout
+
+
+def test_scrub_leaves_no_temp_file(tmp_path: Path) -> None:
+    run_hook(tmp_path, "feat: x" + TRAILERS)
+    assert [p.name for p in tmp_path.iterdir()] == ["COMMIT_EDITMSG"]
 
 
 @pytest.mark.parametrize(
     "line",
     [
-        "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
         "generated with some tool",
         "Auditor: reviewer-bot",
     ],
