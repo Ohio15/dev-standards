@@ -49,11 +49,10 @@ jobs:
       go_dirs: ${{ steps.detect.outputs.go_dirs }}
       python_dirs: ${{ steps.detect.outputs.python_dirs }}
     steps:
-      # actions/checkout v4.1.7
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The audit installs PR-controlled code; it never pushes, so the token
-          # is not left in .git/config for that code to read.
+          # is not persisted where that code could read it.
           persist-credentials: false
 
       - id: detect
@@ -115,16 +114,15 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      # actions/checkout v4.1.7
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The audit installs PR-controlled code; it never pushes, so the token
-          # is not left in .git/config for that code to read.
+          # is not persisted where that code could read it.
           persist-credentials: false
 
-      # actions/setup-node v4.0.4
-      - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
+          package-manager-cache: false
           node-version: '20'
 
       - name: Install (npm ci or pnpm install or yarn install)
@@ -144,8 +142,18 @@ jobs:
             pnpm install --frozen-lockfile --ignore-scripts
           elif [ -f yarn.lock ]; then
             corepack enable
-            corepack prepare yarn@4.18.1 --activate
-            yarn install --immutable --mode=skip-build
+            # The lockfile says which yarn wrote it: berry (>= 2) carries a
+            # `__metadata:` block, classic v1 a "yarn lockfile v1" header.
+            if grep -q '^__metadata:' yarn.lock; then
+              corepack prepare yarn@4.18.1 --activate
+              yarn install --immutable --mode=skip-build
+            elif grep -q '^# yarn lockfile v1' yarn.lock; then
+              corepack prepare yarn@1.22.22 --activate
+              yarn install --frozen-lockfile --ignore-scripts
+            else
+              echo "::error::yarn.lock is neither a yarn berry nor a yarn v1 lockfile; nothing can be audited"
+              exit 1
+            fi
           elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
             npm ci --ignore-scripts
           else
@@ -157,6 +165,68 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # yarn: `npm audit` needs a package-lock.json, so a yarn repo used to
+          # fail here on every run. Each yarn flavour reports through its own
+          # audit, and its exit code alone cannot tell "found something" from
+          # "could not audit", so the JSON it writes decides:
+          #   berry:   `yarn npm audit --all --recursive --json` prints one
+          #            advisory object per line and exits 1 if there is any,
+          #            0 (and prints nothing) if there is none.
+          #   classic: `yarn audit --json` ends with an auditSummary line; its
+          #            exit code is a severity bitmask (1 info, 2 low,
+          #            4 moderate, 8 high, 16 critical).
+          # No report means not examined, which fails like a finding does.
+          if [ ! -f pnpm-lock.yaml ] && [ -f yarn.lock ]; then
+            rc=0
+            if grep -q '^__metadata:' yarn.lock; then
+              flavour=berry
+              yarn npm audit --all --recursive --json > audit-yarn.json || rc=$?
+            else
+              flavour=classic
+              yarn audit --json > audit-yarn.json || rc=$?
+            fi
+            python3 - audit-yarn.json "$rc" "$flavour" <<'PY'
+          import json, sys
+          path, rc, flavour = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          def not_examined(why):
+              print(f"::error::yarn {flavour} audit could not run (exit {rc}): {why}; nothing was audited")
+              sys.exit(1)
+          frames = []
+          for line in open(path, encoding="utf-8", errors="replace"):
+              if line.strip():
+                  try:
+                      frames.append(json.loads(line))
+                  except ValueError:
+                      not_examined("output is not the JSON audit report")
+          counts = dict.fromkeys(("info", "low", "moderate", "high", "critical"), 0)
+          if flavour == "berry":
+              advisories = [f for f in frames if isinstance(f, dict) and isinstance(f.get("children"), dict) and "value" in f]
+              if len(advisories) != len(frames):
+                  not_examined("output holds something other than advisories")
+              if (rc == 0) != (not advisories) or rc not in (0, 1):
+                  not_examined("exit code and report disagree")
+              for a in advisories:
+                  sev = str(a["children"].get("Severity", "")).lower()
+                  if sev not in counts:
+                      not_examined(f"advisory without a known severity: {a.get('value')}")
+                  counts[sev] += 1
+          else:
+              summary = [f for f in frames if isinstance(f, dict) and f.get("type") == "auditSummary"]
+              if len(summary) != 1 or rc > 31:
+                  not_examined("no audit summary")
+              vulns = summary[0].get("data", {}).get("vulnerabilities", {})
+              for sev in counts:
+                  counts[sev] = int(vulns.get(sev, 0))
+              bits = sum(bit for sev, bit in (("info", 1), ("low", 2), ("moderate", 4), ("high", 8), ("critical", 16)) if counts[sev])
+              if bits != rc:
+                  not_examined(f"exit code {rc} does not match the summary's severities ({bits})")
+          print("yarn audit: " + " ".join(f"{k}={v}" for k, v in counts.items()))
+          if counts["high"] or counts["critical"]:
+              print(f"::error::yarn audit found {counts['high']} high and {counts['critical']} critical vulnerabilities")
+              sys.exit(1)
+          PY
+            exit 0
+          fi
           # Run informational audit (everything) — never fails the build.
           if [ -f pnpm-lock.yaml ]; then
             pnpm audit --json > audit-info.json || true
@@ -196,15 +266,13 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      # actions/checkout v4.1.7
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The audit installs PR-controlled code; it never pushes, so the token
-          # is not left in .git/config for that code to read.
+          # is not persisted where that code could read it.
           persist-credentials: false
 
-      # actions/setup-go v5.0.2
-      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ matrix.dir }}/go.mod
           cache: true
@@ -242,15 +310,13 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      # actions/checkout v4.1.7
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The audit installs PR-controlled code; it never pushes, so the token
-          # is not left in .git/config for that code to read.
+          # is not persisted where that code could read it.
           persist-credentials: false
 
-      # actions/setup-python v5.2.0
-      - uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.x'
 
@@ -258,8 +324,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install pip-audit
+          python -m pip install pip==26.2.1
+          python -m pip install pip-audit==2.10.1
 
       - name: Run pip-audit (--strict gates the workflow)
         shell: bash

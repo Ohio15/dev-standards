@@ -181,17 +181,9 @@ The next scheduled run will exit silently with a notice.
 
 ### Supply chain rule
 
-Every `uses:` in both workflow templates is **SHA-pinned**, not tag-pinned. The pinned SHAs (and the human-readable version they map to) are:
+Every `uses:` in the workflow templates and the reusable workflows is **SHA-pinned**, not tag-pinned, with the release it maps to on the same line: `uses: owner/repo@<40-hex> # vX.Y.Z`. The workflow files are the only record of which version is pinned; this README deliberately does not repeat them, so it cannot go stale. The comment stays on the `uses:` line because Dependabot rewrites only a same-line version comment when it bumps a pin (`scripts/tests/test_action_pins.py` enforces both).
 
-| Action | SHA (40-char) | Version |
-|---|---|---|
-| `actions/checkout` | `692973e3d937129bcbf40652eb9f2f61becf3332` | v4.1.7 |
-| `actions/setup-node` | `0a44ba7841725637a19e28fa30b79a866c81b0a6` | v4.0.4 |
-| `actions/setup-go` | `0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32` | v5.0.2 |
-| `actions/setup-python` | `f677139bbe7f9c59b41e40162b753c062f5d49a3` | v5.2.0 |
-| `peter-evans/create-pull-request` | `5e914681df9dc83aa4e4905692ca88beb2f9e91f` | v7.0.5 |
-
-Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack: never trust a moving tag. Bumps to these SHAs in dev-standards land via the same Layer B that the templates produce, once an oracle for action-SHA-within-major is built.
+Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack: never trust a moving tag. Installed repos get their pins bumped by Dependabot (`install.sh` seeds `.github/dependabot.yml`).
 
 ### References
 
