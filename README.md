@@ -305,7 +305,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Projects\dev-standards\de
 # `C:\Program Files\Git\bin\bash.exe` path well.
 schtasks /Create /TN "DevStandards-NpmAudit" /SC WEEKLY /D SUN /ST 06:00 /F `
   /RL LIMITED `
-  /TR "D:\Projects\dev-standards\scripts\npm-audit-weekly.cmd"
+  /TR "D:\Projects\dev-standards\dev-standards\scripts\npm-audit-weekly.cmd"
 ```
 
 `scripts/npm-audit-weekly.cmd` is a thin wrapper that invokes Git-Bash → `npm-audit-weekly.sh`. It exists purely to sidestep `schtasks` argument parsing of paths-with-spaces.
