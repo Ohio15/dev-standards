@@ -51,6 +51,10 @@ jobs:
     steps:
       # actions/checkout v4.1.7
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # The audit installs PR-controlled code; it never pushes, so the token
+          # is not left in .git/config for that code to read.
+          persist-credentials: false
 
       - id: detect
         shell: bash
@@ -113,6 +117,10 @@ jobs:
     steps:
       # actions/checkout v4.1.7
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # The audit installs PR-controlled code; it never pushes, so the token
+          # is not left in .git/config for that code to read.
+          persist-credentials: false
 
       # actions/setup-node v4.0.4
       - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6
@@ -123,19 +131,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Lifecycle scripts are never run: on a pull_request they are code
+          # the PR controls, and the audit reads the resolved dependency graph
+          # (lockfile + installed tree), which scripts do not change.
+          # Package-manager versions are pinned, never @latest/@stable: a
+          # `packageManager` field in package.json still wins under corepack;
+          # these are only the fallback. pnpm 10 is the newest line that runs
+          # on the Node 20 set up above (pnpm 11 needs Node >= 22.13).
           if [ -f pnpm-lock.yaml ]; then
             corepack enable
-            corepack prepare pnpm@latest --activate
-            pnpm install --frozen-lockfile
+            corepack prepare pnpm@10.34.6 --activate
+            pnpm install --frozen-lockfile --ignore-scripts
           elif [ -f yarn.lock ]; then
             corepack enable
-            corepack prepare yarn@stable --activate
-            yarn install --immutable
+            corepack prepare yarn@4.18.1 --activate
+            yarn install --immutable --mode=skip-build
           elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            npm ci
+            npm ci --ignore-scripts
           else
             echo "::warning::No npm lockfile found; running 'npm install' (audit results may be less reliable)"
-            npm install --no-audit --no-fund
+            npm install --no-audit --no-fund --ignore-scripts
           fi
 
       - name: Audit (low/moderate logged, high/critical fails)
@@ -183,6 +198,10 @@ jobs:
     steps:
       # actions/checkout v4.1.7
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # The audit installs PR-controlled code; it never pushes, so the token
+          # is not left in .git/config for that code to read.
+          persist-credentials: false
 
       # actions/setup-go v5.0.2
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
@@ -196,7 +215,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
-            go install golang.org/x/vuln/cmd/govulncheck@latest
+            # Pinned, never @latest: this job holds security-events: write.
+            go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           fi
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
@@ -224,6 +244,10 @@ jobs:
     steps:
       # actions/checkout v4.1.7
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # The audit installs PR-controlled code; it never pushes, so the token
+          # is not left in .git/config for that code to read.
+          persist-credentials: false
 
       # actions/setup-python v5.2.0
       - uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3

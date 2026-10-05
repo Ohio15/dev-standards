@@ -141,15 +141,17 @@ Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs 
 |---|---|
 | npm    | `npm audit fix` (never `--force`, never `--include-major`); `npm test` if a `test` script is defined. pnpm: `pnpm update <vuln-pkgs>` derived from audit JSON. yarn: skipped (no safe `audit fix`). |
 | Go     | `govulncheck` enumerates affected modules; `go get -u=patch <mod>` for each; `go mod tidy`; `go build ./...`; `go test ./...`. **Aborted** if the resulting `go.sum` line-count delta exceeds 20 (heuristic for "this minor was actually breaking"). |
-| Python | Only if every line of every `requirements*.txt` is pinned with `==` or `~=`. Runs `pip-audit --fix --strict --dry-run` first to preview, then for real. `pytest` if available. |
+| Python | Only if every line of every `requirements*.txt` is pinned with `==` or `~=`. Runs `pip-audit --fix --strict` (JSON report; a run with no report fails the job). `pytest` if available. `pyproject.toml`-only directories are declined, and said. |
 | Docker | **Read-only audit only.** Verifies every `FROM` line is digest-pinned (`@sha256:...`); auto-bumping digests is out of scope (needs a trusted digest oracle). Un-pinned Dockerfiles are flagged in the PR body. |
-| GitHub Actions | **Read-only audit only.** Verifies every external `uses:` is SHA-pinned (40-char hex). Auto-bumping SHAs within-major is deferred to v2 (requires a Dependabot-style oracle). |
+| GitHub Actions | **Read-only audit only.** Verifies every external `uses:` is SHA-pinned (40-char hex). SHA bumps are Dependabot's job: `install.sh` seeds `.github/dependabot.yml` (github-actions, weekly, grouped) when the repo has none. |
 
 **Outcomes:**
 
-- Anything bumped + tests pass -> branch `auto-apply/YYYY-MM-DD`, PR labeled `auto-apply`, ntfy notification fired, brain ingest posted (if `SHARED_BRAIN_TOKEN` secret is set).
+- Anything bumped + tests pass -> branch `auto-apply/YYYY-MM-DD`, PR labeled `auto-apply`, ntfy notification fired only if the `DEP_AUTO_APPLY_NTFY_URL` variable is set (optional `DEP_AUTO_APPLY_NTFY_TOKEN` secret), brain ingest posted (if `SHARED_BRAIN_TOKEN` secret is set).
 - Anything bumped + tests fail -> **draft** PR labeled `auto-apply-broken` for human triage. Not auto-closed.
-- Nothing bumped -> silent exit 0; no PR, no notification.
+- Nothing bumped -> exit 0 with a notice and a run summary listing every manifest location declined by policy (yarn, no lockfile, unpinned requirements, pyproject-only, stdlib vulns, go.sum churn).
+- A scanner or package manager could not examine a manifest -> the job FAILS; no PR. Unknown is never reported as "no changes".
+- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root.
 
 **Enrollment** (per-repo opt-in):
 
