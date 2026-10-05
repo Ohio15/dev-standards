@@ -4,13 +4,13 @@
   "current_rc": "v1-rc11",
   "current_rc_sha": "eaefa5f1371907a33a1bc4d61c251bc8a7e99def",
   "current_rc_created_at": "2026-10-05T15:07:21Z",
-  "consecutive_green_runs": 2,
+  "consecutive_green_runs": 3,
   "last_observed_run_id": 37332541387,
   "last_observed_run_conclusion": "success",
   "last_observed_run_at": "2026-10-05T15:27:44Z",
-  "status": "pending",
-  "promoted_at": null,
-  "promoted_to_sha": null,
+  "status": "promoted",
+  "promoted_at": "2026-10-05T15:32:26Z",
+  "promoted_to_sha": "eaefa5f1371907a33a1bc4d61c251bc8a7e99def",
   "history": [
     {
       "rc": "v1-rc1",
@@ -82,6 +82,13 @@
       "status": "promoted",
       "green": 2,
       "at": "2026-10-05T13:22:36Z"
+    },
+    {
+      "rc": "v1-rc11",
+      "sha": "eaefa5f1371907a33a1bc4d61c251bc8a7e99def",
+      "status": "promoted",
+      "green": 2,
+      "at": "2026-10-05T15:32:26Z"
     }
   ]
 }
