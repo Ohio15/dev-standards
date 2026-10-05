@@ -139,6 +139,35 @@ def test_scrub_leaves_no_temp_file(tmp_path: Path) -> None:
     assert [p.name for p in tmp_path.iterdir()] == ["COMMIT_EDITMSG"]
 
 
+def test_awk_warning_on_stderr_does_not_skip_the_scrub(tmp_path: Path) -> None:
+    # audit-openos-2026-10-05: the count was read from awk's stderr, so any awk
+    # warning made it non-numeric and the commit went through unscrubbed in
+    # silence. An awk that warns must still scrub (and must never pass silently).
+    real_awk = shutil.which("awk", path=str(Path(BASH).parent)) or shutil.which("awk")
+    assert real_awk, "awk not found"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    wrapper = bindir / "awk"
+    wrapper.write_text(
+        f'#!/bin/sh\necho "awk: warning: simulated" >&2\nexec "{Path(real_awk).as_posix()}" "$@"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    wrapper.chmod(0o755)
+    msg_dir = tmp_path / "msg"
+    msg_dir.mkdir()
+    msg_file = msg_dir / "COMMIT_EDITMSG"
+    msg_file.write_text("feat: x" + TRAILERS, encoding="utf-8", newline="")
+    env = dict(os.environ, PATH=f"{bindir.as_posix()}{os.pathsep}{os.environ.get('PATH', '')}")
+    proc = subprocess.run(
+        [BASH, "-c", f'PATH="{bindir.as_posix()}:$PATH" exec "{HOOK.as_posix()}" "{msg_file.as_posix()}"'],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert msg_file.read_bytes().decode("utf-8") == "feat: x\n"
+    assert "removed 2 attribution line(s)" in proc.stdout
+
+
 @pytest.mark.parametrize(
     "line",
     [
