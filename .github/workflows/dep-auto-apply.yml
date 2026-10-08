@@ -283,7 +283,7 @@ jobs:
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
             # Pinned, never @latest: this job holds contents: write.
-            go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+            go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           fi
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
