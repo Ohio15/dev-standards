@@ -473,6 +473,57 @@ anything else; a monotonic version floor in the updater.
 **Since.** 2026-10-05.
 **Origin.** audit-openos-2026-10-05 (MEDIUM; approved by Ron 2026-10-05).
 
+### SC-32 · A privilege policy written as a deny-list of dangerous values
+**Shape.** A capability, syscall, device, or mount policy refuses a
+hand-picked set of "host-escape" values and admits everything else, so an
+omitted member passes (DAC_READ_SEARCH -> `open_by_handle_at`, the "shocker"
+container escape); and a drop-side field (`cap_drop`) is type-checked but not
+required, so omitting it silently restores the runtime's default set. The
+refusal message ("host-escape capability refused") asserts a completeness the
+list lacks (SC-13).
+**Check.** `grep -nE "in \((\"[A-Z_]+\", ?)+\"[A-Z_]+\"\)"` over policy code
+that handles `cap_add`, `capabilities`, `devices`, `sysctls` or `security_opt`;
+every hit on a privilege dimension is a finding unless it is an allow-list.
+`grep -n "cap_drop"`: the policy must require `cap_drop` to contain `ALL`, and
+the post-deploy audit must read `CapDrop` and the effective set, not only
+`CapAdd`. A test feeds every name in `capabilities(7)` that is not on the
+allow-list and asserts refusal, plus a document with `cap_drop` omitted.
+**Fix form.** Allow-list of known-safe values, each justified; require
+drop-ALL; audit the effective set at runtime.
+**Since.** 2026-10-08.
+**Origin.** audit-infra-2026-10-08 (HIGH; approved by Ron 2026-10-08).
+
+### SC-33 · An allow-list enforced only when the governed key is present
+**Shape.** A policy validates a key's value against an allow-list only inside
+`if key in doc` / `elif attr == ...`, while the consuming system gives the
+ABSENT key a broader default: a Traefik router with no `entrypoints` binds
+every entrypoint, one with no `rule` gets the default Host rule. Omission is
+the bypass, and the tests only ever feed present values.
+**Check.** For every allow-list predicate in policy code, find the consumer's
+default for the missing key in its documentation or source; if that default
+is broader than the allow-list, the policy must REQUIRE the key. One test per
+predicate feeds the document with the key omitted and asserts refusal.
+**Fix form.** Require the key wherever the consumer's default is wider than
+the allow-list; never validate only what is present.
+**Since.** 2026-10-08.
+**Origin.** audit-infra-2026-10-08 (MEDIUM; approved by Ron 2026-10-08).
+
+### SC-34 · Untrusted content written to GITHUB_ENV or GITHUB_OUTPUT with a
+fixed heredoc delimiter
+**Shape.** A workflow step appends `NAME<<EOF` ... `EOF` to `$GITHUB_ENV` or
+`$GITHUB_OUTPUT` with content fetched from outside the step (a gist, an API
+body, a PR title, a file the job did not write). A newline plus the fixed
+delimiter in that content ends the block early and sets arbitrary environment
+variables or outputs for every later step (`GH_REPO`, `BASH_ENV`, ...).
+**Check.** `grep -nE "<<-?['\"]?[A-Za-z_]*EOF" .github/workflows/*.yml` near
+`GITHUB_ENV|GITHUB_OUTPUT`; every hit whose body interpolates a value not
+computed in-step from trusted input is a finding unless the delimiter is
+random per run (`delim="ghadelim_$(openssl rand -hex 16)"` or equivalent).
+**Fix form.** Random per-run delimiter, or validate the content down to a
+fixed shape (a timestamp, a SHA) before writing it.
+**Since.** 2026-10-08.
+**Origin.** audit-infra-2026-10-08 (LOW; approved by Ron 2026-10-08).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -482,5 +533,5 @@ _None pending._ Audits append proposals here in the format above with a
 proposal into the register and bumps its `Since` date. Graduated so far:
 SC-22..SC-24 (audit-cortex-hooks-2026-09-15, approved 2026-09-16), SC-29..SC-31
 (audit-openos-2026-10-05) and SC-25 (gate-openos-2026-09-16), approved
-2026-10-05. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
+2026-10-05. SC-32..SC-34 (audit-infra-2026-10-08), approved 2026-10-08. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
 written as proposals; the numbers stay reserved.
