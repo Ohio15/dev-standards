@@ -282,7 +282,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
-            # Pinned, never @latest: this job holds security-events: write. The pin is
+            # Pinned, never @latest: this job holds contents: write. The pin is
             # chosen from the Go this job PROVISIONED (go.mod via setup-go, under
             # GOTOOLCHAIN=local), because each x/vuln release raises its go directive:
             # v1.8.0 needs 1.26, v1.2.0-v1.7.0 need 1.25, v1.1.4 needs 1.22 (verified
