@@ -141,15 +141,17 @@ Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs 
 |---|---|
 | npm    | `npm audit fix` (never `--force`, never `--include-major`); `npm test` if a `test` script is defined. pnpm: `pnpm update <vuln-pkgs>` derived from audit JSON. yarn: skipped (no safe `audit fix`). |
 | Go     | `govulncheck` enumerates affected modules; `go get -u=patch <mod>` for each; `go mod tidy`; `go build ./...`; `go test ./...`. **Aborted** if the resulting `go.sum` line-count delta exceeds 20 (heuristic for "this minor was actually breaking"). |
-| Python | Only if every line of every `requirements*.txt` is pinned with `==` or `~=`. Runs `pip-audit --fix --strict --dry-run` first to preview, then for real. `pytest` if available. |
+| Python | Only if every line of every `requirements*.txt` is pinned with `==` or `~=`. Runs `pip-audit --fix --strict` (JSON report; a run with no report fails the job). `pytest` if available. `pyproject.toml`-only directories are declined, and said. |
 | Docker | **Read-only audit only.** Verifies every `FROM` line is digest-pinned (`@sha256:...`); auto-bumping digests is out of scope (needs a trusted digest oracle). Un-pinned Dockerfiles are flagged in the PR body. |
-| GitHub Actions | **Read-only audit only.** Verifies every external `uses:` is SHA-pinned (40-char hex). Auto-bumping SHAs within-major is deferred to v2 (requires a Dependabot-style oracle). |
+| GitHub Actions | **Read-only audit only.** Verifies every external `uses:` is SHA-pinned (40-char hex). SHA bumps are Dependabot's job: `install.sh` seeds `.github/dependabot.yml` (github-actions, weekly, grouped) when the repo has none. |
 
 **Outcomes:**
 
-- Anything bumped + tests pass -> branch `auto-apply/YYYY-MM-DD`, PR labeled `auto-apply`, ntfy notification fired, brain ingest posted (if `SHARED_BRAIN_TOKEN` secret is set).
+- Anything bumped + tests pass -> branch `auto-apply/YYYY-MM-DD`, PR labeled `auto-apply`, ntfy notification fired only if the `DEP_AUTO_APPLY_NTFY_URL` variable is set (optional `DEP_AUTO_APPLY_NTFY_TOKEN` secret), brain ingest posted (if `SHARED_BRAIN_TOKEN` secret is set).
 - Anything bumped + tests fail -> **draft** PR labeled `auto-apply-broken` for human triage. Not auto-closed.
-- Nothing bumped -> silent exit 0; no PR, no notification.
+- Nothing bumped -> exit 0 with a notice and a run summary listing every manifest location declined by policy (yarn, no lockfile, unpinned requirements, pyproject-only, stdlib vulns, go.sum churn).
+- A scanner or package manager could not examine a manifest -> the job FAILS; no PR. Unknown is never reported as "no changes".
+- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root.
 
 **Enrollment** (per-repo opt-in):
 
@@ -179,17 +181,9 @@ The next scheduled run will exit silently with a notice.
 
 ### Supply chain rule
 
-Every `uses:` in both workflow templates is **SHA-pinned**, not tag-pinned. The pinned SHAs (and the human-readable version they map to) are:
+Every `uses:` in the workflow templates and the reusable workflows is **SHA-pinned**, not tag-pinned, with the release it maps to on the same line: `uses: owner/repo@<40-hex> # vX.Y.Z`. The workflow files are the only record of which version is pinned; this README deliberately does not repeat them, so it cannot go stale. The comment stays on the `uses:` line because Dependabot rewrites only a same-line version comment when it bumps a pin (`scripts/tests/test_action_pins.py` enforces both).
 
-| Action | SHA (40-char) | Version |
-|---|---|---|
-| `actions/checkout` | `692973e3d937129bcbf40652eb9f2f61becf3332` | v4.1.7 |
-| `actions/setup-node` | `0a44ba7841725637a19e28fa30b79a866c81b0a6` | v4.0.4 |
-| `actions/setup-go` | `0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32` | v5.0.2 |
-| `actions/setup-python` | `f677139bbe7f9c59b41e40162b753c062f5d49a3` | v5.2.0 |
-| `peter-evans/create-pull-request` | `5e914681df9dc83aa4e4905692ca88beb2f9e91f` | v7.0.5 |
-
-Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack: never trust a moving tag. Bumps to these SHAs in dev-standards land via the same Layer B that the templates produce, once an oracle for action-SHA-within-major is built.
+Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack: never trust a moving tag. Installed repos get their pins bumped by Dependabot (`install.sh` seeds `.github/dependabot.yml`).
 
 ### References
 

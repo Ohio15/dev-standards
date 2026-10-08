@@ -109,7 +109,6 @@ jobs:
       rc_sha: ${{ steps.cut.outputs.rc_sha }}
       skipped: ${{ steps.cut.outputs.skipped }}
     steps:
-      # actions/checkout v4.1.7 — full history so `git tag` sees existing v1-rc*
       - name: Mint release-promoter token
         id: app
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -119,7 +118,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           # Use the cross-repo PAT so the tag push triggers downstream
@@ -345,7 +344,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}

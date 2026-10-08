@@ -75,6 +75,24 @@ if [ ! -f "$target/.gitleaks.toml" ]; then
   cp "$here/templates/.gitleaks.toml" "$target/.gitleaks.toml"
 fi
 
+# Dependabot keeps the SHA pins in the workflows above current (SC-25). Seed a
+# github-actions config only when the repo has none at all: an existing config
+# (either extension) is the repo's own and is never overwritten. One that does
+# not cover github-actions is reported, not edited.
+dependabot_existing=""
+for f in "$target/.github/dependabot.yml" "$target/.github/dependabot.yaml"; do
+  if [ -e "$f" ]; then dependabot_existing="$f"; break; fi
+done
+if [ -z "$dependabot_existing" ]; then
+  cp "$here/templates/.github/dependabot.yml" "$target/.github/dependabot.yml"
+  dependabot_note="seeded (github-actions, weekly, grouped)"
+elif grep -Eq '^[[:space:]]*-?[[:space:]]*package-ecosystem:[[:space:]]*["'"'"']?github-actions["'"'"']?[[:space:]]*(#.*)?$' "$dependabot_existing"; then
+  dependabot_note="kept existing ${dependabot_existing#"$target/"} (covers github-actions)"
+else
+  dependabot_note="kept existing ${dependabot_existing#"$target/"} - WARNING: it has no github-actions entry, so the SHA-pinned actions will go stale"
+  echo "WARNING: $dependabot_existing has no 'package-ecosystem: github-actions' entry; add one so the SHA-pinned actions stay current." >&2
+fi
+
 git -C "$target" config core.hooksPath .githooks
 
 echo "Installed into $target"
@@ -89,6 +107,7 @@ echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
 echo "  SECURITY-CHECKS.md                    (security register — always refreshed)"
 echo "  .large-files-allowlist                (if not present)"
 echo "  .gitleaks.toml                        (if not present)"
+echo "  .github/dependabot.yml                ($dependabot_note)"
 echo "  git config core.hooksPath .githooks   (local)"
 echo "  hooks staged with mode 100755          (git add --chmod=+x)"
 echo
