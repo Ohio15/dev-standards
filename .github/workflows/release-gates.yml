@@ -415,7 +415,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run govulncheck on every module

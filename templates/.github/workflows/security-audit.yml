@@ -284,7 +284,13 @@ jobs:
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
             # Pinned, never @latest: this job holds security-events: write.
-            go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+            # The pin must match the Go the job provisions (go.mod via setup-go,
+            # GOTOOLCHAIN=local): v1.8.0 requires go >= 1.26 and failed every 1.25
+            # repo at install time (Sentinel #107, openclaw-1 #12, 2026-10-08).
+            # v1.7.0 is the newest release whose go directive is 1.25; the vuln DB
+            # is fetched live from vuln.go.dev, so the binary's age does not
+            # weaken the scan. Raise the pin when the fleet's go.mod floor is 1.26.
+            go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           fi
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
