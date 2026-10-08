@@ -282,8 +282,27 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
-            # Pinned, never @latest: this job holds contents: write.
-            go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+            # Pinned, never @latest: this job holds security-events: write. The pin is
+            # chosen from the Go this job PROVISIONED (go.mod via setup-go, under
+            # GOTOOLCHAIN=local), because each x/vuln release raises its go directive:
+            # v1.8.0 needs 1.26, v1.2.0-v1.7.0 need 1.25, v1.1.4 needs 1.22 (verified
+            # from proxy.golang.org .mod files, 2026-10-08). A single pin failed the
+            # fleet twice in one day: v1.8.0 on every 1.25 repo (Sentinel #107), then
+            # v1.7.0 on a 1.24 module (openclaw-1 #12). The vuln DB is fetched live
+            # from vuln.go.dev, so an older binary does not weaken the scan. Add a row
+            # when the fleet's floor moves; never fall through to @latest.
+            gover="$(go env GOVERSION)"            # e.g. go1.25.14
+            minor="$(printf '%s' "$gover" | sed -E 's/^go1\.([0-9]+).*$/\1/')"
+            case "$minor" in
+              ''|*[!0-9]*) echo "::error::cannot parse Go version '$gover' for the govulncheck pin table"; exit 1 ;;
+            esac
+            if   [ "$minor" -ge 26 ]; then vuln_pin=v1.8.0
+            elif [ "$minor" -ge 25 ]; then vuln_pin=v1.7.0
+            elif [ "$minor" -ge 22 ]; then vuln_pin=v1.1.4
+            else echo "::error::no govulncheck pin for $gover (table floor is go1.22); raise the module's go directive"; exit 1
+            fi
+            echo "govulncheck pin for $gover: $vuln_pin"
+            go install "golang.org/x/vuln/cmd/govulncheck@$vuln_pin"
           fi
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
