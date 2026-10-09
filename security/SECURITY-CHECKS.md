@@ -216,6 +216,8 @@ when the code it anchored on was rewritten.
 **Check.** For every new test, revert the behaviour AT THE REAL CALL SITE and
 confirm the test goes red. A skipped/missed mutation anchor is a FAILURE,
 never a kill. Batteries carry at least one deletion AND one retention mutant.
+A verifier or guard whose tests include no mutation battery (revert the
+guard, confirm the test fails) is NOT EXAMINED, not CLEAR.
 **Fix form.** Drive the real handler; anchor by enclosing function; re-anchor
 inherited mutations, never delete them.
 **Since.** 2026-09-02.
@@ -524,6 +526,98 @@ fixed shape (a timestamp, a SHA) before writing it.
 **Since.** 2026-10-08.
 **Origin.** audit-infra-2026-10-08 (LOW; approved by Ron 2026-10-08).
 
+### SC-35 · Removal by unlinking one edge while persistence is
+reachability-based (replace-by-add)
+**Shape.** A "replace", "redact" or "remove" operation registers a NEW object
+(or deletes one inbound reference) and rewrites the consumer it was told
+about, but leaves the original bound through another name, index, resource
+dictionary, parent pointer, structure tree, calculation order or reply chain.
+Persistence is decided by a reachability walk (garbage collection,
+`removeUnreachableObjects`, `collectGarbage`), so the original is still
+reachable and is written out, while every verifier looks only at what is DRAWN
+or LISTED, not at what is PRESENT. pdfmanager 2026-10-08: redacted image/form
+XObjects kept under the original resource name (CRITICAL); removed annotations
+and widgets resurrected via `/OBJR`, `/IRT`, `/CO`, `/Parent`, XFA (HIGH);
+deleted pages written because pdf-lib writes every indirect object (HIGH).
+**Check.** Grep the add-only registration form (`addXObject(`, `.clone(`,
+`set(PDFName.of(...` on a resource dict, `push(` on a kids/fields array) and
+the single-edge removal form (`filter(` on one array, `delete` on one key) in
+any code that claims to remove content; for each, name every other inbound
+edge the object type can have in the format's object model. The diff must
+carry an OUTPUT-BOUNDARY test: serialise, re-parse, and assert the original
+object's bytes (or ref) are ABSENT from the saved file, not merely that the
+drawn result is correct.
+**Fix form.** Remove by object identity across every inbound reference, or
+rebuild the index from the names the rewritten consumer actually uses; make
+the verifier fail on any reachable-but-unreferenced object of the redacted
+kind.
+**Since.** 2026-10-09.
+**Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-32
+(CRITICAL; approved by Ron 2026-10-09).
+
+### SC-36 · Index-space mismatch between where a position is computed and
+where it is applied
+**Shape.** Positions, offsets or lengths are computed in one unit (Unicode
+code points via `for..of`, graphemes, pre-case-fold characters, bytes) and
+consumed in another (`String.length`, `.slice`, `.substring`, `indexOf` on
+UTF-16 units, or on a case-folded string whose length changed). Every
+occurrence after the first astral character or length-changing fold is
+shifted. When the consumer is a redaction, a highlight, a patch or an access
+check, the shift lands the action on the wrong target and a fallback that
+re-rasterises or re-copies the original preserves the content the action was
+meant to remove. pdfmanager 2026-10-08 `textSearch.ts:61-78` (HIGH).
+**Check.** Grep `for (const .* of ` over a string paired with `.length`,
+`.slice(`, `.substring(` or `indexOf(` on the same or a derived string; grep
+`.toLowerCase()`/`.toUpperCase()`/`.normalize(` whose result is indexed with
+offsets from the un-folded string. The diff must carry a test using an astral
+character (`𝐀`, an emoji) and a length-changing fold (`İ`) BEFORE the target
+occurrence.
+**Fix form.** One index space end to end (build the map per UTF-16 unit on the
+already-folded string), and verify the OUTPUT (the term must be absent from
+the rendered or re-extracted result), never only the input positions.
+**Since.** 2026-10-09.
+**Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-33
+(HIGH; approved by Ron 2026-10-09).
+
+### SC-37 · A pull_request-reachable job whose runner is chosen by a
+repository variable
+**Shape.** `runs-on: ${{ vars.X || 'ubuntu-latest' }}` (or any expression over
+`vars.`/`inputs.`) on a job reachable from `pull_request` in a public
+repository. The default is hosted, so the shape is inert until the variable is
+set; then every fork PR's install-time code runs on whatever the variable
+names. pdfmanager 2026-10-08: 7 sites across 3 workflows (MEDIUM, latent).
+**Check.** `grep -n "runs-on:.*\${{" .github/workflows/*.yml` intersected with
+workflows that declare `pull_request:` or `pull_request_target:`; for each
+hit, the repo visibility and the fork-approval policy are part of the finding.
+Any hit in a public repo is a finding regardless of the variable's current
+value.
+**Fix form.** Literal GitHub-hosted labels on every PR-reachable job;
+variables may select runners only for `schedule`, `workflow_dispatch` and
+`push` on protected branches.
+**Since.** 2026-10-09.
+**Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-34
+(MEDIUM, latent; approved by Ron 2026-10-09).
+
+### SC-38 · A guard that passes vacuously for inputs below its own tolerance
+**Shape.** A geometric, range or threshold guard applies an inset, epsilon,
+rounding or minimum to its input and, for inputs smaller than that tolerance,
+produces an empty, inverted or degenerate test region. Every subsequent
+membership test is then false, and "nothing found" reads as "clean". The
+acceptance filter upstream admits inputs smaller than the guard's tolerance.
+pdfmanager 2026-10-08 `redactionVerifier.ts:66` (0.5 pt inset; marks over 0.01
+pt accepted) (LOW); the zero-size-text finding has the same degenerate shape
+at `contentRedactor.ts:302`.
+**Check.** For every guard that subtracts, insets or divides by a tolerance,
+grep the upstream acceptance filter's minimum and compare; the diff must carry
+a test at an input strictly between the acceptance minimum and the guard
+tolerance, asserting the guard REJECTS or reports NOT EXAMINED rather than
+passing.
+**Fix form.** Clamp the tolerance to a fraction of the input, or reject inputs
+below the tolerance at the acceptance filter.
+**Since.** 2026-10-09.
+**Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-35
+(LOW; approved by Ron 2026-10-09).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -533,5 +627,8 @@ _None pending._ Audits append proposals here in the format above with a
 proposal into the register and bumps its `Since` date. Graduated so far:
 SC-22..SC-24 (audit-cortex-hooks-2026-09-15, approved 2026-09-16), SC-29..SC-31
 (audit-openos-2026-10-05) and SC-25 (gate-openos-2026-09-16), approved
-2026-10-05. SC-32..SC-34 (audit-infra-2026-10-08), approved 2026-10-08. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
+2026-10-05. SC-32..SC-34 (audit-infra-2026-10-08), approved 2026-10-08.
+SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
+and renumbered because those numbers were already graduated), approved
+2026-10-09. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
 written as proposals; the numbers stay reserved.
