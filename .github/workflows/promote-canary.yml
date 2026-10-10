@@ -1,12 +1,15 @@
 name: promote-canary
 
 # Canary-RC promotion automation (IMPL-11). When dev-standards `main` advances:
-#   1. Tag new HEAD as v1-rcN (next available N).
-#   2. Mirror that tag into Ohio15/dev-standards-canary so its release.yml fires
-#      against @v1-rcN.
-#   3. Monitor canary's recent runs at @v1-rcN. After 3 consecutive green runs,
-#      fast-forward `v1` in dev-standards to the RC commit and ntfy nexus-alerts.
-#      On any red run, ntfy `urgent` and leave v1 alone for human triage.
+#   1. Select the next v1-rcN for main HEAD (refused unless HEAD == origin/main).
+#   2. Pin the canary's release.yml to that exact dev-standards commit
+#      (`uses: Ohio15/dev-standards/...@<rc_sha>`) with one commit on the
+#      canary's main, then tag dev-standards and the pinned canary commit.
+#   3. Monitor the canary's release.yml runs at that tag AND that canary commit
+#      (head_sha). After 3 consecutive green runs, fast-forward `v1` in
+#      dev-standards to the RC commit. On any red run, fail the monitor run
+#      (GitHub's failed-workflow notification is the alert) and leave v1 alone
+#      for human triage.
 #
 # Design choice: workflow over cron script.
 #   The monitor portion needs to read GitHub API state (canary run history) and
@@ -24,12 +27,41 @@ name: promote-canary
 # re-runs without API calls. The file format is documented in
 # release/canary-promotion.md.
 #
+# Trust boundary (audit-dev-standards-2026-10-10 HIGH 1; register SC-29):
+#   Both jobs mint a token from the release-promoter App key, and that token can
+#   move `refs/tags/v1`, which every consumer pinned at @v1 executes. Each job
+#   therefore (a) runs only when `github.ref == 'refs/heads/main'` (job `if:`),
+#   (b) re-asserts that as its first step, and (c) declares
+#   `environment: release-promoter`.
+#   (a) and (b) are written in THIS file, and a `workflow_dispatch` runs the
+#   DISPATCHED REF's copy of the file, so a pushed branch that edits them away
+#   is not stopped by them. They close the no-edit variant (dispatching an
+#   unmodified copy from a branch) and nothing more. The real boundary is
+#   repository configuration, which exists (2026-10-10):
+#     - environment `release-promoter`: required reviewer Ohio15, deployment
+#       policies `main` (branch) and `v*` (tag), RELEASE_PROMOTER_PRIVATE_KEY
+#       set as an environment secret;
+#     - ruleset 24843941 on refs/heads/main: PR required, required checks
+#       `size-guard` + `Audit summary (always runs)`, no force push, no
+#       deletion; sole bypass actor the release-promoter App (5165373), which
+#       is how this workflow's state commits reach main;
+#     - ruleset 24843943 on refs/tags/v*: no update, deletion or force; App
+#       5165373 bypass.
+#   One step remains: delete the REPOSITORY-level RELEASE_PROMOTER_PRIVATE_KEY
+#   immediately after this workflow (with `environment:`) is on main. Until
+#   then a dispatched edited copy can still read it. See release/SPEC.md.
+#
 # Cross-repo prereqs:
 #   vars.RELEASE_PROMOTER_APP_ID + secrets.RELEASE_PROMOTER_PRIVATE_KEY
-#     A GitHub App (ohio15-release-promoter) with `contents:write` installed on
-#     BOTH Ohio15/dev-standards and Ohio15/dev-standards-canary; each job mints a
-#     short-lived installation token (actions/create-github-app-token) instead of
-#     storing a PAT. Required because:
+#     A GitHub App (ohio15-release-promoter) installed on BOTH
+#     Ohio15/dev-standards and Ohio15/dev-standards-canary with contents:write
+#     and actions:write (workflow dispatch), plus workflows:write for the canary
+#     pin. Every mint names its permissions explicitly: the general tokens
+#     request only contents:write + actions:write; the pin token requests only
+#     contents:write + workflows:write and is scoped to dev-standards-canary.
+#     Each job mints short-lived installation tokens
+#     (actions/create-github-app-token) instead of storing a PAT. Required
+#     because:
 #       (a) GITHUB_TOKEN cannot push to dev-standards-canary from this repo;
 #       (b) tag pushes made with GITHUB_TOKEN do not trigger downstream
 #           workflows (the recursion guard suppresses them), and we need the
@@ -37,23 +69,35 @@ name: promote-canary
 #
 #   Canary contract (owned by Ohio15/dev-standards-canary, IMPL-11 sibling):
 #     - canary `release.yml` must trigger on `push: tags: ['v1-rc*']`.
-#     - canary `release.yml` calls dev-standards reusable workflows at
-#       `@main`. GitHub does not evaluate expressions in `uses:` for
-#       reusable workflows, so `@${{ github.ref_name }}` is not possible.
-#       Because tag-rc tags `main` HEAD, `@main` exercises the RC commit
-#       unless another merge lands during the watch window — accepted
-#       approximation (issue #7, 2026-09-11).
+#     - canary `release.yml` calls dev-standards reusable workflows with a
+#       static `uses: Ohio15/dev-standards/.github/workflows/<f>.yml@<ref>`.
+#       GitHub does not evaluate expressions in `uses:`, so the RC cannot be
+#       passed at dispatch time; instead tag-rc rewrites that ref to
+#       `@<rc_sha>` on the canary's main and tags THAT canary commit. Every run
+#       at the tag (push and re-dispatch) therefore executes the RC commit, not
+#       whatever dev-standards main is at run time. `pin_canary: false` keeps
+#       the canary's ref as it is and is accepted only when it is `@main` (the
+#       old approximation, warned) or already `@<rc_sha>`.
 #     - canary runs MUST set head_branch to the tag name (default for
-#       tag-push events; documented here so the monitor query stays valid).
+#       tag-push events and for dispatches at the tag ref).
 #
 # Promotion criteria:
-#   - 3 consecutive most-recent canary runs at @v1-rcN with conclusion=success
-#     across every workflow the canary defines (success-only filter; any
-#     non-success conclusion — failure / cancelled / timed_out / action_required
-#     — counts as red and aborts the watch).
+#   - 3 consecutive most-recent completed runs of the canary's
+#     `.github/workflows/release.yml` (by `path`) at head_branch v1-rcN AND
+#     head_sha == the pinned canary commit recorded in the state file, all
+#     conclusion=success, and no non-success run of that workflow at that
+#     commit ever. A release.yml run at the tag with any OTHER head_sha means
+#     the tag was moved and blocks promotion. Runs of other canary workflows
+#     (some are dispatchable and trivially green) are never counted.
 #   - RC age < 7 days. Older RCs auto-expire per STANDARDS.md section 5; this
-#     workflow surfaces an expired RC via ntfy and resets state to idle so the
-#     next push:main can re-cut.
+#     workflow resets state to idle so the next push:main can re-cut.
+#
+# Notifications: none outbound. The NEXUS ntfy is LAN/Tailscale-only and not
+# reachable from GitHub-hosted runners (release/SPEC.md), and the former post to
+# the public, unauthenticated https://ntfy.sh/nexus-alerts topic was removed
+# (audit-dev-standards-2026-10-10 LOW). Outcomes are annotations + the job
+# summary; a red canary FAILS the monitor run so GitHub's own failed-run
+# notification reaches the owner.
 
 on:
   push:
@@ -75,9 +119,15 @@ on:
         type: choice
         default: monitor
         options: [tag-rc, monitor, reset]
+      pin_canary:
+        description: "tag-rc only: pin the canary's release.yml to the RC commit before tagging (false = legacy @main approximation)"
+        type: boolean
+        default: true
 
-permissions:
-  contents: write    # to push v1-rcN, fast-forward v1, and commit state file
+# GITHUB_TOKEN gets nothing. Every write (tags, state commits, dispatches, the
+# v1 move) and the checkout itself use the release-promoter App token; the
+# jobs repeat `permissions: {}` so a later job cannot inherit a grant.
+permissions: {}
 
 concurrency:
   # Single-flight. Two simultaneous tag-rc runs would race on N selection;
@@ -87,6 +137,9 @@ concurrency:
 
 env:
   CANARY_REPO: Ohio15/dev-standards-canary
+  # The ONLY canary workflow whose runs are scored (matched against the runs
+  # API `path` field).
+  RELEASE_WORKFLOW_PATH: .github/workflows/release.yml
   STATE_FILE: release/canary-state.json
   RC_PREFIX: v1-rc
   STABLE_TAG: v1
@@ -94,21 +147,36 @@ env:
   # RFC 3339 max age. Mirrors STANDARDS.md section 5 ("RCs older than 7 days
   # without promotion auto-expire and get re-cut from latest main").
   RC_MAX_AGE_HOURS: 168
-  NTFY_URL: https://ntfy.sh/nexus-alerts
 
 jobs:
   # ──────────────────────────────────────────────────────────── tag-rc job
-  # Runs on push:main only. Creates v1-rcN, pushes to canary, primes state.
+  # Runs on push:main (or a forced dispatch from main). Pins the canary to the
+  # RC commit, creates v1-rcN in both repos, primes state.
   tag-rc:
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.force_action == 'tag-rc')
+    if: >-
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'push' ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.force_action == 'tag-rc'))
     runs-on: ubuntu-latest
+    environment: release-promoter
+    permissions: {}
     outputs:
       rc_tag: ${{ steps.cut.outputs.rc_tag }}
       rc_sha: ${{ steps.cut.outputs.rc_sha }}
+      canary_sha: ${{ steps.pin.outputs.canary_sha }}
       skipped: ${{ steps.cut.outputs.skipped }}
     steps:
+      # First step, before any key material: see "Trust boundary" above for
+      # why this is necessary but not sufficient.
+      - name: Refuse to run off main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::promote-canary mints the release-promoter token and runs only on refs/heads/main (got ${GITHUB_REF})."
+            exit 1
+          fi
+
       - name: Mint release-promoter token
         id: app
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -117,11 +185,17 @@ jobs:
           private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
+          # Only what the steps use: contents (checkout, tag + state pushes,
+          # canary refs/contents reads, the v1 move) and actions (workflow
+          # dispatches, canary run reads). Without permission-* inputs the
+          # token would inherit every App permission, workflows:write included.
+          permission-contents: write
+          permission-actions: write
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # Use the cross-repo PAT so the tag push triggers downstream
+          # Use the App token so the tag push triggers downstream
           # workflows. GITHUB_TOKEN-pushed tags are silently suppressed.
           token: ${{ steps.app.outputs.token }}
           persist-credentials: true
@@ -136,6 +210,34 @@ jobs:
             echo "::error::release-promoter token not minted. Set repository variable RELEASE_PROMOTER_APP_ID and secret RELEASE_PROMOTER_PRIVATE_KEY (GitHub App with contents:write on dev-standards and dev-standards-canary). See the header of this workflow."
             exit 1
           fi
+          # The token is written into a curl config on stdin below; refuse any
+          # character that could break out of the quoted header value.
+          if ! [[ "$T" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::release-promoter token has an unexpected shape."
+            exit 1
+          fi
+
+      # Tag only the commit that is main right now. On a push run the checkout
+      # is github.sha; when main has already moved on (push storm) the newer
+      # push run tags the newer head, so this run stands down. A HEAD that is
+      # not on main at all is refused outright.
+      - name: Assert HEAD is origin/main HEAD
+        id: main_head
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          head=$(git rev-parse HEAD)
+          main=$(git rev-parse refs/remotes/origin/main)
+          if [ "$head" = "$main" ]; then
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "$head" "$main"; then
+            echo "::notice::main advanced to ${main:0:7} after ${head:0:7}; the run for the newer head tags it."
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::HEAD ${head} is not on origin/main (${main}); refusing to tag."
+            exit 1
+          fi
 
       # Skip the no-op case where the only change is the state-file commit
       # this workflow itself just made. Without this guard a successful
@@ -143,13 +245,18 @@ jobs:
       - name: Skip self-induced commits
         id: skip_check
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SUPERSEDED: ${{ steps.main_head.outputs.superseded }}
         run: |
           set -euo pipefail
           last_msg=$(git log -1 --pretty=%B)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$SUPERSEDED" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             # An operator asked for a tag explicitly (typically after a red RC
-            # whose only later commits are state updates): always tag.
-            echo "::notice::Forced tag-rc: tagging HEAD regardless of the last commit."
+            # whose only later commits are state updates): always tag main HEAD.
+            echo "::notice::Forced tag-rc: tagging main HEAD regardless of the last commit."
             echo "skip=false" >> "$GITHUB_OUTPUT"
           elif grep -Eq '^\[skip canary\]|\[canary state\]' <<< "$last_msg"; then
             echo "::notice::Last commit is a canary-state update; skipping tag-rc."
@@ -158,7 +265,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Cut next v1-rcN tag
+      - name: Select next v1-rcN
         id: cut
         if: steps.skip_check.outputs.skip != 'true'
         shell: bash
@@ -172,26 +279,166 @@ jobs:
           # reachable from HEAD, which is not always true after force-fixes.
           highest=0
           while IFS= read -r tag; do
-            n="${tag#${RC_PREFIX}}"
+            n="${tag#"${RC_PREFIX}"}"
             if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$highest" ]; then
               highest="$n"
             fi
           done < <(git tag --list "${RC_PREFIX}*")
           next=$((highest + 1))
           rc_tag="${RC_PREFIX}${next}"
+          # HEAD == origin/main was asserted above.
           rc_sha=$(git rev-parse HEAD)
           echo "rc_tag=${rc_tag}" >> "$GITHUB_OUTPUT"
           echo "rc_sha=${rc_sha}" >> "$GITHUB_OUTPUT"
           echo "skipped=false" >> "$GITHUB_OUTPUT"
 
+      # A token that can write workflow files, scoped to the canary only, so
+      # the broader token above never carries workflows:write.
+      - name: Mint canary workflow-pin token
+        id: pin_app
+        if: steps.cut.outputs.skipped == 'false' && github.event.inputs.pin_canary != 'false'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PROMOTER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: dev-standards-canary
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Explain a failed pin-token mint
+        if: failure() && steps.pin_app.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::error::Could not mint a contents:write + workflows:write token for dev-standards-canary. The release-promoter App needs the Workflows (read & write) permission to pin the canary's release.yml. Grant it, or dispatch tag-rc with pin_canary=false (legacy @main approximation)."
+          exit 1
+
+      # Rewrite the canary's `uses: Ohio15/dev-standards/...@<ref>` to the RC
+      # commit with one Contents API commit on the canary's main, then verify
+      # the result at the new canary commit. Nothing is tagged until this
+      # succeeds, and the canary commit it yields is what the RC tag points at
+      # and what the monitor scores against (head_sha).
+      - name: Pin the canary to the RC commit
+        id: pin
+        if: steps.cut.outputs.skipped == 'false'
+        shell: bash
+        env:
+          T: ${{ steps.app.outputs.token }}
+          PIN_T: ${{ steps.pin_app.outputs.token }}
+          PIN: ${{ github.event.inputs.pin_canary != 'false' }}
+          CANARY_REPO: ${{ env.CANARY_REPO }}
+          WF_PATH: ${{ env.RELEASE_WORKFLOW_PATH }}
+          RC_TAG: ${{ steps.cut.outputs.rc_tag }}
+          RC_SHA: ${{ steps.cut.outputs.rc_sha }}
+        run: |
+          set -euo pipefail
+          # Token goes to curl on stdin (-K -), never on the command line (SC-11).
+          gh_curl() { local tok="$1"; shift; printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          api="https://api.github.com/repos/${CANARY_REPO}"
+          work=$(mktemp -d)
+
+          canary_head=$(gh_curl "$T" -fsS "${api}/git/ref/heads/main" | jq -r .object.sha)
+          if ! [[ "$canary_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve ${CANARY_REPO} main HEAD."
+            exit 1
+          fi
+          gh_curl "$T" -fsS "${api}/contents/${WF_PATH}?ref=${canary_head}" > "${work}/get.json"
+          file_sha=$(jq -r .sha "${work}/get.json")
+          jq -r .content "${work}/get.json" | base64 -d > "${work}/release.yml"
+
+          # Every line that calls this repo's reusable workflows.
+          pattern='^([[:space:]]*uses:[[:space:]]*Ohio15/dev-standards/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml)@([^[:space:]#]+)([[:space:]]*#.*)?$'
+          n_calls=$(grep -cE "$pattern" "${work}/release.yml" || true)
+          if [ "$n_calls" -lt 1 ]; then
+            echo "::error::${CANARY_REPO}/${WF_PATH} has no 'uses: Ohio15/dev-standards/.github/workflows/...@<ref>' line; cannot bind the canary to ${RC_TAG}."
+            exit 1
+          fi
+          refs=$(sed -nE "s|${pattern}|\\2|p" "${work}/release.yml" | sort -u)
+
+          if [ "$PIN" = "true" ]; then
+            sed -E "s|${pattern}|\\1@${RC_SHA} # ${RC_TAG}|" "${work}/release.yml" > "${work}/pinned.yml"
+            pinned=$(grep -cE "^[[:space:]]*uses:[[:space:]]*Ohio15/dev-standards/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@${RC_SHA} # ${RC_TAG}\$" "${work}/pinned.yml" || true)
+            if [ "$pinned" != "$n_calls" ]; then
+              echo "::error::Pin rewrite produced ${pinned} pinned line(s) for ${n_calls} call(s)."
+              exit 1
+            fi
+            # Fail closed: no non-comment line may still mention Ohio15/dev-standards/ with
+            # any ref other than RC_SHA (a quoted or list-item `uses:` spelling
+            # the rewrite pattern does not match would otherwise keep @main).
+            stray=$(grep -nE 'Ohio15/dev-standards/' "${work}/pinned.yml" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE "@${RC_SHA}([^0-9A-Za-z]|\$)" || true)
+            if [ -n "$stray" ]; then
+              echo "::error::Canary release.yml still references dev-standards at a ref other than ${RC_SHA} after the pin rewrite:"
+              printf '%s\n' "$stray"
+              exit 1
+            fi
+            # Nothing but the uses: lines may change.
+            if ! diff <(grep -vE "$pattern" "${work}/release.yml") <(grep -vE "$pattern" "${work}/pinned.yml") > /dev/null; then
+              echo "::error::Pin rewrite touched lines other than the reusable-workflow calls."
+              exit 1
+            fi
+            if cmp -s "${work}/release.yml" "${work}/pinned.yml"; then
+              echo "::notice::${CANARY_REPO} already pinned to ${RC_SHA:0:7}; no canary commit needed."
+              canary_sha="$canary_head"
+            else
+              if [ -z "${PIN_T:-}" ]; then
+                echo "::error::Canary workflow-pin token missing."
+                exit 1
+              fi
+              content=$(base64 -w0 "${work}/pinned.yml")
+              jq -n \
+                --arg message "ci(canary): pin dev-standards reusable workflows to ${RC_SHA:0:7} for ${RC_TAG}" \
+                --arg content "$content" \
+                --arg sha "$file_sha" \
+                '{message:$message, content:$content, sha:$sha, branch:"main"}' > "${work}/put.json"
+              gh_curl "$PIN_T" -fsS -X PUT -d "@${work}/put.json" "${api}/contents/${WF_PATH}" > "${work}/put-resp.json"
+              canary_sha=$(jq -r .commit.sha "${work}/put-resp.json")
+              if ! [[ "$canary_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::Canary pin commit returned no commit sha."
+                exit 1
+              fi
+              echo "::notice::Pinned ${CANARY_REPO} release.yml to ${RC_SHA:0:7} at canary ${canary_sha:0:7}."
+            fi
+            # Boundary check: read the file back AT the commit that will be
+            # tagged and require it to be byte-identical to the pinned copy.
+            gh_curl "$T" -fsS "${api}/contents/${WF_PATH}?ref=${canary_sha}" | jq -r .content | base64 -d > "${work}/readback.yml"
+            if ! cmp -s "${work}/pinned.yml" "${work}/readback.yml"; then
+              echo "::error::${CANARY_REPO}@${canary_sha} release.yml does not carry the pin to ${RC_SHA}."
+              exit 1
+            fi
+            canary_ref="$RC_SHA"
+          else
+            # Legacy mode: no canary commit. Accept only refs that test the RC
+            # commit (already pinned to it) or main (the old approximation).
+            canary_sha="$canary_head"
+            if [ "$refs" = "$RC_SHA" ]; then
+              canary_ref="$RC_SHA"
+            elif [ "$refs" = "main" ]; then
+              canary_ref="main"
+              echo "::warning::pin_canary=false: the canary calls dev-standards @main, so its runs test main at run time, not ${RC_SHA:0:7}. Promotion is only as good as main not moving during the watch."
+            else
+              echo "::error::pin_canary=false but the canary calls dev-standards at '${refs//$'\n'/,}', which is neither main nor ${RC_SHA}; its runs would not test this RC."
+              exit 1
+            fi
+          fi
+          echo "canary_sha=${canary_sha}" >> "$GITHUB_OUTPUT"
+          echo "canary_ref=${canary_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Push v1-rcN tag
+        if: steps.cut.outputs.skipped == 'false'
+        shell: bash
+        env:
+          RC_TAG: ${{ steps.cut.outputs.rc_tag }}
+          RC_SHA: ${{ steps.cut.outputs.rc_sha }}
+        run: |
+          set -euo pipefail
           # Annotated tag — release-gates / docker-release scripts treat
           # annotated and lightweight equivalently for `tag-matches-version`,
           # but annotated preserves intent + author for `gh release` listings.
           git config user.email "dev-standards-bot@noreply.anthropic.com"
           git config user.name  "dev-standards-bot"
-          git tag -a "${rc_tag}" -m "Canary RC ${next} — auto-cut from $(git log -1 --pretty=%h main)"
-          git push origin "${rc_tag}"
-          echo "::notice::Cut ${rc_tag} -> ${rc_sha}"
+          git tag -a "${RC_TAG}" -m "Canary RC ${RC_TAG#v1-rc} — auto-cut from ${RC_SHA:0:7} (main)" "${RC_SHA}"
+          git push origin "refs/tags/${RC_TAG}"
+          echo "::notice::Cut ${RC_TAG} -> ${RC_SHA}"
 
       - name: Mirror tag to canary repo
         if: steps.cut.outputs.skipped == 'false'
@@ -200,42 +447,30 @@ jobs:
           T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
           RC_TAG: ${{ steps.cut.outputs.rc_tag }}
-          RC_SHA: ${{ steps.cut.outputs.rc_sha }}
+          CANARY_SHA: ${{ steps.pin.outputs.canary_sha }}
         run: |
           set -euo pipefail
-          # Resolve canary HEAD sha — we tag the canary's HEAD with our RC
-          # name so the canary's `release.yml` fires on `push: tags: ['v*']`.
-          # The tag value (RC_TAG) is what canary reads to know which
-          # dev-standards ref to consume; the SHA it points at is canary's
-          # own current main, which is fine because canary's source-of-truth
-          # for "which dev-standards version to test" is the tag name.
-          canary_head=$(curl -fsS -H "Authorization: Bearer ${T}" \
-            "https://api.github.com/repos/${CANARY_REPO}/git/refs/heads/main" | \
-            jq -r .object.sha)
-          if [ -z "$canary_head" ] || [ "$canary_head" = "null" ]; then
-            echo "::error::Could not resolve ${CANARY_REPO} main HEAD."
-            exit 1
-          fi
-
-          # Create the tag in canary. If it already exists (rare; would mean
-          # a previous run partially completed), surface and continue —
-          # idempotency over abort.
-          payload=$(jq -nc --arg ref "refs/tags/${RC_TAG}" --arg sha "$canary_head" \
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          # Tag the PINNED canary commit (not whatever canary main is now), so
+          # every run at the tag executes the RC commit and carries
+          # head_sha == CANARY_SHA, which is what the monitor scores.
+          payload=$(jq -nc --arg ref "refs/tags/${RC_TAG}" --arg sha "$CANARY_SHA" \
             '{ref:$ref, sha:$sha}')
-          http_code=$(curl -sS -o /tmp/mirror.json -w "%{http_code}" \
+          http_code=$(gh_curl -sS -o /tmp/mirror.json -w "%{http_code}" \
             -X POST \
-            -H "Authorization: Bearer ${T}" \
-            -H "Accept: application/vnd.github+json" \
             -d "$payload" \
             "https://api.github.com/repos/${CANARY_REPO}/git/refs")
           case "$http_code" in
-            201) echo "::notice::Mirrored ${RC_TAG} -> ${CANARY_REPO}@${canary_head}" ;;
+            201) echo "::notice::Mirrored ${RC_TAG} -> ${CANARY_REPO}@${CANARY_SHA}" ;;
             422)
-              # 422 is "Reference already exists" in this API. Treat as success.
-              if jq -e '.message | test("already exists")' /tmp/mirror.json > /dev/null; then
-                echo "::warning::${RC_TAG} already exists in ${CANARY_REPO}; continuing."
+              # "Reference already exists": idempotent only if it already
+              # points at the pinned commit; anything else would be scored
+              # against a commit that does not test this RC.
+              existing=$(gh_curl -fsS "https://api.github.com/repos/${CANARY_REPO}/git/ref/tags/${RC_TAG}" | jq -r .object.sha)
+              if [ "$existing" = "$CANARY_SHA" ]; then
+                echo "::warning::${RC_TAG} already exists in ${CANARY_REPO} at ${CANARY_SHA:0:7}; continuing."
               else
-                echo "::error::Canary tag mirror returned 422 with unexpected body:"
+                echo "::error::${RC_TAG} already exists in ${CANARY_REPO} at ${existing}, not the pinned ${CANARY_SHA}."
                 cat /tmp/mirror.json
                 exit 1
               fi
@@ -254,22 +489,29 @@ jobs:
           STATE_FILE: ${{ env.STATE_FILE }}
           RC_TAG: ${{ steps.cut.outputs.rc_tag }}
           RC_SHA: ${{ steps.cut.outputs.rc_sha }}
+          CANARY_SHA: ${{ steps.pin.outputs.canary_sha }}
+          CANARY_REF: ${{ steps.pin.outputs.canary_ref }}
         run: |
           set -euo pipefail
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           tmp=$(mktemp)
           # Append a history entry for the previous RC if present (status was
-          # "pending" -> "expired" if not promoted by the time a new one cuts).
+          # "pending" -> "superseded" if not promoted by the time a new one cuts).
           jq \
             --arg rc "$RC_TAG" \
             --arg sha "$RC_SHA" \
+            --arg csha "$CANARY_SHA" \
+            --arg cref "$CANARY_REF" \
             --arg now "$now" \
             '
               ( if (.current_rc != null and .status == "pending") then
-                  .history += [{rc:.current_rc, sha:.current_rc_sha, status:"superseded", green:.consecutive_green_runs, at:$now}]
+                  .history += [{rc:.current_rc, sha:.current_rc_sha, canary_sha:(.current_rc_canary_sha // null), status:"superseded", green:.consecutive_green_runs, at:$now}]
                 else . end )
+              | .schema_version = 2
               | .current_rc = $rc
               | .current_rc_sha = $sha
+              | .current_rc_canary_sha = $csha
+              | .current_rc_canary_ref = $cref
               | .current_rc_created_at = $now
               | .consecutive_green_runs = 0
               | .last_observed_run_id = null
@@ -291,7 +533,7 @@ jobs:
           git commit \
             -m "[canary state] prime ${RC_TAG} (${RC_SHA:0:7})" \
             -m "[skip canary]"
-          git push origin main
+          git push origin HEAD:refs/heads/main
 
       - name: Kick off the monitor for this RC
         # The */10 cron is throttled to ~6 h by GitHub; without this kick the
@@ -301,40 +543,44 @@ jobs:
         shell: bash
         env:
           T: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${T}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/promote-canary.yml/dispatches" \
-            -d '{"ref":"main","inputs":{"force_action":"monitor"}}'
-          echo "::notice::Monitor dispatched for ${{ steps.cut.outputs.rc_tag }}."
-
-      - name: ntfy — RC cut
-        if: steps.cut.outputs.skipped == 'false'
-        shell: bash
-        env:
-          NTFY_URL: ${{ env.NTFY_URL }}
           RC_TAG: ${{ steps.cut.outputs.rc_tag }}
-          RC_SHA: ${{ steps.cut.outputs.rc_sha }}
+          CANARY_SHA: ${{ steps.pin.outputs.canary_sha }}
         run: |
           set -euo pipefail
-          curl -fsS -X POST \
-            -H "Title: dev-standards ${RC_TAG} cut" \
-            -H "Tags: package,canary" \
-            -H "Priority: low" \
-            -d "Mirrored to ${{ env.CANARY_REPO }}; canary CI starting. SHA ${RC_SHA:0:7}." \
-            "$NTFY_URL" || \
-            echo "::warning::ntfy publish failed (non-fatal)"
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          gh_curl -fsS -X POST \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/promote-canary.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"force_action":"monitor"}}'
+          echo "::notice::Monitor dispatched for ${RC_TAG}."
+          {
+            echo "## promote-canary tag-rc"
+            echo ""
+            echo "Cut \`${RC_TAG}\`; canary tagged at \`${CANARY_SHA}\`. Monitor dispatched."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────── monitor job
-  # Runs on schedule + dispatch. Polls canary, promotes or fails accordingly.
+  # Runs on schedule + dispatch (from main only). Polls canary, promotes or
+  # fails accordingly.
   monitor:
-    if: |
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.force_action == 'monitor' || github.event.inputs.force_action == 'reset'))
+    if: >-
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.force_action == 'monitor' || github.event.inputs.force_action == 'reset')))
     runs-on: ubuntu-latest
+    environment: release-promoter
+    permissions: {}
     steps:
+      # First step, before any key material: see "Trust boundary" above for
+      # why this is necessary but not sufficient.
+      - name: Refuse to run off main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::promote-canary mints the release-promoter token and runs only on refs/heads/main (got ${GITHUB_REF})."
+            exit 1
+          fi
+
       - name: Mint release-promoter token
         id: app
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -343,12 +589,33 @@ jobs:
           private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
+          # Only what the steps use: contents (checkout, tag + state pushes,
+          # canary refs/contents reads, the v1 move) and actions (workflow
+          # dispatches, canary run reads). Without permission-* inputs the
+          # token would inherit every App permission, workflows:write included.
+          permission-contents: write
+          permission-actions: write
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
           persist-credentials: true
+
+      - name: Verify the promoter token was minted
+        shell: bash
+        env:
+          T: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${T:-}" ]; then
+            echo "::error::release-promoter token not minted (RELEASE_PROMOTER_APP_ID / RELEASE_PROMOTER_PRIVATE_KEY)."
+            exit 1
+          fi
+          if ! [[ "$T" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::release-promoter token has an unexpected shape."
+            exit 1
+          fi
 
       - name: Reset state (manual override only)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.force_action == 'reset'
@@ -361,10 +628,12 @@ jobs:
           tmp=$(mktemp)
           jq --arg now "$now" '
             ( if (.current_rc != null) then
-                .history += [{rc:.current_rc, sha:.current_rc_sha, status:"manual_reset", green:.consecutive_green_runs, at:$now}]
+                .history += [{rc:.current_rc, sha:.current_rc_sha, canary_sha:(.current_rc_canary_sha // null), status:"manual_reset", green:.consecutive_green_runs, at:$now}]
               else . end )
             | .current_rc = null
             | .current_rc_sha = null
+            | .current_rc_canary_sha = null
+            | .current_rc_canary_ref = null
             | .current_rc_created_at = null
             | .consecutive_green_runs = 0
             | .last_observed_run_id = null
@@ -382,7 +651,10 @@ jobs:
             -m "[canary state] manual reset" \
             -m "[skip canary]" \
             || echo "no state diff"
-          git push origin main || true
+          if ! git push origin HEAD:refs/heads/main; then
+            echo "::error::Reset commit could not be pushed to main; state on main is UNCHANGED (not idle)."
+            exit 1
+          fi
           echo "::notice::State reset to idle. Next push:main will re-prime."
           exit 0
 
@@ -396,6 +668,8 @@ jobs:
           status=$(jq -r '.status' "$STATE_FILE")
           rc=$(jq -r '.current_rc // empty' "$STATE_FILE")
           rc_sha=$(jq -r '.current_rc_sha // empty' "$STATE_FILE")
+          canary_sha=$(jq -r '.current_rc_canary_sha // empty' "$STATE_FILE")
+          canary_ref=$(jq -r '.current_rc_canary_ref // empty' "$STATE_FILE")
           rc_at=$(jq -r '.current_rc_created_at // empty' "$STATE_FILE")
           green=$(jq -r '.consecutive_green_runs' "$STATE_FILE")
           last_run_id=$(jq -r '.last_observed_run_id // empty' "$STATE_FILE")
@@ -403,17 +677,21 @@ jobs:
             echo "status=$status"
             echo "rc=$rc"
             echo "rc_sha=$rc_sha"
+            echo "canary_sha=$canary_sha"
+            echo "canary_ref=$canary_ref"
             echo "rc_at=$rc_at"
             echo "green=$green"
             echo "last_run_id=$last_run_id"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::state status=$status rc=$rc green=$green last_observed=$last_run_id"
+          echo "::notice::state status=$status rc=$rc canary=${canary_sha:0:7} green=$green last_observed=$last_run_id"
 
       - name: Skip when idle
         if: steps.state.outputs.status != 'pending'
         shell: bash
+        env:
+          STATUS: ${{ steps.state.outputs.status }}
         run: |
-          echo "::notice::status=${{ steps.state.outputs.status }} — nothing to monitor."
+          echo "::notice::status=${STATUS} — nothing to monitor."
           exit 0
 
       - name: Check RC age
@@ -445,17 +723,19 @@ jobs:
         shell: bash
         env:
           STATE_FILE: ${{ env.STATE_FILE }}
-          NTFY_URL: ${{ env.NTFY_URL }}
           RC: ${{ steps.state.outputs.rc }}
           AGE_HOURS: ${{ steps.age.outputs.age_hours }}
+          RC_MAX_AGE_HOURS: ${{ env.RC_MAX_AGE_HOURS }}
         run: |
           set -euo pipefail
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           tmp=$(mktemp)
           jq --arg now "$now" '
-            .history += [{rc:.current_rc, sha:.current_rc_sha, status:"expired", green:.consecutive_green_runs, at:$now}]
+            .history += [{rc:.current_rc, sha:.current_rc_sha, canary_sha:(.current_rc_canary_sha // null), status:"expired", green:.consecutive_green_runs, at:$now}]
             | .current_rc = null
             | .current_rc_sha = null
+            | .current_rc_canary_sha = null
+            | .current_rc_canary_ref = null
             | .current_rc_created_at = null
             | .consecutive_green_runs = 0
             | .last_observed_run_id = null
@@ -469,58 +749,74 @@ jobs:
           git commit \
             -m "[canary state] expire ${RC} after ${AGE_HOURS}h" \
             -m "[skip canary]"
-          git push origin main
-          curl -fsS -X POST \
-            -H "Title: ${RC} expired (${AGE_HOURS}h)" \
-            -H "Tags: hourglass,canary" \
-            -H "Priority: default" \
-            -d "RC age exceeded ${{ env.RC_MAX_AGE_HOURS }}h without promotion. Next push to dev-standards/main will cut a fresh RC." \
-            "$NTFY_URL" || echo "::warning::ntfy publish failed (non-fatal)"
-          echo "::notice::${RC} marked expired."
+          git push origin HEAD:refs/heads/main
+          echo "::warning::${RC} expired after ${AGE_HOURS}h (max ${RC_MAX_AGE_HOURS}h) without promotion. Next push to dev-standards/main will cut a fresh RC."
           exit 0
 
-      - name: Query canary runs at RC ref
+      - name: Query canary release.yml runs at the RC tag and pinned commit
         id: runs
         if: steps.state.outputs.status == 'pending' && steps.age.outputs.expired != 'true'
         shell: bash
         env:
           T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
+          WF_PATH: ${{ env.RELEASE_WORKFLOW_PATH }}
           RC: ${{ steps.state.outputs.rc }}
+          CANARY_SHA: ${{ steps.state.outputs.canary_sha }}
+          GREEN_THRESHOLD: ${{ env.GREEN_THRESHOLD }}
         run: |
           set -euo pipefail
-          if [ -z "${T:-}" ]; then
-            echo "::error::release-promoter token not minted (RELEASE_PROMOTER_APP_ID / RELEASE_PROMOTER_PRIVATE_KEY)."
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          # Run names and URLs come from the canary repo and are written to
+          # GITHUB_OUTPUT (first_red) and into a workflow command later: strip
+          # control characters (a newline would inject an output key) and the
+          # '|' field separator.
+          JQ_CLEAN='def clean: tostring | gsub("[[:cntrl:]|]"; " "); '
+          if ! [[ "$CANARY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::State has no current_rc_canary_sha (primed before schema_version 2). It cannot be scored against a canary commit; dispatch force_action=tag-rc from main to re-cut."
             exit 1
           fi
-          # head_branch is the tag name for both the tag-push run and the
-          # monitor's own workflow_dispatch re-runs at that ref (below). Only
-          # release.yml fires on a v1-rcN tag, so one push yields one run; the
-          # re-dispatches are how three consecutive executions accumulate.
-          # PR runs against canary main never carry the tag as head_branch.
-          for ev in push workflow_dispatch; do
-            curl -fsS \
-              -H "Authorization: Bearer ${T}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=${ev}&per_page=20" \
-              > "/tmp/runs-${ev}.json"
-          done
-          jq -s '{total_count: (map(.total_count) | add),
-                  workflow_runs: (map(.workflow_runs) | add)}' \
-             /tmp/runs-push.json /tmp/runs-workflow_dispatch.json > /tmp/runs.json
+          # Score ONLY the canary's release.yml (matched on the run's `path`,
+          # not just the endpoint) at head_branch == the RC tag. Other canary
+          # workflows can also carry the tag as head_branch when dispatched at
+          # it, and some are trivially green, so they are never counted. Among
+          # release.yml runs, only those whose head_sha is the pinned canary
+          # commit the tag was created at are scored; a release.yml run at the
+          # tag with any other head_sha means the tag was moved and is treated
+          # as disqualifying.
+          gh_curl -fsS \
+            "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/$(basename "$WF_PATH")/runs?branch=${RC}&per_page=100" \
+            > /tmp/runs-all.json
+          jq --arg path "$WF_PATH" --arg rc "$RC" --arg sha "$CANARY_SHA" '
+            [.workflow_runs[] | select(.path == $path and .head_branch == $rc)] as $rel
+            | {scored:  [$rel[] | select(.head_sha == $sha)],
+               foreign: [$rel[] | select(.head_sha != $sha)]}
+          ' /tmp/runs-all.json > /tmp/runs.json
 
-          total=$(jq -r '.total_count' /tmp/runs.json)
-          in_flight=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' /tmp/runs.json)
+          total=$(jq '.scored | length' /tmp/runs.json)
+          in_flight=$(jq '[.scored[] | select(.status != "completed")] | length' /tmp/runs.json)
           echo "in_flight=${in_flight}" >> "$GITHUB_OUTPUT"
-          echo "::notice::Canary has ${total} run(s) at ${RC}."
+          echo "::notice::Canary has ${total} release.yml run(s) at ${RC} @ ${CANARY_SHA:0:7}."
+
+          foreign=$(jq -r "${JQ_CLEAN}"'.foreign | (.[0] // null)
+            | if . == null then "none" else "\(.id)|foreign_head_sha:\(.head_sha | clean)|\(.html_url | clean)|\(.name | clean)" end' /tmp/runs.json)
 
           # Reduce to runs that have terminated (status=completed). In-flight
           # runs are simply not yet eligible — we will see them next cycle.
-          jq '[.workflow_runs[] | select(.status == "completed")]
+          jq '[.scored[] | select(.status == "completed")]
                | sort_by(.created_at)
                | reverse' /tmp/runs.json > /tmp/completed.json
           completed=$(jq 'length' /tmp/completed.json)
           echo "completed=${completed}"
+
+          if [ "$foreign" != "none" ]; then
+            {
+              echo "completed=${completed}"
+              echo "first_red=${foreign}"
+              echo "verdict=red"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ "$completed" = "0" ]; then
             echo "verdict=in_flight" >> "$GITHUB_OUTPUT"
@@ -530,17 +826,17 @@ jobs:
           # Three most recent terminated runs. If fewer than threshold exist,
           # we cannot promote yet, but a single failure among them is still
           # disqualifying.
-          jq --argjson n "${{ env.GREEN_THRESHOLD }}" '.[:$n]' /tmp/completed.json > /tmp/window.json
+          jq --argjson n "$GREEN_THRESHOLD" '.[:$n]' /tmp/completed.json > /tmp/window.json
           window_size=$(jq 'length' /tmp/window.json)
 
           # Detect any non-success conclusion in the window OR in the entire
           # completed history at this RC. STANDARDS section 5: "any canary
           # red blocks v1 promotion" — a transient red and then 3 greens does
           # NOT promote. We require a clean record at this RC.
-          first_red=$(jq -r '
+          first_red=$(jq -r "${JQ_CLEAN}"'
             [.[] | select(.conclusion != "success")]
             | (.[0] // null)
-            | if . == null then "none" else "\(.id)|\(.conclusion)|\(.html_url)|\(.name)" end
+            | if . == null then "none" else "\(.id)|\(.conclusion | clean)|\(.html_url | clean)|\(.name | clean)" end
           ' /tmp/completed.json)
 
           # Greens count in the window (newest first), but only if no red
@@ -562,7 +858,7 @@ jobs:
 
           if [ "$first_red" != "none" ]; then
             echo "verdict=red" >> "$GITHUB_OUTPUT"
-          elif [ "$completed" -ge "${{ env.GREEN_THRESHOLD }}" ] && [ "$greens_in_window" -ge "${{ env.GREEN_THRESHOLD }}" ]; then
+          elif [ "$completed" -ge "$GREEN_THRESHOLD" ] && [ "$greens_in_window" -ge "$GREEN_THRESHOLD" ]; then
             echo "verdict=green" >> "$GITHUB_OUTPUT"
           else
             echo "verdict=accumulating" >> "$GITHUB_OUTPUT"
@@ -577,24 +873,30 @@ jobs:
         env:
           T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
+          WF_PATH: ${{ env.RELEASE_WORKFLOW_PATH }}
           RC: ${{ steps.state.outputs.rc }}
+          COMPLETED: ${{ steps.runs.outputs.completed }}
         run: |
           set -euo pipefail
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
           # Same ref, fresh execution: this is how "3 consecutive green runs"
-          # is reachable for a single-workflow canary. The dispatched run has
-          # head_branch == the tag, so the query above scores it next cycle.
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${T}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/release.yml/dispatches" \
+          # is reachable for a single-workflow canary. Dispatched at the tag,
+          # the run executes the tag's (pinned) release.yml and carries
+          # head_branch == the tag and head_sha == the pinned canary commit,
+          # so the query above scores it next cycle.
+          gh_curl -fsS -X POST \
+            "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/$(basename "$WF_PATH")/dispatches" \
             -d "{\"ref\":\"${RC}\"}"
-          echo "::notice::Re-dispatched canary release.yml at ${RC} (completed so far: ${{ steps.runs.outputs.completed }})."
+          echo "::notice::Re-dispatched canary release.yml at ${RC} (completed so far: ${COMPLETED})."
 
       - name: Update state — accumulating (still building toward threshold)
         if: steps.runs.outputs.verdict == 'accumulating' || steps.runs.outputs.verdict == 'in_flight'
         shell: bash
         env:
           STATE_FILE: ${{ env.STATE_FILE }}
+          VERDICT: ${{ steps.runs.outputs.verdict }}
+          RC: ${{ steps.state.outputs.rc }}
+          GREEN_THRESHOLD: ${{ env.GREEN_THRESHOLD }}
           GREENS: ${{ steps.runs.outputs.greens_in_window }}
           LAST_RUN_ID: ${{ steps.runs.outputs.last_run_id }}
           LAST_CONCLUSION: ${{ steps.runs.outputs.last_conclusion }}
@@ -602,7 +904,7 @@ jobs:
         run: |
           set -euo pipefail
           # No state change required if nothing has terminated yet.
-          if [ "${{ steps.runs.outputs.verdict }}" = "in_flight" ]; then
+          if [ "$VERDICT" = "in_flight" ]; then
             echo "::notice::Canary runs still in flight — will recheck next cycle."
             exit 0
           fi
@@ -626,9 +928,9 @@ jobs:
           git config user.name  "dev-standards-bot"
           git add "$STATE_FILE"
           git commit \
-            -m "[canary state] ${{ steps.state.outputs.rc }} — ${GREENS:-0}/${{ env.GREEN_THRESHOLD }} green" \
+            -m "[canary state] ${RC} — ${GREENS:-0}/${GREEN_THRESHOLD} green" \
             -m "[skip canary]"
-          git push origin main
+          git push origin HEAD:refs/heads/main
 
       - name: Wait for the re-dispatched run, then re-enter the monitor
         # GitHub throttles this workflow's */10 cron to roughly every six
@@ -648,24 +950,27 @@ jobs:
         env:
           T: ${{ steps.app.outputs.token }}
           CANARY_REPO: ${{ env.CANARY_REPO }}
+          WF_PATH: ${{ env.RELEASE_WORKFLOW_PATH }}
           RC: ${{ steps.state.outputs.rc }}
+          CANARY_SHA: ${{ steps.state.outputs.canary_sha }}
           BEFORE: ${{ steps.runs.outputs.completed }}
         run: |
           set -euo pipefail
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
           BEFORE="${BEFORE:-0}"          # empty when the first run is still in flight
           deadline=$(( $(date +%s) + 20*60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 30
-            n=$(curl -fsS -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
-                 "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=workflow_dispatch&per_page=20" \
-                 | jq '[.workflow_runs[] | select(.status == "completed")] | length')
-            m=$(curl -fsS -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
-                 "https://api.github.com/repos/${CANARY_REPO}/actions/runs?branch=${RC}&event=push&per_page=20" \
-                 | jq '[.workflow_runs[] | select(.status == "completed")] | length')
-            if [ "$((n + m))" -gt "$BEFORE" ]; then
-              echo "::notice::Re-dispatched canary run completed ($((n + m)) completed at ${RC}); re-entering the monitor."
-              curl -fsS -X POST -H "Authorization: Bearer ${T}" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/promote-canary.yml/dispatches" \
+            # Same population the scoring step counts: release.yml runs at the
+            # tag AND the pinned canary commit.
+            n=$(gh_curl -fsS \
+                 "https://api.github.com/repos/${CANARY_REPO}/actions/workflows/$(basename "$WF_PATH")/runs?branch=${RC}&per_page=100" \
+                 | jq --arg path "$WF_PATH" --arg rc "$RC" --arg sha "$CANARY_SHA" \
+                   '[.workflow_runs[] | select(.path == $path and .head_branch == $rc and .head_sha == $sha and .status == "completed")] | length')
+            if [ "$n" -gt "$BEFORE" ]; then
+              echo "::notice::Re-dispatched canary run completed (${n} completed at ${RC}); re-entering the monitor."
+              gh_curl -fsS -X POST \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/promote-canary.yml/dispatches" \
                 -d '{"ref":"main","inputs":{"force_action":"monitor"}}'
               exit 0
             fi
@@ -679,35 +984,52 @@ jobs:
           T: ${{ steps.app.outputs.token }}
           STATE_FILE: ${{ env.STATE_FILE }}
           STABLE_TAG: ${{ env.STABLE_TAG }}
+          GREEN_THRESHOLD: ${{ env.GREEN_THRESHOLD }}
           RC: ${{ steps.state.outputs.rc }}
           RC_SHA: ${{ steps.state.outputs.rc_sha }}
-          NTFY_URL: ${{ env.NTFY_URL }}
+          CANARY_REF: ${{ steps.state.outputs.canary_ref }}
         run: |
           set -euo pipefail
+          # Only canary evidence that ran the RC commit may move v1. A legacy
+          # pin_canary=false RC (canary called @main) tested main at run time,
+          # not RC_SHA, so its greens never promote (SC-30).
+          if ! [[ "$RC_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$CANARY_REF" != "$RC_SHA" ]; then
+            echo "::error::Canary ref '${CANARY_REF}' is not the RC commit ${RC_SHA}; its runs did not test this RC. Refusing to promote. Re-cut with force_action=tag-rc (pin_canary=true)."
+            exit 1
+          fi
+          gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          # Bind the promotion to main and the RC: the state's RC_SHA must be
+          # what the RC tag in this repo points at, and must be on main.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tag_sha=$(git rev-parse --verify --quiet "refs/tags/${RC}^{commit}" || true)
+          if [ "$tag_sha" != "$RC_SHA" ]; then
+            echo "::error::State RC sha ${RC_SHA} does not match tag ${RC} (${tag_sha:-missing}); refusing to promote."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RC_SHA" refs/remotes/origin/main; then
+            echo "::error::${RC_SHA} is not on origin/main; refusing to promote."
+            exit 1
+          fi
           # Fast-forward `v1` to the RC commit. We use force=true because v1
           # is a moving major-version pointer per SPEC.md ("`@v1` is a moving
           # major-version tag in dev-standards"). Force-update of `v1` is the
           # mechanism that propagates fixes to consumers; this is the SAFE
           # form of force-push because the destination commit has now been
-          # canary-validated 3x consecutively.
+          # canary-validated 3x consecutively at the pinned canary commit.
           payload=$(jq -nc --arg sha "${RC_SHA}" '{sha:$sha, force:true}')
-          http_code=$(curl -sS -o /tmp/ff.json -w "%{http_code}" \
+          http_code=$(gh_curl -sS -o /tmp/ff.json -w "%{http_code}" \
             -X PATCH \
-            -H "Authorization: Bearer ${T}" \
-            -H "Accept: application/vnd.github+json" \
             -d "$payload" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${STABLE_TAG}")
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/${STABLE_TAG}")
           case "$http_code" in
             200) echo "::notice::${STABLE_TAG} -> ${RC_SHA:0:7}" ;;
             422)
               # Tag may not exist yet on first promotion. Create it.
               if jq -e '.message | test("Reference does not exist|Not Found"; "i")' /tmp/ff.json > /dev/null; then
                 payload2=$(jq -nc --arg ref "refs/tags/${STABLE_TAG}" --arg sha "${RC_SHA}" '{ref:$ref, sha:$sha}')
-                curl -fsS -X POST \
-                  -H "Authorization: Bearer ${T}" \
-                  -H "Accept: application/vnd.github+json" \
+                gh_curl -fsS -X POST \
                   -d "$payload2" \
-                  "https://api.github.com/repos/${{ github.repository }}/git/refs"
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs"
                 echo "::notice::Created ${STABLE_TAG} at ${RC_SHA:0:7}"
               else
                 echo "::error::v1 fast-forward returned 422:"
@@ -718,11 +1040,9 @@ jobs:
             404)
               # Same: tag does not exist, create it.
               payload2=$(jq -nc --arg ref "refs/tags/${STABLE_TAG}" --arg sha "${RC_SHA}" '{ref:$ref, sha:$sha}')
-              curl -fsS -X POST \
-                -H "Authorization: Bearer ${T}" \
-                -H "Accept: application/vnd.github+json" \
+              gh_curl -fsS -X POST \
                 -d "$payload2" \
-                "https://api.github.com/repos/${{ github.repository }}/git/refs"
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs"
               echo "::notice::Created ${STABLE_TAG} at ${RC_SHA:0:7}"
               ;;
             *)
@@ -734,12 +1054,12 @@ jobs:
 
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           tmp=$(mktemp)
-          jq --arg now "$now" --arg sha "$RC_SHA" '
-            .history += [{rc:.current_rc, sha:.current_rc_sha, status:"promoted", green:.consecutive_green_runs, at:$now}]
+          jq --arg now "$now" --arg sha "$RC_SHA" --argjson n "$GREEN_THRESHOLD" '
+            .history += [{rc:.current_rc, sha:.current_rc_sha, canary_sha:(.current_rc_canary_sha // null), status:"promoted", green:.consecutive_green_runs, at:$now}]
             | .status = "promoted"
             | .promoted_at = $now
             | .promoted_to_sha = $sha
-            | .consecutive_green_runs = ${{ env.GREEN_THRESHOLD }}
+            | .consecutive_green_runs = $n
           ' "$STATE_FILE" > "$tmp"
           mv "$tmp" "$STATE_FILE"
           git config user.email "dev-standards-bot@noreply.anthropic.com"
@@ -748,21 +1068,14 @@ jobs:
           git commit \
             -m "[canary state] ${RC} promoted to v1 (${RC_SHA:0:7})" \
             -m "[skip canary]"
-          git push origin main
-
-          curl -fsS -X POST \
-            -H "Title: dev-standards v1 -> ${RC}" \
-            -H "Tags: white_check_mark,canary,promotion" \
-            -H "Priority: default" \
-            -d "Canary green for ${{ env.GREEN_THRESHOLD }} consecutive runs. v1 fast-forwarded to ${RC_SHA:0:7}." \
-            "$NTFY_URL" || echo "::warning::ntfy publish failed (non-fatal)"
+          git push origin HEAD:refs/heads/main
+          echo "::notice::Canary green for ${GREEN_THRESHOLD} consecutive runs. ${STABLE_TAG} fast-forwarded to ${RC_SHA:0:7}."
 
       - name: Mark failed — red canary run observed
         if: steps.runs.outputs.verdict == 'red'
         shell: bash
         env:
           STATE_FILE: ${{ env.STATE_FILE }}
-          NTFY_URL: ${{ env.NTFY_URL }}
           RC: ${{ steps.state.outputs.rc }}
           FIRST_RED: ${{ steps.runs.outputs.first_red }}
         run: |
@@ -775,7 +1088,7 @@ jobs:
           jq --arg now "$now" \
              --arg url "$red_url" \
              --arg concl "$red_concl" '
-            .history += [{rc:.current_rc, sha:.current_rc_sha, status:"failed", conclusion:$concl, run_url:$url, at:$now}]
+            .history += [{rc:.current_rc, sha:.current_rc_sha, canary_sha:(.current_rc_canary_sha // null), status:"failed", conclusion:$concl, run_url:$url, at:$now}]
             | .status = "failed"
             | .last_observed_run_conclusion = $concl
           ' "$STATE_FILE" > "$tmp"
@@ -787,30 +1100,37 @@ jobs:
             -m "[canary state] ${RC} red — ${red_concl}" \
             -m "[skip canary]" \
             || echo "no state diff"
-          git push origin main || true
+          git push origin HEAD:refs/heads/main || true
 
-          # Urgent ntfy. Per STANDARDS section 5: "Ron is notified via ntfy
-          # urgent priority. Human review SLA: 24 hours to triage."
-          curl -fsS -X POST \
-            -H "Title: ${RC} canary RED — v1 promotion blocked" \
-            -H "Tags: rotating_light,canary,blocked" \
-            -H "Priority: urgent" \
-            -H "Click: ${red_url}" \
-            -d "Canary workflow '${red_name}' completed with ${red_concl}. v1 NOT advanced. 24h triage SLA — fix forward, revert RC, or document expected-fail. Run: ${red_url}" \
-            "$NTFY_URL" || echo "::warning::ntfy publish failed (non-fatal)"
+          # STANDARDS section 5: any canary red blocks v1 promotion, 24 hours
+          # to triage. There is no reachable authenticated ntfy from a hosted
+          # runner, so the alert is this run FAILING: GitHub notifies the
+          # owner of failed workflow runs. State is now "failed", so later
+          # monitor runs skip quietly instead of re-failing.
+          echo "::error title=${RC} canary RED — v1 promotion blocked::Canary workflow '${red_name}' run ${red_id} completed with ${red_concl}. v1 NOT advanced. 24h triage SLA — fix forward, revert RC, or document expected-fail. Run: ${red_url}"
+          exit 1
 
       - name: Summary
         if: always()
         shell: bash
+        env:
+          S_STATUS: ${{ steps.state.outputs.status }}
+          S_RC: ${{ steps.state.outputs.rc }}
+          S_CANARY: ${{ steps.state.outputs.canary_sha }}
+          S_VERDICT: ${{ steps.runs.outputs.verdict }}
+          S_GREENS: ${{ steps.runs.outputs.greens_in_window }}
+          S_LAST_ID: ${{ steps.runs.outputs.last_run_id }}
+          S_LAST_CONCL: ${{ steps.runs.outputs.last_conclusion }}
         run: |
           {
             echo "## promote-canary monitor summary"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Status (start) | ${{ steps.state.outputs.status }} |"
-            echo "| RC | ${{ steps.state.outputs.rc }} |"
-            echo "| Verdict | ${{ steps.runs.outputs.verdict }} |"
-            echo "| Greens in window | ${{ steps.runs.outputs.greens_in_window }} |"
-            echo "| Last run | ${{ steps.runs.outputs.last_run_id }} (${{ steps.runs.outputs.last_conclusion }}) |"
+            echo "| Status (start) | ${S_STATUS} |"
+            echo "| RC | ${S_RC} |"
+            echo "| Canary commit scored | ${S_CANARY} |"
+            echo "| Verdict | ${S_VERDICT} |"
+            echo "| Greens in window | ${S_GREENS} |"
+            echo "| Last run | ${S_LAST_ID} (${S_LAST_CONCL}) |"
           } >> "$GITHUB_STEP_SUMMARY"

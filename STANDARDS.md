@@ -240,7 +240,7 @@ Each exercises every documented input of the matching reusable workflow as a CI 
 | `notify_unreachable` | ntfy down — deploy must still succeed |
 | `mcp_pin_path_update` | mcp-release post-deploy `mcp.client_pin_paths` JSON edit |
 
-**Canary failure modes & SLA:** any canary red blocks v1 promotion. Ron is notified via ntfy `urgent` priority. Human review SLA: 24 hours to triage (fix forward, revert RC, or document as expected-fail). RCs older than 7 days without promotion auto-expire and get re-cut from latest main.
+**Canary failure modes & SLA:** any canary red blocks v1 promotion. Ron is notified by the promote-canary monitor run failing (GitHub's failed-run notification); there is no ntfy post, because the NEXUS ntfy is not reachable from hosted runners and a public ntfy.sh topic is not an acceptable sink (`release/canary-promotion.md`). Human review SLA: 24 hours to triage (fix forward, revert RC, or document as expected-fail). RCs older than 7 days without promotion auto-expire and get re-cut from latest main.
 
 **Open question:** canary-as-subdir of dev-standards vs separate repo. Subdir wins on atomic commits + no cross-repo PR coordination. Separate repo wins on clean separation of "the standards" from "the test of the standards" + ability to open canary publicly without leaking nothing-yet-public dev-standards. Deferred — see section 12.
 

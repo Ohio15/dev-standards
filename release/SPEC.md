@@ -244,9 +244,30 @@ repo waits its turn.
   (records actual deployed-and-healthy state) but requires the registry
   to be in place first — Phase 1C dependency.
 - Self-hosted runner security: Docker-socket access lets a compromised
-  workflow take over NEXUS. Mitigate with branch protection (only `main`
-  + tags can dispatch deploy jobs) and required reviews on workflow file
-  changes in this repo.
+  workflow take over NEXUS. The same exposure applies to the release-promoter
+  App key in `promote-canary.yml`, which can move `v1` for every consumer.
+  Controls that EXIST in this repo (created 2026-10-10 in response to
+  audit-dev-standards-2026-10-10 HIGH 1):
+  - Ruleset 24843941 on `refs/heads/main`: pull request required (0
+    approving reviews required), required status checks `size-guard` and
+    `Audit summary (always runs)`, no force push, no deletion. Sole bypass
+    actor: the release-promoter App (integration 5165373), which pushes the
+    promotion state commits.
+  - Ruleset 24843943 on `refs/tags/v*`: no update, no deletion, no force
+    push. Bypass actor: the release-promoter App (5165373), the only identity
+    that moves `v1` or creates `v1-rcN`.
+  - Environment `release-promoter`: required reviewer Ohio15, deployment
+    policies `main` (branch) and `v*` (tag), secret
+    `RELEASE_PROMOTER_PRIVATE_KEY`. Both `promote-canary.yml` jobs declare
+    it, run only when `github.ref == 'refs/heads/main'`, and re-assert that
+    as their first step. Those in-file checks do not bind an edited copy
+    dispatched from a branch; the environment does.
+
+  One step remains: delete the REPOSITORY-level `RELEASE_PROMOTER_PRIVATE_KEY`
+  immediately after the PR that adds `environment: release-promoter` merges.
+  While it exists, any job (including an edited copy dispatched from a
+  pushed branch) can read it. Deleting it earlier breaks the pre-merge
+  workflow, which does not declare the environment.
 
 ## Runner selection
 
