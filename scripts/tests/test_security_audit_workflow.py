@@ -337,8 +337,10 @@ def run_yarn(tmp_path: Path, shim_path: str, lock: str, out: str, rc: int, step:
         p = bindir / name
         p.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
         p.chmod(0o755)
+    # Trusted: these cases are about which yarn runs and how its report is
+    # read; the untrusted (pull_request) install has its own tests below.
     proc = subprocess.run([BASH, "-c", npm_step(step)], cwd=work, capture_output=True, text=True,
-                          env={**os.environ, "PATH": shim_path})
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "true"})
     proc.calls = (tmp_path / "yarn-calls").read_text(encoding="utf-8") if (tmp_path / "yarn-calls").exists() else ""
     proc.corepack = (tmp_path / "corepack-calls").read_text(encoding="utf-8") if (tmp_path / "corepack-calls").exists() else ""
     return proc
@@ -405,3 +407,317 @@ def test_install_refuses_an_unknown_yarn_lockfile(tmp_path, shim_path):
     proc = run_yarn(tmp_path, shim_path, "garbage\n", "", 0, step="Install")
     assert proc.returncode == 1
     assert "neither a yarn berry nor a yarn v1 lockfile" in proc.stdout
+
+
+# ─── runner and trust (audit-dev-standards-2026-10-10 HIGH 3; SC-37, SC-13) ──
+# A repo variable may choose the runner only on a trusted event, and on an
+# untrusted one (pull_request) no PR-controlled code runs. The runs-on
+# expression is EVALUATED here with Actions' operand-returning &&/|| rules,
+# for every job a pull_request reaches, with CI_RUNNER set to a self-hosted
+# label: none may resolve to it.
+
+import json
+
+SIZE_GUARD_COPIES = [ROOT / "workflows" / "size-guard.yml", ROOT / ".github" / "workflows" / "size-guard.yml"]
+
+
+def triggers(wf: dict) -> set[str]:
+    on = wf.get("on", wf.get(True))  # PyYAML reads a bare `on:` key as True
+    if isinstance(on, str):
+        return {on}
+    return set(on or [])
+
+
+def _pr_workflows() -> list[Path]:
+    """Every workflow a pull_request can start, wherever the repo keeps one."""
+    found = []
+    for d in (ROOT / ".github" / "workflows", ROOT / "workflows", ROOT / "templates" / ".github" / "workflows"):
+        for f in sorted([*d.glob("*.yml"), *d.glob("*.yaml")]):
+            if "pull_request" in triggers(yaml.safe_load(f.read_text(encoding="utf-8"))):
+                found.append(f)
+    return found
+
+
+PR_WORKFLOWS = _pr_workflows()
+
+
+# A small evaluator for the expression subset runs-on may use: string
+# literals, dotted context lookups, ==, &&, ||, !, parentheses, format().
+# &&/|| return an operand, as in Actions; == compares case-insensitively.
+_TOK = re.compile(r"\s*(?:(\|\||&&|==|!=|[()!,])|'((?:[^']|'')*)'|([A-Za-z_][\w.\-]*))")
+
+
+def eval_expr(text: str, ctx: dict):
+    toks, pos = [], 0
+    while pos < len(text.rstrip()):
+        m = _TOK.match(text, pos)
+        assert m and m.end() > pos, f"cannot parse {text[pos:]!r}"
+        toks.append(("op", m.group(1)) if m.group(1) else ("str", m.group(2).replace("''", "'"))
+                    if m.group(2) is not None else ("id", m.group(3)))
+        pos = m.end()
+    i = 0
+
+    def peek():
+        return toks[i] if i < len(toks) else (None, None)
+
+    def take():
+        nonlocal i
+        i += 1
+        return toks[i - 1]
+
+    def primary():
+        kind, val = take()
+        if (kind, val) == ("op", "("):
+            v = or_()
+            assert take() == ("op", ")")
+            return v
+        if (kind, val) == ("op", "!"):
+            return not primary()
+        if kind == "str":
+            return val
+        assert kind == "id", (kind, val)
+        if val in ("true", "false"):
+            return val == "true"
+        if peek() == ("op", "("):
+            take()
+            args = [or_()]
+            while peek() == ("op", ","):
+                take()
+                args.append(or_())
+            assert take() == ("op", ")")
+            assert val == "format", f"function {val} not modelled"
+            return re.sub(r"\{(\d+)\}", lambda mm: str(args[1 + int(mm.group(1))]), args[0])
+        assert val in ctx, f"context {val} not modelled"
+        return ctx[val]
+
+    def cmp_():
+        v = primary()
+        while peek() in (("op", "=="), ("op", "!=")):
+            op = take()[1]
+            r = primary()
+            eq = str(v).lower() == str(r).lower()
+            v = eq if op == "==" else not eq
+        return v
+
+    def and_():
+        v = cmp_()
+        while peek() == ("op", "&&"):
+            take()
+            r = cmp_()
+            v = r if v else v
+        return v
+
+    def or_():
+        v = and_()
+        while peek() == ("op", "||"):
+            take()
+            r = and_()
+            v = v if v else r
+        return v
+
+    out = or_()
+    assert i == len(toks), f"trailing tokens in {text!r}"
+    return out
+
+
+def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
+    if not isinstance(expr, str) or "${{" not in expr:
+        return expr
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
+    assert m, expr
+    return eval_expr(m.group(1), {
+        "github.event_name": event, "github.ref": ref,
+        "github.event.repository.default_branch": "main", "vars.CI_RUNNER": ci_runner,
+    })
+
+
+UNTRUSTED = [("pull_request", "refs/pull/7/merge"), ("pull_request_target", "refs/heads/main"),
+             ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7"), ("release", "refs/tags/v1"),
+             ("push", "refs/heads/feature"), ("push", "refs/heads/master"), ("push", "refs/tags/v1"),
+             ("workflow_dispatch", "refs/heads/feature")]
+TRUSTED = [("schedule", "refs/heads/main"), ("push", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main")]
+
+
+def test_the_pull_request_workflow_list_is_derived_not_listed():
+    names = {p.relative_to(ROOT).as_posix() for p in PR_WORKFLOWS}
+    assert {".github/workflows/security-audit.yml", "templates/.github/workflows/security-audit.yml",
+            ".github/workflows/size-guard.yml", "workflows/size-guard.yml",
+            ".github/workflows/healthcheck-shape-lint.yml"} <= names, names
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert wf["jobs"], "no jobs parsed"
+    for name, job in wf["jobs"].items():
+        for event, ref in UNTRUSTED:
+            got = resolve(job["runs-on"], event, ref)
+            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} runs on {got!r}"
+        if "${{" in str(job["runs-on"]):
+            for event, ref in TRUSTED:
+                assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event)
+                assert resolve(job["runs-on"], event, ref, ci_runner="") == "ubuntu-latest"
+
+
+def test_trusted_event_flag_is_the_runner_predicate():
+    flag = WORKFLOW["env"]["TRUSTED_EVENT"]
+    pred = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", flag, re.S).group(1)
+    for name, job in JOBS.items():
+        assert pred in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+    for event, ref in UNTRUSTED:
+        assert resolve(flag, event, ref) is False, (event, ref)
+    for event, ref in TRUSTED:
+        assert resolve(flag, event, ref) is True, (event, ref)
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_least_privilege_token(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert wf["permissions"] == {"contents": "read"}
+    for name, job in wf["jobs"].items():
+        assert "permissions" not in job, f"{name} widens the token"
+    assert "security-events" not in path.read_text(encoding="utf-8")
+
+
+def test_no_execute_switches_are_present():
+    npm_env = JOBS["npm-audit"]["env"]
+    assert npm_env["COREPACK_ENV_FILE"] == "0"
+    assert npm_env["COREPACK_ENABLE_UNSAFE_CUSTOM_URLS"] == "0"
+    assert npm_env["npm_config_ignore_scripts"] == "true"
+    assert npm_env["npm_config_git"] == "git" and npm_env["npm_config_script_shell"] == "/bin/sh"
+    install, audit = npm_step("Install"), npm_step("Audit")
+    assert "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile" in install
+    assert "pnpmfileChecksum" in install
+    pnpm_audits = [l for l in audit.splitlines() if re.match(r"\s*pnpm audit", l)]
+    assert pnpm_audits and all("--config.ignore-pnpmfile=true" in l for l in pnpm_audits), pnpm_audits
+    assert "export YARN_IGNORE_PATH=1" in install and "YARN_RC_FILENAME" in install
+    assert "del(.yarnPath) | del(.plugins) | .enableScripts = false" in install
+    [pip] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
+    untrusted = pip.split('if [ "${TRUSTED_EVENT:-}" = "true" ]; then', 1)[1].split("exit 0\n", 1)[1]
+    calls = re.findall(r"^\s*pip-audit .*$", untrusted, re.M)
+    assert len(calls) == 2, calls
+    for c in calls:
+        assert "--locked" in c or ("--no-deps" in c and "--disable-pip" in c), c
+
+
+def test_size_guard_copies_agree():
+    a, b = (p.read_bytes() for p in SIZE_GUARD_COPIES)
+    assert a == b
+
+
+# ─── untrusted install paths, executed ───────────────────────────────────────
+
+def run_install(tmp_path: Path, shim_path: str, files: dict[str, str], trusted: str):
+    work = tmp_path / "work"
+    work.mkdir()
+    for rel, body in files.items():
+        (work / rel).write_text(body, encoding="utf-8", newline="\n")
+    bindir = tmp_path / "bin"
+    log = (tmp_path / "calls").as_posix()
+    for name in ("yarn", "pnpm", "corepack", "npm", "yq"):
+        body = f'echo "{name} $* | IGNORE_PATH=${{YARN_IGNORE_PATH:-}} RC=${{YARN_RC_FILENAME:-}}" >> "{log}"\n'
+        if name == "yq":
+            body += 'echo "{}"\n'
+        p = bindir / name
+        p.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
+        p.chmod(0o755)
+    genv = tmp_path / "github_env"
+    proc = subprocess.run([BASH, "-c", npm_step("Install")], cwd=work, capture_output=True, text=True,
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": trusted, "DIR": ".",
+                               "GITHUB_ENV": genv.as_posix(), "GITHUB_WORKSPACE": work.as_posix()})
+    proc.calls = Path(log).read_text(encoding="utf-8") if Path(log).exists() else ""
+    proc.genv = genv.read_text(encoding="utf-8") if genv.exists() else ""
+    return proc
+
+
+def test_untrusted_berry_reads_only_the_rewritten_rc(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "yarn.lock": BERRY_LOCK,
+                                             ".yarnrc.yml": "yarnPath: ./evil.cjs\n"}, "false")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    [install] = [l for l in proc.calls.splitlines() if l.startswith("yarn install")]
+    assert "IGNORE_PATH=1" in install and "RC=.yarnrc-audit-" in install
+    assert "YARN_IGNORE_PATH=1" in proc.genv and "YARN_RC_FILENAME=.yarnrc-audit-" in proc.genv
+    assert "yq -o=json explode(.) | del(.yarnPath) | del(.plugins)" in proc.calls
+
+
+def test_trusted_berry_keeps_the_repo_rc(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "yarn.lock": BERRY_LOCK}, "true")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "yq" not in proc.calls and proc.genv == ""
+
+
+def test_untrusted_pnpm_lockfile_written_with_a_pnpmfile_is_not_examined(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}",
+                                             "pnpm-lock.yaml": "lockfileVersion: '9.0'\npnpmfileChecksum: sha256-x\n"},
+                       "false")
+    assert proc.returncode == 1
+    assert "not examined" in proc.stdout
+    assert "pnpm install" not in proc.calls
+
+
+@pytest.mark.parametrize("trusted,flag", [("false", True), ("true", False), ("", True)])
+def test_pnpm_ignores_the_pnpmfile_unless_trusted(tmp_path, shim_path, trusted, flag):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+                       trusted)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ("--ignore-pnpmfile" in proc.calls) is flag
+
+
+@pytest.mark.skipif(shutil.which("yq") is None, reason="real yq not on PATH")
+def test_real_yq_strips_smuggled_keys(tmp_path):
+    rc = tmp_path / "rc.yml"
+    rc.write_text('nodeLinker: &nl node-modules\n"yarnPath": ./evil.cjs\nplugins:\n  - path: ./evil.cjs\n',
+                  encoding="utf-8")
+    out = subprocess.run(["yq", "-o=json", "explode(.) | del(.yarnPath) | del(.plugins) | .enableScripts = false",
+                          str(rc)], capture_output=True, text=True, check=True).stdout
+    got = json.loads(out)
+    assert "yarnPath" not in got and "plugins" not in got and got["enableScripts"] is False
+
+
+
+# ─── interpreter isolation (gate pass 2 on #41) ──────────────────────────────
+# Python run with the checkout as cwd puts '' first on sys.path; a PR could
+# plant packaging/__init__.py and own the coverage check. Every python
+# invocation in a run: body must be isolated (-I).
+
+def test_every_python_in_a_run_body_is_isolated():
+    bad = []
+    for name, job in JOBS.items():
+        for step in job.get("steps", []):
+            for line in step.get("run", "").splitlines():
+                if line.strip().startswith("#"):
+                    continue
+                for m in re.finditer(r"\bpython3?\s+(-\S*|\S+\.py\b)", line):
+                    if m.group(1) != "-I":
+                        bad.append(f"{name}: {line.strip()}")
+    assert bad == [], bad
+
+
+def _has(mod: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(mod) is not None
+
+
+@pytest.mark.skipif(not (_has("packaging") and _has("pip_requirements_parser")),
+                    reason="needs packaging + pip-requirements-parser (pip-audit's own deps)")
+def test_planted_packaging_in_the_checkout_is_not_imported(tmp_path, shim_path):
+    work = tmp_path / "work"
+    (work / "packaging").mkdir(parents=True)
+    (work / "packaging" / "__init__.py").write_text("raise SystemExit('PLANTED packaging imported')\n", encoding="utf-8")
+    (work / "tomllib.py").write_text("raise SystemExit('PLANTED tomllib imported')\n", encoding="utf-8")
+    (work / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1"\ndependencies = ["idna>=3"]\n', encoding="utf-8")
+    (work / "requirements.txt").write_text("idna==3.10\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    (bindir / "python").write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+                                   encoding="utf-8", newline="\n")
+    (bindir / "pip-audit").write_text(f'#!/usr/bin/env bash\necho "pip-audit $*" >> "{(tmp_path / "calls").as_posix()}"\n',
+                                      encoding="utf-8", newline="\n")
+    for f in ("python", "pip-audit"):
+        (bindir / f).chmod(0o755)
+    [run] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
+    proc = subprocess.run([BASH, "-c", run], cwd=work, capture_output=True, text=True,
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "false", "DIR": "."})
+    out = proc.stdout + proc.stderr
+    assert "PLANTED" not in out, out
+    assert proc.returncode == 0, out
+    assert "1 declared dependencies, each audited" in out
