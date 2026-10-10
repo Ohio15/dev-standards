@@ -145,6 +145,25 @@ fi
 
 echo "pre-commit-tests: running \`$test_cmd\` (timeout ${test_timeout}s)" >&2
 
+# ---------------------------------------------------------------------------
+# The suite never sees git's HOOK environment.
+#
+# git exports GIT_DIR, GIT_INDEX_FILE (and, in a worktree, more GIT_*) to its
+# hooks. Any test that spawns `git init` / `git commit` / `git checkout` in a
+# temp directory still resolves GIT_DIR from that environment, so its fixture
+# commits land on the BRANCH BEING COMMITTED and `git init` sets
+# `core.bare=true` in the repository's shared config - which makes every
+# checkout of it, including a live deploy tree, report "not a work tree".
+# That happened in cortex-hooks on 2026-09-14 and again on 2026-10-01, each
+# time from a test that forgot to strip the variables itself. Per-test
+# discipline failed twice; the hook removes the hazard for every suite. The
+# suite still runs from the work-tree root, so a test that READS this repo
+# finds it by cwd exactly as `npm test` from a shell does.
+# ---------------------------------------------------------------------------
+while IFS= read -r git_var; do
+  unset "$git_var"
+done < <(compgen -e | grep '^GIT_' || true)
+
 timed_out=0
 set +e
 if command -v timeout >/dev/null 2>&1; then
