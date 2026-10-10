@@ -337,8 +337,10 @@ def run_yarn(tmp_path: Path, shim_path: str, lock: str, out: str, rc: int, step:
         p = bindir / name
         p.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
         p.chmod(0o755)
+    # Trusted: these cases are about which yarn runs and how its report is
+    # read; the untrusted (pull_request) install has its own tests below.
     proc = subprocess.run([BASH, "-c", npm_step(step)], cwd=work, capture_output=True, text=True,
-                          env={**os.environ, "PATH": shim_path})
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "true"})
     proc.calls = (tmp_path / "yarn-calls").read_text(encoding="utf-8") if (tmp_path / "yarn-calls").exists() else ""
     proc.corepack = (tmp_path / "corepack-calls").read_text(encoding="utf-8") if (tmp_path / "corepack-calls").exists() else ""
     return proc
@@ -405,3 +407,160 @@ def test_install_refuses_an_unknown_yarn_lockfile(tmp_path, shim_path):
     proc = run_yarn(tmp_path, shim_path, "garbage\n", "", 0, step="Install")
     assert proc.returncode == 1
     assert "neither a yarn berry nor a yarn v1 lockfile" in proc.stdout
+
+
+# ─── runner and trust (audit-dev-standards-2026-10-10 HIGH 3; SC-37, SC-13) ──
+# A repo variable may choose the runner only on a trusted event, and on an
+# untrusted one (pull_request) no PR-controlled code runs. The runs-on
+# expression is EVALUATED here with Actions' operand-returning &&/|| rules,
+# for every job a pull_request reaches, with CI_RUNNER set to a self-hosted
+# label: none may resolve to it.
+
+import json
+
+SIZE_GUARD_COPIES = [ROOT / "workflows" / "size-guard.yml", ROOT / ".github" / "workflows" / "size-guard.yml"]
+TRUSTED = {"push", "workflow_dispatch", "schedule", "release"}
+PR_WORKFLOWS = [TEMPLATE, OWN_COPY, *SIZE_GUARD_COPIES]
+RUNS_ON = re.compile(r"\$\{\{\s*contains\(fromJSON\('(\[[^']*\])'\),\s*github\.event_name\)\s*&&\s*vars\.CI_RUNNER"
+                     r"\s*\|\|\s*'([^']+)'\s*\}\}")
+
+
+def triggers(wf: dict) -> set[str]:
+    on = wf.get("on", wf.get(True))  # PyYAML reads a bare `on:` key as True
+    return {on} if isinstance(on, str) else set(on)
+
+
+def eval_runs_on(expr, event: str, ci_runner: str):
+    """The only runs-on shapes allowed: a literal, or the trusted-event guard."""
+    if not isinstance(expr, str) or "${{" not in expr:
+        return expr
+    m = RUNS_ON.fullmatch(expr)
+    assert m, f"runs-on shape the trust rule does not allow: {expr}"
+    allowed = set(json.loads(m.group(1)))
+    assert allowed <= TRUSTED, f"untrusted event may pick a runner: {allowed - TRUSTED}"
+    left = (event in allowed) and ci_runner  # Actions: false && x is false
+    return left or m.group(2)
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert "pull_request" in triggers(wf), "this test is for pull_request-reachable workflows"
+    assert wf["jobs"], "no jobs parsed"
+    for name, job in wf["jobs"].items():
+        for event in ("pull_request", "pull_request_target", "merge_group"):
+            got = eval_runs_on(job["runs-on"], event, "nexus-ci")
+            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} runs on {got!r}"
+        if "${{" in str(job["runs-on"]):
+            assert eval_runs_on(job["runs-on"], "push", "nexus-ci") == "nexus-ci"
+            assert eval_runs_on(job["runs-on"], "push", "") == "ubuntu-latest"
+
+
+def test_trusted_event_flag_uses_the_runner_predicate():
+    m = re.search(r"contains\(fromJSON\('(\[[^']*\])'\)", WORKFLOW["env"]["TRUSTED_EVENT"])
+    assert m and set(json.loads(m.group(1))) <= TRUSTED
+    for name, job in JOBS.items():
+        assert m.group(1) in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_least_privilege_token(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert wf["permissions"] == {"contents": "read"}
+    for name, job in wf["jobs"].items():
+        assert "permissions" not in job, f"{name} widens the token"
+    assert "security-events" not in path.read_text(encoding="utf-8")
+
+
+def test_no_execute_switches_are_present():
+    npm_env = JOBS["npm-audit"]["env"]
+    assert npm_env["COREPACK_ENV_FILE"] == "0"
+    assert npm_env["COREPACK_ENABLE_UNSAFE_CUSTOM_URLS"] == "0"
+    assert npm_env["npm_config_ignore_scripts"] == "true"
+    install, audit = npm_step("Install"), npm_step("Audit")
+    assert "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile" in install
+    assert "pnpmfileChecksum" in install
+    pnpm_audits = [l for l in audit.splitlines() if re.match(r"\s*pnpm audit", l)]
+    assert pnpm_audits and all("--config.ignore-pnpmfile=true" in l for l in pnpm_audits), pnpm_audits
+    assert "export YARN_IGNORE_PATH=1" in install and "YARN_RC_FILENAME" in install
+    assert "del(.yarnPath) | del(.plugins) | .enableScripts = false" in install
+    [pip] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
+    untrusted = pip.split('if [ "${TRUSTED_EVENT:-}" = "true" ]; then', 1)[1].split("exit 0\n", 1)[1]
+    calls = re.findall(r"^\s*pip-audit .*$", untrusted, re.M)
+    assert len(calls) == 2, calls
+    for c in calls:
+        assert "--locked" in c or ("--no-deps" in c and "--disable-pip" in c), c
+
+
+def test_size_guard_copies_agree():
+    a, b = (p.read_bytes() for p in SIZE_GUARD_COPIES)
+    assert a == b
+
+
+# ─── untrusted install paths, executed ───────────────────────────────────────
+
+def run_install(tmp_path: Path, shim_path: str, files: dict[str, str], trusted: str):
+    work = tmp_path / "work"
+    work.mkdir()
+    for rel, body in files.items():
+        (work / rel).write_text(body, encoding="utf-8", newline="\n")
+    bindir = tmp_path / "bin"
+    log = (tmp_path / "calls").as_posix()
+    for name in ("yarn", "pnpm", "corepack", "npm", "yq"):
+        body = f'echo "{name} $* | IGNORE_PATH=${{YARN_IGNORE_PATH:-}} RC=${{YARN_RC_FILENAME:-}}" >> "{log}"\n'
+        if name == "yq":
+            body += 'echo "{}"\n'
+        p = bindir / name
+        p.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
+        p.chmod(0o755)
+    genv = tmp_path / "github_env"
+    proc = subprocess.run([BASH, "-c", npm_step("Install")], cwd=work, capture_output=True, text=True,
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": trusted, "DIR": ".",
+                               "GITHUB_ENV": genv.as_posix(), "GITHUB_WORKSPACE": work.as_posix()})
+    proc.calls = Path(log).read_text(encoding="utf-8") if Path(log).exists() else ""
+    proc.genv = genv.read_text(encoding="utf-8") if genv.exists() else ""
+    return proc
+
+
+def test_untrusted_berry_reads_only_the_rewritten_rc(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "yarn.lock": BERRY_LOCK,
+                                             ".yarnrc.yml": "yarnPath: ./evil.cjs\n"}, "false")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    [install] = [l for l in proc.calls.splitlines() if l.startswith("yarn install")]
+    assert "IGNORE_PATH=1" in install and "RC=.yarnrc-audit-" in install
+    assert "YARN_IGNORE_PATH=1" in proc.genv and "YARN_RC_FILENAME=.yarnrc-audit-" in proc.genv
+    assert "yq -o=json explode(.) | del(.yarnPath) | del(.plugins)" in proc.calls
+
+
+def test_trusted_berry_keeps_the_repo_rc(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "yarn.lock": BERRY_LOCK}, "true")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "yq" not in proc.calls and proc.genv == ""
+
+
+def test_untrusted_pnpm_lockfile_written_with_a_pnpmfile_is_not_examined(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}",
+                                             "pnpm-lock.yaml": "lockfileVersion: '9.0'\npnpmfileChecksum: sha256-x\n"},
+                       "false")
+    assert proc.returncode == 1
+    assert "not examined" in proc.stdout
+    assert "pnpm install" not in proc.calls
+
+
+@pytest.mark.parametrize("trusted,flag", [("false", True), ("true", False), ("", True)])
+def test_pnpm_ignores_the_pnpmfile_unless_trusted(tmp_path, shim_path, trusted, flag):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+                       trusted)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ("--ignore-pnpmfile" in proc.calls) is flag
+
+
+@pytest.mark.skipif(shutil.which("yq") is None, reason="real yq not on PATH")
+def test_real_yq_strips_smuggled_keys(tmp_path):
+    rc = tmp_path / "rc.yml"
+    rc.write_text('nodeLinker: &nl node-modules\n"yarnPath": ./evil.cjs\nplugins:\n  - path: ./evil.cjs\n',
+                  encoding="utf-8")
+    out = subprocess.run(["yq", "-o=json", "explode(.) | del(.yarnPath) | del(.plugins) | .enableScripts = false",
+                          str(rc)], capture_output=True, text=True, check=True).stdout
+    got = json.loads(out)
+    assert "yarnPath" not in got and "plugins" not in got and got["enableScripts"] is False

@@ -250,14 +250,27 @@ repo waits its turn.
 
 ## Runner selection
 
-Every job the standards run in a consumer repo picks its runner as
-`${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}` (reusable
-workflows) or `${{ vars.CI_RUNNER || 'ubuntu-latest' }}` (synced guard
-workflows). Set the repository variable `CI_RUNNER` to a self-hosted label
+Reusable release workflows pick their runner as
+`${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}`; they are called
+from tag pushes only (see the caller shape above). Synced guard workflows
+(`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it as
+`${{ contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) && vars.CI_RUNNER || 'ubuntu-latest' }}`.
+Set the repository variable `CI_RUNNER` to a self-hosted label
 (for example `nexus-ci`, the fenced ephemeral-VM runners on NEXUS) to move
 gates, tests and image builds there without editing any workflow; unset it to
 fall back to GitHub-hosted runners. Deploy and notify jobs keep their explicit
 `[self-hosted, nexus-deploy]` label because they must reach the host.
-Only PRIVATE repositories may point `CI_RUNNER` at a self-hosted label: a
-pull request from a fork carries its own workflow file and would otherwise be
-able to request your runners.
+The rule is mechanical, not a convention: a job reachable from `pull_request`
+can never resolve its runner from a variable. `&&`/`||` return an operand, so
+on any event outside that trusted list the expression is the literal
+`ubuntu-latest` whatever `CI_RUNNER` holds, and pull-request code never lands
+on a self-hosted runner through these workflows. The same predicate sets
+`TRUSTED_EVENT`, and on an untrusted event the audit runs no PR-controlled
+code (pnpmfile, yarnPath, yarn plugins, `.corepack.env`, Python build
+backends); what it cannot audit without running such code is NOT EXAMINED
+and fails. `scripts/tests/test_security_audit_workflow.py` enforces this
+(audit-dev-standards-2026-10-10 HIGH 3). It does not stop a fork pull request
+that edits the workflow file itself and names a self-hosted label directly:
+that is closed only by never serving a self-hosted runner to a public
+repository (runner-group repository access) and by requiring approval for
+outside contributors' workflow runs.

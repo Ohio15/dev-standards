@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   size-guard:
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) && vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       # SHA-pinned, same ref as security-audit.yml and dep-auto-apply.yml
       # (mutable tags are a supply-chain vector).
