@@ -123,9 +123,12 @@ acceptable when the file gets large (>~200 entries); no current automation.
 Installed on **both** `Ohio15/dev-standards` and
 `Ohio15/dev-standards-canary` with `contents: write`, `actions: write`
 (workflow dispatch) and `workflows: write` (the canary pin). Each job mints
-short-lived installation tokens. The pin step mints a separate token limited
-to `dev-standards-canary` with only `contents` and `workflows` write, so the
-general token never requests `workflows: write`.
+short-lived installation tokens, and every mint names its permissions
+(`permission-*` inputs; without them a token inherits every App permission).
+The general tokens request only `contents: write` + `actions: write`. The pin
+step mints a separate token limited to `dev-standards-canary` with only
+`contents: write` + `workflows: write`, so the general tokens never carry
+`workflows: write`.
 
 Required because:
 
@@ -186,8 +189,10 @@ starts, not the RC commit. So tag-rc, before any tag exists:
 
 1. reads the canary's `release.yml` at canary `main`;
 2. rewrites every `uses: Ohio15/dev-standards/.github/workflows/...@<ref>`
-   line to `@<rc_sha> # v1-rcN`, refusing if there is no such line or if any
-   other line would change;
+   line to `@<rc_sha> # v1-rcN`, refusing if there is no such line, if any
+   other line would change, or if any line still mentions
+   `Ohio15/dev-standards/` at a ref other than `<rc_sha>` (e.g. a quoted or
+   list-item `uses:` the rewrite does not match);
 3. commits it to canary `main` through the Contents API (token to curl on
    stdin, never in argv) and reads the file back at the returned commit;
 4. tags dev-standards `v1-rcN` at `rc_sha` and creates canary `v1-rcN` at
@@ -243,7 +248,7 @@ ensures push-storms during rapid main commits all get tagged in order.
 | App lacks `workflows: write` | The pin-token mint fails and tag-rc fails before tagging anything, with an error naming the permission. |
 | Canary `release.yml` has no `uses: Ohio15/dev-standards/...` line | tag-rc fails before tagging. |
 | Canary tag already exists at a different commit | tag-rc fails: runs at it would not test this RC. |
-| Canary tag mirror returns 422 (already exists) | Treated as success; assumes prior partial run created it. Idempotent. |
+| Canary tag mirror returns 422 (already exists) | Accepted only if the existing canary tag already points at the pinned commit (`current_rc_canary_sha`), e.g. a re-run after a partial failure; otherwise tag-rc fails. |
 | `v1` ref does not yet exist on first promotion | Monitor falls through 422/404 path and CREATEs `v1` at the RC sha. |
 | Red canary run | State set to `failed`, then the monitor run FAILS with an `::error::` naming the run. GitHub's failed-run notification is the alert; later monitor runs skip the `failed` state quietly. There is no ntfy post: the NEXUS ntfy is not reachable from hosted runners (SPEC.md), and the former post to the public, unauthenticated `ntfy.sh/nexus-alerts` was removed (audit-dev-standards-2026-10-10). |
 | Cron tick lands while tag-rc is mid-flight | `concurrency: promote-canary` queues the monitor run; it observes the post-tag state when it eventually executes. |

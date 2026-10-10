@@ -56,8 +56,10 @@ name: promote-canary
 #     A GitHub App (ohio15-release-promoter) installed on BOTH
 #     Ohio15/dev-standards and Ohio15/dev-standards-canary with contents:write
 #     and actions:write (workflow dispatch), plus workflows:write for the canary
-#     pin (a token minted with only contents:write + workflows:write, scoped to
-#     dev-standards-canary). Each job mints short-lived installation tokens
+#     pin. Every mint names its permissions explicitly: the general tokens
+#     request only contents:write + actions:write; the pin token requests only
+#     contents:write + workflows:write and is scoped to dev-standards-canary.
+#     Each job mints short-lived installation tokens
 #     (actions/create-github-app-token) instead of storing a PAT. Required
 #     because:
 #       (a) GITHUB_TOKEN cannot push to dev-standards-canary from this repo;
@@ -183,6 +185,12 @@ jobs:
           private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
+          # Only what the steps use: contents (checkout, tag + state pushes,
+          # canary refs/contents reads, the v1 move) and actions (workflow
+          # dispatches, canary run reads). Without permission-* inputs the
+          # token would inherit every App permission, workflows:write included.
+          permission-contents: write
+          permission-actions: write
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -352,6 +360,15 @@ jobs:
             pinned=$(grep -cE "^[[:space:]]*uses:[[:space:]]*Ohio15/dev-standards/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@${RC_SHA} # ${RC_TAG}\$" "${work}/pinned.yml" || true)
             if [ "$pinned" != "$n_calls" ]; then
               echo "::error::Pin rewrite produced ${pinned} pinned line(s) for ${n_calls} call(s)."
+              exit 1
+            fi
+            # Fail closed: no non-comment line may still mention Ohio15/dev-standards/ with
+            # any ref other than RC_SHA (a quoted or list-item `uses:` spelling
+            # the rewrite pattern does not match would otherwise keep @main).
+            stray=$(grep -nE 'Ohio15/dev-standards/' "${work}/pinned.yml" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE "@${RC_SHA}([^0-9A-Za-z]|\$)" || true)
+            if [ -n "$stray" ]; then
+              echo "::error::Canary release.yml still references dev-standards at a ref other than ${RC_SHA} after the pin rewrite:"
+              printf '%s\n' "$stray"
               exit 1
             fi
             # Nothing but the uses: lines may change.
@@ -572,6 +589,12 @@ jobs:
           private-key: ${{ secrets.RELEASE_PROMOTER_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: dev-standards,dev-standards-canary
+          # Only what the steps use: contents (checkout, tag + state pushes,
+          # canary refs/contents reads, the v1 move) and actions (workflow
+          # dispatches, canary run reads). Without permission-* inputs the
+          # token would inherit every App permission, workflows:write included.
+          permission-contents: write
+          permission-actions: write
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -628,7 +651,10 @@ jobs:
             -m "[canary state] manual reset" \
             -m "[skip canary]" \
             || echo "no state diff"
-          git push origin HEAD:refs/heads/main || true
+          if ! git push origin HEAD:refs/heads/main; then
+            echo "::error::Reset commit could not be pushed to main; state on main is UNCHANGED (not idle)."
+            exit 1
+          fi
           echo "::notice::State reset to idle. Next push:main will re-prime."
           exit 0
 

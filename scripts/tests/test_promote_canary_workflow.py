@@ -48,6 +48,9 @@ TOKEN = "ghs_FAKEtokenForTestsOnly0123456789"
 
 CANARY_RELEASE_YML = """name: Release
 
+# Schema: https://github.com/Ohio15/dev-standards/blob/main/release/SPEC.md
+# (a comment naming dev-standards at another ref, as the real canary has)
+
 on:
   push:
     tags: ['v*']
@@ -349,6 +352,17 @@ def test_tag_rc_pins_the_canary_before_any_tag_is_pushed():
     assert ".schema_version = 2" in prime["run"]
 
 
+def test_every_app_token_mint_names_its_permissions():
+    mints = [(j, s) for j, s in all_steps() if s.get("uses", "").startswith("actions/create-github-app-token@")]
+    assert len(mints) >= 3
+    for job, s in mints:
+        perms = {k: v for k, v in s["with"].items() if k.startswith("permission-")}
+        assert perms, f"{job}/{s.get('name')}: no permission-* inputs; the token inherits every App permission"
+        if s.get("id") == "app":
+            assert perms == {"permission-contents": "write", "permission-actions": "write"}, (job, perms)
+        assert "permission-workflows" not in perms or s["with"]["repositories"] == "dev-standards-canary"
+
+
 def test_pin_token_is_scoped_to_the_canary_only():
     mint = step("tag-rc", "Mint canary workflow-pin token")
     assert mint["with"]["repositories"] == "dev-standards-canary"
@@ -432,6 +446,24 @@ def test_pin_keeps_the_token_out_of_curl_argv(fake_env):
 
 
 @needs_jq
+@pytest.mark.parametrize("spelling", [
+    '    uses: "Ohio15/dev-standards/.github/workflows/docker-release.yml@main"\n',
+    "    - uses: Ohio15/dev-standards/.github/workflows/docker-release.yml@main\n",
+    "    uses: 'Ohio15/dev-standards/.github/workflows/lib-release.yml@v1'\n",
+])
+def test_pin_fails_closed_on_an_unrewritten_dev_standards_reference(fake_env, spelling):
+    # One normal call (rewritten) plus a second spelling the rewrite pattern
+    # does not match: the stray reference must stop the pin, not slip through.
+    body = CANARY_RELEASE_YML + "  extra:\n" + spelling
+    write_canary_file(fake_env["fake"], body)
+    proc, o = run_step(fake_env, step("tag-rc", "Pin the canary to the RC commit")["run"], pin_env())
+    assert proc.returncode != 0
+    assert "references dev-standards at a ref other than" in proc.stdout
+    assert "canary_sha" not in o
+    assert not (fake_env["fake"] / "put.json").exists()
+
+
+@needs_jq
 def test_pin_refuses_a_canary_with_no_dev_standards_call(fake_env):
     write_canary_file(fake_env["fake"], CANARY_RELEASE_YML.replace("Ohio15/dev-standards/", "someone/else/"))
     proc, o = run_step(fake_env, step("tag-rc", "Pin the canary to the RC commit")["run"], pin_env())
@@ -467,6 +499,35 @@ def score(fx, runs: list[dict], canary_sha: str = CANARY_PINNED):
                                           encoding="utf-8")
     return run_step(fx, step("monitor", "Query canary release.yml runs")["run"],
                     {"RC": RC_TAG, "CANARY_SHA": canary_sha, "GREEN_THRESHOLD": "3"})
+
+
+# Real shape, probed read-only on 2026-10-10 from
+# repos/Ohio15/dev-standards-canary/actions/runs: `path` is the bare repo path
+# for every event seen (push, workflow_dispatch, pull_request, schedule), with
+# no `@ref` suffix.
+REAL_PATH_EVENTS = [
+    (".github/workflows/release.yml", "push"),
+    (".github/workflows/release.yml", "workflow_dispatch"),
+    (".github/workflows/nexus-ci-smoke.yml", "workflow_dispatch"),
+    (".github/workflows/size-guard.yml", "push"),
+    (".github/workflows/security-audit.yml", "push"),
+    (".github/workflows/dep-auto-apply.yml", "schedule"),
+]
+
+
+@needs_jq
+def test_real_runs_api_shape_scores_only_release_push_and_dispatch(fake_env):
+    runs = []
+    for i, (path, event) in enumerate(REAL_PATH_EVENTS, start=1):
+        r = run_obj(i, path, CANARY_PINNED, "success", minute=i)
+        r["event"] = event
+        runs.append(r)
+    # A suffixed path (shape not observed) must not be counted: fail closed.
+    runs.append({**run_obj(99, REL + "@refs/tags/" + RC_TAG, CANARY_PINNED, "success", minute=50)})
+    proc, o = score(fake_env, runs)
+    assert proc.returncode == 0, proc.stderr
+    assert o["completed"] == "2"
+    assert o["verdict"] == "accumulating"
 
 
 @needs_jq
