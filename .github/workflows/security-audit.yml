@@ -90,7 +90,7 @@ jobs:
           # grep exits 1 and would kill this step for every repo that lacks
           # one of the ecosystems.
           dirs_of() {
-            git ls-files -z -- "$@" | python3 -c '
+            git ls-files -z -- "$@" | python3 -I -c '
           import json, posixpath, sys
           paths = [p for p in sys.stdin.buffer.read().decode().split("\0") if p]
           # A directory name is repo content a PR controls. A control character
@@ -106,7 +106,7 @@ jobs:
           npm_dirs=$(dirs_of 'package.json' '**/package.json')
           go_dirs=$(dirs_of 'go.mod' '**/go.mod')
           python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')
-          count() { python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$1"; }
+          count() { python3 -I -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$1"; }
           n_npm=$(count "$npm_dirs"); n_go=$(count "$go_dirs"); n_py=$(count "$python_dirs")
           has_npm=false; [ "$n_npm" -gt 0 ] && has_npm=true
           has_go=false; [ "$n_go" -gt 0 ] && has_go=true
@@ -277,7 +277,7 @@ jobs:
               flavour=classic
               yarn audit --json > audit-yarn.json || rc=$?
             fi
-            python3 - audit-yarn.json "$rc" "$flavour" <<'PY'
+            python3 -I - audit-yarn.json "$rc" "$flavour" <<'PY'
           import json, sys
           path, rc, flavour = sys.argv[1], int(sys.argv[2]), sys.argv[3]
           def not_examined(why):
@@ -438,8 +438,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install pip==26.2.1
-          python -m pip install pip-audit==2.10.1
+          # -I everywhere python runs inside the checkout: without it the
+          # working directory is first on sys.path, so a PR-planted pip/,
+          # json.py, packaging/ or tomllib.py would be imported instead.
+          python -I -m pip install pip==26.2.1
+          python -I -m pip install pip-audit==2.10.1
 
       - name: Run pip-audit (--strict gates the workflow)
         shell: bash
@@ -505,8 +508,10 @@ jobs:
           if [ -f pyproject.toml ] && [ ${#locks[@]} -eq 0 ]; then
             # Same interpreter as pip-audit, so its own parsers are present:
             # packaging, and pip-requirements-parser (what pip-audit reads -r
-            # files with, nested -r included).
-            if ! python - "${reqs[@]}" > pyproject-coverage.txt <<'PY'
+            # files with, nested -r included). -I: isolated mode, so the
+            # checkout (cwd) is not on sys.path and a PR-planted packaging/
+            # or tomllib.py is never imported.
+            if ! python -I - "${reqs[@]}" > pyproject-coverage.txt <<'PY'
           import sys
           import tomllib
           from packaging.requirements import Requirement

@@ -672,3 +672,52 @@ def test_real_yq_strips_smuggled_keys(tmp_path):
                           str(rc)], capture_output=True, text=True, check=True).stdout
     got = json.loads(out)
     assert "yarnPath" not in got and "plugins" not in got and got["enableScripts"] is False
+
+
+
+# ─── interpreter isolation (gate pass 2 on #41) ──────────────────────────────
+# Python run with the checkout as cwd puts '' first on sys.path; a PR could
+# plant packaging/__init__.py and own the coverage check. Every python
+# invocation in a run: body must be isolated (-I).
+
+def test_every_python_in_a_run_body_is_isolated():
+    bad = []
+    for name, job in JOBS.items():
+        for step in job.get("steps", []):
+            for line in step.get("run", "").splitlines():
+                if line.strip().startswith("#"):
+                    continue
+                for m in re.finditer(r"\bpython3?\s+(-\S*|\S+\.py\b)", line):
+                    if m.group(1) != "-I":
+                        bad.append(f"{name}: {line.strip()}")
+    assert bad == [], bad
+
+
+def _has(mod: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(mod) is not None
+
+
+@pytest.mark.skipif(not (_has("packaging") and _has("pip_requirements_parser")),
+                    reason="needs packaging + pip-requirements-parser (pip-audit's own deps)")
+def test_planted_packaging_in_the_checkout_is_not_imported(tmp_path, shim_path):
+    work = tmp_path / "work"
+    (work / "packaging").mkdir(parents=True)
+    (work / "packaging" / "__init__.py").write_text("raise SystemExit('PLANTED packaging imported')\n", encoding="utf-8")
+    (work / "tomllib.py").write_text("raise SystemExit('PLANTED tomllib imported')\n", encoding="utf-8")
+    (work / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1"\ndependencies = ["idna>=3"]\n', encoding="utf-8")
+    (work / "requirements.txt").write_text("idna==3.10\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    (bindir / "python").write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+                                   encoding="utf-8", newline="\n")
+    (bindir / "pip-audit").write_text(f'#!/usr/bin/env bash\necho "pip-audit $*" >> "{(tmp_path / "calls").as_posix()}"\n',
+                                      encoding="utf-8", newline="\n")
+    for f in ("python", "pip-audit"):
+        (bindir / f).chmod(0o755)
+    [run] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
+    proc = subprocess.run([BASH, "-c", run], cwd=work, capture_output=True, text=True,
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "false", "DIR": "."})
+    out = proc.stdout + proc.stderr
+    assert "PLANTED" not in out, out
+    assert proc.returncode == 0, out
+    assert "1 declared dependencies, each audited" in out
