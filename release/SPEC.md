@@ -254,7 +254,9 @@ Reusable release workflows pick their runner as
 `${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}`; they are called
 from tag pushes only (see the caller shape above). Synced guard workflows
 (`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it as
-`${{ contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) && vars.CI_RUNNER || 'ubuntu-latest' }}`.
+`${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}`:
+a variable runner only for a schedule, or a push / workflow_dispatch of the
+default branch.
 Set the repository variable `CI_RUNNER` to a self-hosted label
 (for example `nexus-ci`, the fenced ephemeral-VM runners on NEXUS) to move
 gates, tests and image builds there without editing any workflow; unset it to
@@ -262,7 +264,7 @@ fall back to GitHub-hosted runners. Deploy and notify jobs keep their explicit
 `[self-hosted, nexus-deploy]` label because they must reach the host.
 The rule is mechanical, not a convention: a job reachable from `pull_request`
 can never resolve its runner from a variable. `&&`/`||` return an operand, so
-on any event outside that trusted list the expression is the literal
+on any other event or ref the expression is the literal
 `ubuntu-latest` whatever `CI_RUNNER` holds, and pull-request code never lands
 on a self-hosted runner through these workflows. The same predicate sets
 `TRUSTED_EVENT`, and on an untrusted event the audit runs no PR-controlled

@@ -419,48 +419,155 @@ def test_install_refuses_an_unknown_yarn_lockfile(tmp_path, shim_path):
 import json
 
 SIZE_GUARD_COPIES = [ROOT / "workflows" / "size-guard.yml", ROOT / ".github" / "workflows" / "size-guard.yml"]
-TRUSTED = {"push", "workflow_dispatch", "schedule", "release"}
-PR_WORKFLOWS = [TEMPLATE, OWN_COPY, *SIZE_GUARD_COPIES]
-RUNS_ON = re.compile(r"\$\{\{\s*contains\(fromJSON\('(\[[^']*\])'\),\s*github\.event_name\)\s*&&\s*vars\.CI_RUNNER"
-                     r"\s*\|\|\s*'([^']+)'\s*\}\}")
 
 
 def triggers(wf: dict) -> set[str]:
     on = wf.get("on", wf.get(True))  # PyYAML reads a bare `on:` key as True
-    return {on} if isinstance(on, str) else set(on)
+    if isinstance(on, str):
+        return {on}
+    return set(on or [])
 
 
-def eval_runs_on(expr, event: str, ci_runner: str):
-    """The only runs-on shapes allowed: a literal, or the trusted-event guard."""
+def _pr_workflows() -> list[Path]:
+    """Every workflow a pull_request can start, wherever the repo keeps one."""
+    found = []
+    for d in (ROOT / ".github" / "workflows", ROOT / "workflows", ROOT / "templates" / ".github" / "workflows"):
+        for f in sorted([*d.glob("*.yml"), *d.glob("*.yaml")]):
+            if "pull_request" in triggers(yaml.safe_load(f.read_text(encoding="utf-8"))):
+                found.append(f)
+    return found
+
+
+PR_WORKFLOWS = _pr_workflows()
+
+
+# A small evaluator for the expression subset runs-on may use: string
+# literals, dotted context lookups, ==, &&, ||, !, parentheses, format().
+# &&/|| return an operand, as in Actions; == compares case-insensitively.
+_TOK = re.compile(r"\s*(?:(\|\||&&|==|!=|[()!,])|'((?:[^']|'')*)'|([A-Za-z_][\w.\-]*))")
+
+
+def eval_expr(text: str, ctx: dict):
+    toks, pos = [], 0
+    while pos < len(text.rstrip()):
+        m = _TOK.match(text, pos)
+        assert m and m.end() > pos, f"cannot parse {text[pos:]!r}"
+        toks.append(("op", m.group(1)) if m.group(1) else ("str", m.group(2).replace("''", "'"))
+                    if m.group(2) is not None else ("id", m.group(3)))
+        pos = m.end()
+    i = 0
+
+    def peek():
+        return toks[i] if i < len(toks) else (None, None)
+
+    def take():
+        nonlocal i
+        i += 1
+        return toks[i - 1]
+
+    def primary():
+        kind, val = take()
+        if (kind, val) == ("op", "("):
+            v = or_()
+            assert take() == ("op", ")")
+            return v
+        if (kind, val) == ("op", "!"):
+            return not primary()
+        if kind == "str":
+            return val
+        assert kind == "id", (kind, val)
+        if val in ("true", "false"):
+            return val == "true"
+        if peek() == ("op", "("):
+            take()
+            args = [or_()]
+            while peek() == ("op", ","):
+                take()
+                args.append(or_())
+            assert take() == ("op", ")")
+            assert val == "format", f"function {val} not modelled"
+            return re.sub(r"\{(\d+)\}", lambda mm: str(args[1 + int(mm.group(1))]), args[0])
+        assert val in ctx, f"context {val} not modelled"
+        return ctx[val]
+
+    def cmp_():
+        v = primary()
+        while peek() in (("op", "=="), ("op", "!=")):
+            op = take()[1]
+            r = primary()
+            eq = str(v).lower() == str(r).lower()
+            v = eq if op == "==" else not eq
+        return v
+
+    def and_():
+        v = cmp_()
+        while peek() == ("op", "&&"):
+            take()
+            r = cmp_()
+            v = r if v else v
+        return v
+
+    def or_():
+        v = and_()
+        while peek() == ("op", "||"):
+            take()
+            r = and_()
+            v = v if v else r
+        return v
+
+    out = or_()
+    assert i == len(toks), f"trailing tokens in {text!r}"
+    return out
+
+
+def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
     if not isinstance(expr, str) or "${{" not in expr:
         return expr
-    m = RUNS_ON.fullmatch(expr)
-    assert m, f"runs-on shape the trust rule does not allow: {expr}"
-    allowed = set(json.loads(m.group(1)))
-    assert allowed <= TRUSTED, f"untrusted event may pick a runner: {allowed - TRUSTED}"
-    left = (event in allowed) and ci_runner  # Actions: false && x is false
-    return left or m.group(2)
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
+    assert m, expr
+    return eval_expr(m.group(1), {
+        "github.event_name": event, "github.ref": ref,
+        "github.event.repository.default_branch": "main", "vars.CI_RUNNER": ci_runner,
+    })
+
+
+UNTRUSTED = [("pull_request", "refs/pull/7/merge"), ("pull_request_target", "refs/heads/main"),
+             ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7"), ("release", "refs/tags/v1"),
+             ("push", "refs/heads/feature"), ("push", "refs/heads/master"), ("push", "refs/tags/v1"),
+             ("workflow_dispatch", "refs/heads/feature")]
+TRUSTED = [("schedule", "refs/heads/main"), ("push", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main")]
+
+
+def test_the_pull_request_workflow_list_is_derived_not_listed():
+    names = {p.relative_to(ROOT).as_posix() for p in PR_WORKFLOWS}
+    assert {".github/workflows/security-audit.yml", "templates/.github/workflows/security-audit.yml",
+            ".github/workflows/size-guard.yml", "workflows/size-guard.yml",
+            ".github/workflows/healthcheck-shape-lint.yml"} <= names, names
 
 
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
 def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
     wf = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert "pull_request" in triggers(wf), "this test is for pull_request-reachable workflows"
     assert wf["jobs"], "no jobs parsed"
     for name, job in wf["jobs"].items():
-        for event in ("pull_request", "pull_request_target", "merge_group"):
-            got = eval_runs_on(job["runs-on"], event, "nexus-ci")
-            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} runs on {got!r}"
+        for event, ref in UNTRUSTED:
+            got = resolve(job["runs-on"], event, ref)
+            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} runs on {got!r}"
         if "${{" in str(job["runs-on"]):
-            assert eval_runs_on(job["runs-on"], "push", "nexus-ci") == "nexus-ci"
-            assert eval_runs_on(job["runs-on"], "push", "") == "ubuntu-latest"
+            for event, ref in TRUSTED:
+                assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event)
+                assert resolve(job["runs-on"], event, ref, ci_runner="") == "ubuntu-latest"
 
 
-def test_trusted_event_flag_uses_the_runner_predicate():
-    m = re.search(r"contains\(fromJSON\('(\[[^']*\])'\)", WORKFLOW["env"]["TRUSTED_EVENT"])
-    assert m and set(json.loads(m.group(1))) <= TRUSTED
+def test_trusted_event_flag_is_the_runner_predicate():
+    flag = WORKFLOW["env"]["TRUSTED_EVENT"]
+    pred = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", flag, re.S).group(1)
     for name, job in JOBS.items():
-        assert m.group(1) in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+        assert pred in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+    for event, ref in UNTRUSTED:
+        assert resolve(flag, event, ref) is False, (event, ref)
+    for event, ref in TRUSTED:
+        assert resolve(flag, event, ref) is True, (event, ref)
 
 
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
@@ -477,6 +584,7 @@ def test_no_execute_switches_are_present():
     assert npm_env["COREPACK_ENV_FILE"] == "0"
     assert npm_env["COREPACK_ENABLE_UNSAFE_CUSTOM_URLS"] == "0"
     assert npm_env["npm_config_ignore_scripts"] == "true"
+    assert npm_env["npm_config_git"] == "git" and npm_env["npm_config_script_shell"] == "/bin/sh"
     install, audit = npm_step("Install"), npm_step("Audit")
     assert "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile" in install
     assert "pnpmfileChecksum" in install
