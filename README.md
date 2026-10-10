@@ -137,6 +137,15 @@ Moderate / low findings are logged to the workflow summary but don't fail the bu
 
 Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs the project's test suite, and opens a PR labeled `auto-apply` for human review. Auto-merge is intentionally **not** part of this layer — it can be added later as a thin opt-in wrapper on top, once we have evidence from real auto-apply PRs.
 
+**Two jobs, one privilege boundary.** The weekly run ingests whatever patch releases landed inside the declared semver ranges, and installing or testing them runs their code. Before 2026-10-10 that code ran in the same job as the PR push token and the ntfy / shared-brain secrets, so a malicious patch release could append to `$GITHUB_PATH`, plant a fake `git`/`curl`, or edit tracked files, and every later step ran attacker code holding the write token (audit-dev-standards-2026-10-10 HIGH 2). The contract is now:
+
+| Job | Token | Secrets | Runs |
+|---|---|---|---|
+| `apply` | `contents: read` | none | detection, installs, audit fixes, builds, tests. Hands over one artifact: `deps.patch` (a `git diff` of the allow-listed files only) and `result.json` (per-ecosystem flags and notes). |
+| `publish` | `contents: write`, `pull-requests: write` | `DEP_AUTO_APPLY_NTFY_TOKEN`, `SHARED_BRAIN_TOKEN` | no dependency code at all: no install, build, test or `setup-*` toolchain. Clean checkout of the same commit; the artifact is data, never executed. |
+
+`publish` treats the whole artifact as hostile. It fails closed unless `result.json` has the exact expected shape and base commit, the patch applies with `git apply --index`, and every staged path matches `ALLOWED_MANIFEST_RE` (`package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.mod`, `go.sum`, `requirements*.txt`, never under `node_modules`) as a regular-file modify (or a new `go.sum`). The content of each file is checked too: `package.json` may change only dependency versions, and each one must be a version range, not a URL, path or git ref; lockfiles may add URLs only on `https` hosts they already used, and no new `file:`/`link:`/git references; `go.mod` may gain only `require`/`go`/`toolchain` lines; `requirements*.txt` only pinned lines. `create-pull-request` then commits exactly those files (`add-paths`), with a PR body `publish` built from the validated data. A tracked file outside the allow-list that `apply` modified is listed under "Not shipped" and never committed. Both jobs use `vars.CI_RUNNER` when set; that runner must be ephemeral per job (nexus-ci is), or the compromise of `apply` carries over into `publish`. `scripts/tests/test_dep_auto_apply_workflow.py` enforces the split: any job that runs dependency code must hold no write permission and reference no secret, `publish` must run none, and forged artifacts must be refused.
+
 | Ecosystem | Auto-apply behaviour |
 |---|---|
 | npm    | `npm audit fix` (never `--force`, never `--include-major`); `npm test` if a `test` script is defined. pnpm: `pnpm update <vuln-pkgs>` derived from audit JSON. yarn: skipped (no safe `audit fix`). |
@@ -176,7 +185,7 @@ The next scheduled run will exit silently with a notice.
 
 **Required GitHub permissions / secrets:**
 
-- `permissions: { contents: write, pull-requests: write }` (declared in the workflow itself; no repo-side change needed).
+- Declared in the workflow itself; no repo-side change needed. Workflow default `permissions: {}`; `apply` gets `contents: read`; `publish` gets `contents: write, pull-requests: write`.
 - `SHARED_BRAIN_TOKEN` (optional secret). If absent, the brain ingest step logs a notice and exits 0 — the workflow doesn't fail.
 
 ### Supply chain rule

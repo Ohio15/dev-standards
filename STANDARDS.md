@@ -163,7 +163,7 @@ dev-standards exposes gates in two layers:
 
 **Layer A — `security-audit.yml` (always-on):** runs on `pull_request` and `push: [main, master]`. Detect-and-dispatch by ecosystem (npm / go / python). Fails on high/critical. Pinned to action SHAs.
 
-**Layer B — `dep-auto-apply.yml` (weekly cron, opt-in):** Sunday 06:00 UTC via repo-side `schedule:` trigger. Per-repo opt-in via `.github/auto-apply-enabled` file. Auto-applies safe (patch / minor for non-breaking) bumps across npm / go / python / docker / gh-actions. Notifies ntfy + shared-brain.
+**Layer B — `dep-auto-apply.yml` (weekly cron, opt-in):** Sunday 06:00 UTC via repo-side `schedule:` trigger. Per-repo opt-in via `.github/auto-apply-enabled` file. Auto-applies safe (patch / minor for non-breaking) bumps across npm / go / python / docker / gh-actions. Notifies ntfy + shared-brain. Two jobs: `apply` (read-only token, no secrets) runs every install, fix and test, and hands over a patch of allow-listed manifests/lockfiles as an artifact; `publish` (write token + notification secrets) runs no dependency code, validates the patch fail-closed and commits only those files. Untrusted code and credentials never share a job.
 
 **Release-time gates (`release-gates.yml`, called by every surface workflow):**
 

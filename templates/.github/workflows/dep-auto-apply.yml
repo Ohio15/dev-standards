@@ -5,6 +5,31 @@ name: Dependency Auto-Apply (Layer B)
 # label `auto-apply` for human review. Auto-merge is NOT part of this layer
 # (it can be added later as a thin opt-in wrapper).
 #
+# Privilege boundary: TWO JOBS (audit-dev-standards-2026-10-10 HIGH 2).
+#   apply    contents: read, NO secrets. Runs everything that executes
+#            dependency-controlled code: installs (lifecycle scripts), audit
+#            fixes, builds and test suites. A malicious patch release inside a
+#            semver range runs here and can rewrite anything in this job: its
+#            files, $GITHUB_PATH, later steps, its outputs. So NOTHING it
+#            produces is trusted. It hands over one artifact: a `git diff` of
+#            the allow-listed manifests/lockfiles (ALLOWED_MANIFEST_RE below)
+#            plus a result.json of per-ecosystem flags and notes.
+#   publish  contents: write, pull-requests: write, the notification secrets.
+#            Runs NO dependency code (no install, no build, no test, no setup-*
+#            toolchain, nothing from the repo's node_modules). Fresh checkout of
+#            the same commit; the artifact is read as DATA, never executed.
+#            It validates result.json, applies the patch with `git apply
+#            --index`, and fails closed unless every staged path matches the
+#            allow-list, is a regular-file add/modify, and its content passes
+#            the per-manifest checks (package.json may change only dependency
+#            versions; new lockfile URLs only to hosts the lockfile already
+#            used; go.mod gains no replace/exclude/retract; requirements stay
+#            pinned). Then create-pull-request with add-paths = exactly those
+#            files, then ntfy + shared-brain.
+# Both jobs run on vars.CI_RUNNER when set: that runner (nexus-ci) is an
+# ephemeral VM per job. A persistent runner would carry the apply job's
+# compromise into publish and void this boundary; never point CI_RUNNER at one.
+#
 # Detection matches security-audit.yml (Layer A): every tracked manifest
 # ANYWHERE in the tree (from `git ls-files`, never node_modules) selects an
 # ecosystem, and each ecosystem step works through every manifest directory.
@@ -30,14 +55,17 @@ name: Dependency Auto-Apply (Layer B)
 #   the step FAILS - a scanner or package manager could not examine it. The
 #               job goes red and no PR is opened: unknown is never reported as
 #               "no changes".
+# A tracked file outside the allow-list that the apply job modified is never
+# shipped; the PR body lists it as dropped.
 #
 # Outcomes:
 #   anything bumped + tests pass/not run -> open PR labeled `auto-apply`
 #   anything bumped + tests fail         -> open DRAFT PR labeled `auto-apply-broken`
 #   nothing bumped                       -> notice + run summary, exit 0
-#   a scanner could not run              -> job fails
+#   a scanner could not run              -> apply fails; no PR; ntfy if configured
+#   the patch fails validation           -> publish fails; no PR; ntfy if configured
 #
-# Notifications:
+# Notifications (publish job only):
 #   ntfy: OFF unless the repo/org variable DEP_AUTO_APPLY_NTFY_URL is set
 #   (full topic URL). If the secret DEP_AUTO_APPLY_NTFY_TOKEN is set it is
 #   sent as a Bearer token. The post carries the repo name and PR URL, so
@@ -57,27 +85,40 @@ on:
     - cron: "0 6 * * 0"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+# Nothing by default; each job declares exactly what it needs.
+permissions: {}
 
 concurrency:
   group: dep-auto-apply
   cancel-in-progress: false
 
+env:
+  # The only files the publish job will ever commit: exactly what the apply
+  # job legitimately writes (npm audit fix / pnpm update: package.json and the
+  # lockfile; go get + go mod tidy: go.mod, go.sum; pip-audit --fix: pinned
+  # requirements*.txt). yarn.lock, pyproject.toml and Dockerfiles are never
+  # modified by this workflow (declined or read-only), so they are not listed.
+  # Repo-relative path; a node_modules component is refused separately.
+  ALLOWED_MANIFEST_RE: '^(?:[A-Za-z0-9._@+-]+/)*(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|go\.mod|go\.sum|requirements[A-Za-z0-9._-]*\.txt)$'
+
 jobs:
   apply:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    # Per-repo opt-in via .github/auto-apply-enabled. Implemented as a step
-    # check (not job-level if:) so we can reach the brain ingest path from
-    # within one job.
+    # Untrusted-code job: read-only token, no secrets.* anywhere in it.
+    permissions:
+      contents: read
+    outputs:
+      enrolled: ${{ steps.enroll.outputs.enrolled }}
+      any_changed: ${{ steps.agg.outputs.any_changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # Dependency install, fix and test steps run third-party lifecycle
-          # scripts; the contents: write token must not sit in .git/config
-          # for them. create-pull-request configures its own credential.
+          # Keeps the token out of .git/config (SC-13), nothing more: code that
+          # runs in this job can still reach what the job itself holds. The
+          # privilege boundary is the job split: this job's token is read-only
+          # and it references no secrets; the write token and the secrets live
+          # only in `publish`, which never runs dependency code.
           persist-credentials: false
 
       - name: Verify enrollment (.github/auto-apply-enabled present)
@@ -150,8 +191,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ steps.detect.outputs.go_version_file }}
-          cache: true
-          cache-dependency-path: '**/go.sum'
+          # No cache: its save runs after dependency code in this job, so the
+          # module cache it would publish to the default-branch scope (restored
+          # by every other workflow) is attacker-writable.
+          cache: false
 
       - name: Setup Python
         if: steps.enroll.outputs.enrolled == 'true' && steps.detect.outputs.has_python == 'true'
@@ -282,14 +325,15 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v govulncheck > /dev/null; then
-            # Pinned, never @latest: this job holds contents: write. The pin is
-            # chosen from the Go this job PROVISIONED (go.mod via setup-go, under
-            # GOTOOLCHAIN=local), because each x/vuln release raises its go directive:
-            # v1.8.0 needs 1.26, v1.2.0-v1.7.0 need 1.25, v1.1.4 needs 1.22 (verified
-            # from proxy.golang.org .mod files, 2026-10-08). A single pin failed the
-            # fleet twice in one day: v1.8.0 on every 1.25 repo (Sentinel #107), then
-            # v1.7.0 on a 1.24 module (openclaw-1 #12). The vuln DB is fetched live
-            # from vuln.go.dev, so an older binary does not weaken the scan. Add a row
+            # Pinned, never @latest: a floating tool is unreviewed code. The pin
+            # is chosen from the Go this job PROVISIONED (go.mod via setup-go,
+            # under GOTOOLCHAIN=local), because each x/vuln release raises its go
+            # directive: release v1.8.0 needs 1.26, v1.2.0-v1.7.0 need 1.25,
+            # and release v1.1.4 needs 1.22 (verified from proxy.golang.org .mod files,
+            # 2026-10-08). A single pin failed the fleet twice in one day: v1.8.0
+            # on every 1.25 repo (Sentinel #107), then the pin to v1.7.0 on a 1.24
+            # module (openclaw-1 #12). The vuln DB is fetched live from
+            # vuln.go.dev, so an older binary does not weaken the scan. Add a row
             # when the fleet's floor moves; never fall through to @latest.
             gover="$(go env GOVERSION)"            # e.g. go1.25.14
             minor="$(printf '%s' "$gover" | sed -E 's/^go1\.([0-9]+).*$/\1/')"
@@ -404,7 +448,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install pip==26.2.1
-          # Pinned: this job holds contents: write.
+          # Pinned: a floating tool version is unreviewed code.
           python -m pip install pip-audit==2.10.1
 
       - name: Python — pip-audit --fix (pinned reqs only)
@@ -499,32 +543,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          emit() { # <name> <value>: multi-line safe $GITHUB_OUTPUT write
+            local delim
+            delim="ghadelim_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          }
           # We don't auto-bump base images: digest resolution requires
           # network access to the registry and a trusted source-of-truth for
           # "the new digest of the same tag". We only validate that every
           # FROM line is digest-pinned, and surface a warning if not.
+          # Real newlines, never "\n" + printf %b: %b would also expand any
+          # backslash sequence in a Dockerfile line.
           notes=""
           unpinned=""
           while IFS= read -r df; do
             while IFS= read -r line; do
               if [[ "$line" =~ ^[Ff][Rr][Oo][Mm][[:space:]] ]]; then
                 if ! [[ "$line" =~ @sha256: ]]; then
-                  unpinned="${unpinned}${df}: ${line}\n"
+                  unpinned+="${df}: ${line}"$'\n'
                 fi
               fi
             done < "$df"
           done < <(git ls-files | grep -E '(^|/)Dockerfile(\..+)?$' || true)
           if [ -n "$unpinned" ]; then
-            notes="Dockerfiles with un-digest-pinned FROM lines (auto-apply skipped):\n${unpinned}"
-            echo "::warning::$notes"
+            notes="Dockerfiles with un-digest-pinned FROM lines (auto-apply skipped):"$'\n'"${unpinned}"
+            echo "::warning::Dockerfiles with un-digest-pinned FROM lines (auto-apply skipped):"
+            printf '%s' "$unpinned"
           fi
-          {
-            echo "changed=false"
-            echo "notes<<EOF"
-            printf "%b" "$notes"
-            echo
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          emit changed false
+          emit notes "$notes"
 
       # ---------------------------------------------------------- gh-actions
       - name: GitHub Actions — flag non-SHA-pinned uses
@@ -533,6 +580,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          emit() { # <name> <value>: multi-line safe $GITHUB_OUTPUT write
+            local delim
+            delim="ghadelim_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          }
           # Auto-bumping SHA-pinned actions safely requires resolving the
           # latest SHA for the same major from the GitHub API for each one,
           # which is best done by Dependabot's own action-bump grouping
@@ -547,22 +599,17 @@ jobs:
                 # local actions (./...) skip; reusable workflow paths skip.
                 [[ "$action" == ./* || "$action" == .github/* ]] && continue
                 if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-                  notes="${notes}${f}: ${action}@${ref} (not SHA-pinned)\n"
+                  notes+="${f}: ${action}@${ref} (not SHA-pinned)"$'\n'
                 fi
               fi
             done < "$f"
           done < <(git ls-files .github/workflows/ | grep -E '\.(yml|yaml)$' || true)
           if [ -n "$notes" ]; then
             echo "::warning::Non-SHA-pinned GitHub Actions found (auto-apply skipped — fix manually):"
-            printf "%b" "$notes"
+            printf '%s' "$notes"
           fi
-          {
-            echo "changed=false"
-            echo "notes<<EOF"
-            printf "%b" "$notes"
-            echo
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          emit changed false
+          emit notes "$notes"
 
       # ----------------------------------------------------------- aggregate
       - name: Aggregate result
@@ -625,47 +672,412 @@ jobs:
             echo "::notice::No dependency changes this run; $declined manifest location(s) declined by policy (see the run summary)."
           fi
 
+      # ------------------------------------------------------------ package
+      # The hand-over to `publish`: a patch of the allow-listed files and the
+      # per-ecosystem results, as an artifact. Everything here is untrusted by
+      # construction (dependency code ran earlier in this job); `publish`
+      # re-validates all of it and trusts none of it.
+      - name: Package the allow-listed patch for the publish job
+        if: steps.enroll.outputs.enrolled == 'true' && steps.agg.outputs.any_changed == 'true'
+        id: package
+        shell: bash
+        env:
+          ANY_CHANGED: ${{ steps.agg.outputs.any_changed }}
+          TESTS_FAILED: ${{ steps.agg.outputs.tests_failed }}
+          NPM_CHANGED: ${{ steps.npm.outputs.changed }}
+          GO_CHANGED: ${{ steps.go.outputs.changed }}
+          PYTHON_CHANGED: ${{ steps.python.outputs.changed }}
+          NPM_TESTS: ${{ steps.npm.outputs.tests }}
+          GO_TESTS: ${{ steps.go.outputs.tests }}
+          PYTHON_TESTS: ${{ steps.python.outputs.tests }}
+          NPM_NOTES: ${{ steps.npm.outputs.notes }}
+          GO_NOTES: ${{ steps.go.outputs.notes }}
+          PYTHON_NOTES: ${{ steps.python.outputs.notes }}
+          DOCKER_NOTES: ${{ steps.docker.outputs.notes }}
+          ACTIONS_NOTES: ${{ steps.actions.outputs.notes }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/dep-auto-apply"
+          rm -rf "$out"
+          mkdir -p "$out"
+          python3 - "$out" <<'PY'
+          import json, os, re, subprocess, sys
+          out = sys.argv[1]
+          allowed = re.compile(os.environ["ALLOWED_MANIFEST_RE"])
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True).stdout
+
+          def listed(raw):
+              return [p for p in raw.decode("utf-8").split("\0") if p]
+
+          def ok(path):
+              return bool(allowed.fullmatch(path)) and "node_modules" not in path.split("/")
+
+          # An allow-listed file that did not exist before (go.sum written by
+          # go mod tidy) joins the diff as intent-to-add.
+          new = [p for p in listed(git("ls-files", "--others", "--exclude-standard", "-z")) if ok(p)]
+          if new:
+              git("add", "--intent-to-add", "--", *[":(literal)" + p for p in new])
+          changed = listed(git("diff", "--name-only", "-z", "--no-renames"))
+          keep = sorted(p for p in changed if ok(p))
+          dropped = sorted(p for p in changed if not ok(p))
+          for p in dropped:
+              print(f"::warning::auto-apply will not ship {p!r}: not an allow-listed manifest or lockfile")
+          patch = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+                      "--", *[":(literal)" + p for p in keep]) if keep else b""
+          with open(os.path.join(out, "deps.patch"), "wb") as f:
+              f.write(patch)
+          env = os.environ.get
+          result = {
+              "schema": 1,
+              "base_sha": git("rev-parse", "HEAD").decode().strip(),
+              "any_changed": env("ANY_CHANGED", ""),
+              "tests_failed": env("TESTS_FAILED", ""),
+              "ecosystems": {
+                  eco: {"changed": env(f"{eco.upper()}_CHANGED", ""),
+                        "tests": env(f"{eco.upper()}_TESTS", ""),
+                        "notes": env(f"{eco.upper()}_NOTES", "")}
+                  for eco in ("npm", "go", "python")
+              },
+              "docker_notes": env("DOCKER_NOTES", ""),
+              "actions_notes": env("ACTIONS_NOTES", ""),
+              "dropped": dropped,
+          }
+          with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2)
+          print(f"patch: {len(keep)} file(s), {len(patch)} bytes; dropped: {len(dropped)}")
+          PY
+
+      - name: Upload the patch for the publish job
+        if: steps.enroll.outputs.enrolled == 'true' && steps.agg.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dep-auto-apply
+          path: ${{ runner.temp }}/dep-auto-apply/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  # ===================================================================
+  # publish: the ONLY job with a write token or a secret. It runs no
+  # dependency code. Do not add an install, build, test or setup-* step here;
+  # scripts/tests/test_dep_auto_apply_workflow.py fails the build if you do.
+  publish:
+    needs: apply
+    if: >-
+      always() && needs.apply.outputs.enrolled == 'true'
+      && (needs.apply.result == 'failure'
+          || (needs.apply.result == 'success' && needs.apply.outputs.any_changed == 'true'))
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.apply.result == 'success'
+        with:
+          fetch-depth: 0
+          # create-pull-request configures its own credential for the push.
+          persist-credentials: false
+
+      # Outside the workspace: the artifact is never part of the tree that
+      # create-pull-request commits.
+      - name: Download the apply job's patch (data, never executed)
+        if: needs.apply.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dep-auto-apply
+          path: ${{ runner.temp }}/dep-auto-apply
+
+      - name: Verify the patch against the allow-list and apply it
+        if: needs.apply.result == 'success'
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          # -I: isolated mode. No PYTHON* environment, no user site, and no
+          # script/working directory on sys.path, so nothing in the checkout
+          # can be imported in place of the standard library.
+          python3 -I - <<'PY'
+          import datetime, json, os, re, subprocess, sys
+          from urllib.parse import urlsplit
+
+          ALLOWED = re.compile(os.environ["ALLOWED_MANIFEST_RE"])
+          ART = os.path.join(os.environ["RUNNER_TEMP"], "dep-auto-apply")
+          MAX_PATCH = 64 * 1024 * 1024
+          MAX_NOTES = 20000
+          DEFAULT_HOSTS = {"registry.npmjs.org"}
+          DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+          # A version range only: no URL, path, git, alias or workspace protocol.
+          DEP_SPEC = re.compile(r"^[0-9A-Za-z.+^~<>=*| -]{1,128}$")
+          GO_MOD_LINE = re.compile(
+              r"^\s*(?:"
+              r"|\)|require \(|go \d+(?:\.\d+){1,2}|toolchain go\d+(?:\.\d+){1,2}"
+              r"|(?:require\s+)?[A-Za-z0-9._~/-]+ v[0-9A-Za-z.+-]+(?: // indirect)?"
+              r")\s*$")
+          GO_SUM_LINE = re.compile(r"^[A-Za-z0-9._~/-]+ v[0-9A-Za-z.+-]+(?:/go\.mod)? h1:[A-Za-z0-9+/]{43}=$")
+          REQ_LINE = re.compile(
+              r"^\s*(?:"
+              r"|#.*"
+              r"|[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?\s*(?:==|~=)\s*[A-Za-z0-9.*+!-]+"
+              r"(?:\s*;[^#\\]*)?(?:\s+--hash=sha256:[0-9a-f]{64})*(?:\s*\\)?(?:\s+#.*)?"
+              r"|--hash=sha256:[0-9a-f]{64}(?:\s*\\)?"
+              r")\s*$")
+          LOCK_LOCAL_REF = re.compile(r"(?:^|[\s'\"{,])(?:link|file|git\+[a-z]+|github|repo|commit|directory):")
+
+          def clean(text):
+              return re.sub(r"[\x00-\x1f\x7f]", "?", str(text))[:500]
+
+          def die(msg):
+              print(f"::error::publish refused the apply job's patch: {clean(msg)}")
+              sys.exit(1)
+
+          def git(*args, raw=False):
+              p = subprocess.run(["git", *args], capture_output=True)
+              if p.returncode != 0:
+                  die(f"git {args[0]} failed: {p.stderr.decode('utf-8', 'replace').strip()}")
+              return p.stdout if raw else p.stdout.decode("utf-8")
+
+          def emit(name, value):
+              delim = "ghadelim_" + os.urandom(12).hex()
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as f:
+                  f.write(f"{name}<<{delim}\n{value}\n{delim}\n")
+
+          # ---- result.json: shape and enums, nothing taken on trust --------
+          try:
+              with open(os.path.join(ART, "result.json"), "rb") as f:
+                  raw_result = f.read(1024 * 1024 + 1)
+          except OSError as exc:
+              die(f"result.json unreadable: {exc}")
+          if len(raw_result) > 1024 * 1024:
+              die("result.json is larger than 1 MiB")
+          try:
+              result = json.loads(raw_result.decode("utf-8"))
+          except ValueError as exc:
+              die(f"result.json is not JSON: {exc}")
+          bools = ("true", "false", "")
+          tests_enum = ("passed", "failed", "not_run", "")
+          try:
+              assert isinstance(result, dict) and result.get("schema") == 1
+              assert set(result) == {"schema", "base_sha", "any_changed", "tests_failed", "ecosystems",
+                                     "docker_notes", "actions_notes", "dropped"}
+              assert re.fullmatch(r"[0-9a-f]{40}", result["base_sha"])
+              assert result["any_changed"] == "true" and result["tests_failed"] in ("true", "false")
+              assert set(result["ecosystems"]) == {"npm", "go", "python"}
+              for eco in result["ecosystems"].values():
+                  assert set(eco) == {"changed", "tests", "notes"}
+                  assert eco["changed"] in bools and eco["tests"] in tests_enum
+                  assert isinstance(eco["notes"], str) and len(eco["notes"]) <= MAX_NOTES
+              for key in ("docker_notes", "actions_notes"):
+                  assert isinstance(result[key], str) and len(result[key]) <= MAX_NOTES
+              assert isinstance(result["dropped"], list) and len(result["dropped"]) <= 500
+              assert all(isinstance(p, str) and len(p) <= 4096 for p in result["dropped"])
+          except (AssertionError, AttributeError, KeyError, TypeError):
+              die("result.json does not have the expected shape")
+
+          head = git("rev-parse", "HEAD").strip()
+          if result["base_sha"] != head:
+              die(f"patch was made against {result['base_sha']}, this checkout is {head}")
+
+          # ---- the patch: apply to the index, then judge what is staged ----
+          patch_path = os.path.join(ART, "deps.patch")
+          try:
+              size = os.path.getsize(patch_path)
+          except OSError as exc:
+              die(f"deps.patch missing: {exc}")
+          if size > MAX_PATCH:
+              die(f"deps.patch is {size} bytes (cap {MAX_PATCH})")
+          if size == 0:
+              die("apply reported a change but the patch of allow-listed files is empty")
+          git("apply", "--index", "--whitespace=nowarn", "--", patch_path)
+
+          entries = git("diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev").split("\0")
+          staged = []
+          i = 0
+          while i < len(entries) - 1:
+              meta, path = entries[i], entries[i + 1]
+              i += 2
+              m = re.fullmatch(r":(\d{6}) (\d{6}) [0-9a-f]{40} [0-9a-f]{40} ([A-Z])", meta)
+              if not m:
+                  die(f"unexpected staged entry {meta!r}")
+              old_mode, new_mode, status = m.groups()
+              if not ALLOWED.fullmatch(path) or "node_modules" in path.split("/") or path.startswith("-"):
+                  die(f"{path!r} is not an allow-listed manifest or lockfile")
+              if status == "M":
+                  if new_mode != old_mode or new_mode != "100644":
+                      die(f"{path!r}: mode change or non-regular file ({old_mode} -> {new_mode})")
+              elif status == "A":
+                  # Only the Go tidy step legitimately creates a file (an untracked go.sum).
+                  if new_mode != "100644" or path.rsplit("/", 1)[-1] != "go.sum":
+                      die(f"{path!r}: a new file of this kind is never written by auto-apply")
+              else:
+                  die(f"{path!r}: status {status} (only modify, or add of go.sum, is allowed)")
+              staged.append(path)
+          if not staged:
+              die("the patch staged nothing")
+
+          def blob(spec):
+              p = subprocess.run(["git", "show", spec], capture_output=True)
+              return p.stdout.decode("utf-8") if p.returncode == 0 else None
+
+          def added_lines(path):
+              diff = git("diff", "--cached", "-U0", "--no-color", "--no-ext-diff", "--no-textconv",
+                         "--", ":(literal)" + path)
+              return [ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+
+          def hosts(text):
+              return {urlsplit(u).hostname for u in re.findall(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>,}]+", text or "")}
+
+          def check_new_urls(path, old, lines):
+              known = (hosts(old) | DEFAULT_HOSTS) - {None}
+              for ln in lines:
+                  for url in re.findall(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>,}]+", ln):
+                      parts = urlsplit(url)
+                      if parts.scheme != "https" or parts.hostname not in known:
+                          die(f"{path}: new URL {url!r} (only https to a host the lockfile already used)")
+                  if LOCK_LOCAL_REF.search(ln):
+                      die(f"{path}: new local/git reference {ln.strip()!r}")
+
+          for path in staged:
+              name = path.rsplit("/", 1)[-1]
+              old, new = blob(f"HEAD:{path}"), blob(f":{path}")
+              if new is None:
+                  die(f"{path}: staged content unreadable")
+              # A line already present in the file is moved, not new (the Go
+              # tidy step and lockfile writers reorder); only new lines are judged.
+              existing = set((old or "").splitlines())
+              lines = [ln for ln in added_lines(path) if ln not in existing]
+              if name == "package.json":
+                  try:
+                      o, n = json.loads(old), json.loads(new)
+                  except (TypeError, ValueError):
+                      die(f"{path}: not valid JSON before and after")
+                  if not isinstance(o, dict) or not isinstance(n, dict):
+                      die(f"{path}: not a JSON object")
+                  strip = lambda d: {k: v for k, v in d.items() if k not in DEP_SECTIONS}
+                  if strip(o) != strip(n):
+                      die(f"{path}: changes outside {', '.join(DEP_SECTIONS)} (scripts, config, ...)")
+                  for sec in DEP_SECTIONS:
+                      before, after = o.get(sec) or {}, n.get(sec) or {}
+                      if not isinstance(after, dict):
+                          die(f"{path}: {sec} is not an object")
+                      for dep, spec in after.items():
+                          if before.get(dep) != spec and not (isinstance(spec, str) and DEP_SPEC.match(spec)):
+                              die(f"{path}: {sec}.{dep} = {spec!r} is not a version range")
+              elif name in ("package-lock.json", "npm-shrinkwrap.json"):
+                  try:
+                      json.loads(new)
+                  except ValueError:
+                      die(f"{path}: not valid JSON")
+                  check_new_urls(path, old, lines)
+              elif name == "pnpm-lock.yaml":
+                  check_new_urls(path, old, lines)
+              elif name == "go.mod":
+                  for ln in lines:
+                      if not GO_MOD_LINE.match(ln):
+                          die(f"{path}: line {ln.strip()!r} is not a require/go/toolchain line")
+              elif name == "go.sum":
+                  for ln in lines:
+                      if not GO_SUM_LINE.match(ln):
+                          die(f"{path}: line {ln.strip()!r} is not a go.sum hash line")
+              else:  # requirements*.txt
+                  for ln in lines:
+                      if not REQ_LINE.match(ln):
+                          die(f"{path}: line {ln.strip()!r} is not a pinned requirement")
+
+          # ---- PR metadata: built here, from validated data only ------------
+          def notes_block(text):
+              text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", text)
+              text = re.sub(r"[`~]{3,}", "''", text).strip()
+              return "````text\n" + (text or "(none)") + "\n````"
+
+          eco = result["ecosystems"]
+          tests_failed = result["tests_failed"]
+          date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+          table = ["| Ecosystem | Changed | Tests |", "|---|---|---|"]
+          for e in ("npm", "go", "python"):
+              table.append(f"| {e} | {eco[e]['changed'] or 'not detected'} | {eco[e]['tests'] or '-'} |")
+          notes = "\n".join(n for n in (eco["npm"]["notes"], eco["go"]["notes"], eco["python"]["notes"]) if n.strip())
+          files = "\n".join(f"- `{p}`" for p in staged)
+          dropped = "\n".join(result["dropped"])
+          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          if tests_failed == "true":
+              head_md = ("## Weekly auto-apply - TESTS FAILED\n\n"
+                         "Layer B applied dependency bumps but the resulting test run failed. Marked draft so a\n"
+                         "human can decide whether to:\n"
+                         "- investigate + fix the test, then mark ready\n"
+                         "- revert the bumps (close + delete branch)\n"
+                         "- cherry-pick the safe subset\n")
+          else:
+              head_md = ("## Weekly auto-apply (Layer B)\n\n"
+                         "Automated weekly bumps for safe (non-major) dependency fixes.\n")
+          body = "\n".join([
+              head_md,
+              "### Per-ecosystem",
+              *table,
+              "",
+              notes_block(notes),
+              "",
+              "**docker:**",
+              notes_block(result["docker_notes"]),
+              "**gh-actions:**",
+              notes_block(result["actions_notes"]),
+              "",
+              "`tests=not_run` means no test suite was found: nothing was verified.",
+              "",
+              "### Files in this PR",
+              "Each one matched the manifest allow-list and passed the publish job's content checks",
+              "(package.json: dependency versions only; lockfiles: no new hosts or local/git references;",
+              "go.mod: require/go/toolchain lines only; requirements: pinned lines only).",
+              files,
+              "",
+              "### Not shipped (modified by the apply job, outside the allow-list)",
+              notes_block(dropped),
+              "",
+              "### Reviewer checklist",
+              "- [ ] Lockfile diff is present and reasonable",
+              "- [ ] No major version bumps slipped through",
+              "- [ ] CVE / GHSA list (if any) maps to the bumps",
+              "- [ ] CI is green on this PR",
+              "- [ ] Layer A `security-audit` workflow passes",
+              "",
+              f"Workflow run: {run_url}",
+              "",
+              "---",
+              "Design: shared-brain decision `81b962de-3e94-4d67-9093-7dbb5644094d`",
+              "Critique: shared-brain knowledge `7b258d5c-dcf4-49e9-973a-5e92b951a019`",
+              "",
+          ])
+          body_path = os.path.join(os.environ["RUNNER_TEMP"], "dep-auto-apply-pr-body.md")
+          with open(body_path, "w", encoding="utf-8", newline="\n") as f:
+              f.write(body)
+
+          emit("tests_failed", tests_failed)
+          emit("date_str", date_str)
+          emit("branch", f"auto-apply/{date_str}")
+          emit("body_path", body_path)
+          # Exactly the validated files, as literal pathspecs.
+          emit("add_paths", "\n".join(":(literal)" + p for p in staged))
+          print(f"verified {len(staged)} file(s): " + ", ".join(staged))
+          PY
+
       # --------------------------------------------------------- compose PR
       - name: Open PR (success path)
-        if: steps.enroll.outputs.enrolled == 'true' && steps.agg.outputs.any_changed == 'true' && steps.agg.outputs.tests_failed != 'true'
+        if: needs.apply.result == 'success' && steps.verify.outputs.tests_failed == 'false'
         id: pr_ok
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          branch: ${{ steps.agg.outputs.branch }}
+          branch: ${{ steps.verify.outputs.branch }}
           base: ${{ github.event.repository.default_branch }}
+          add-paths: ${{ steps.verify.outputs.add_paths }}
           commit-message: |
-            chore: weekly auto-apply ${{ steps.agg.outputs.date_str }}
+            chore: weekly auto-apply ${{ steps.verify.outputs.date_str }}
 
             Auto-applied by dep-auto-apply.yml (Layer B). Per-ecosystem notes
             and test results are in the PR body.
-          title: "chore: weekly auto-apply ${{ steps.agg.outputs.date_str }}"
-          body: |
-            ## Weekly auto-apply (Layer B)
-
-            Automated weekly bumps for safe (non-major) dependency fixes.
-
-            ### Per-ecosystem notes
-            - **npm:** changed=`${{ steps.npm.outputs.changed }}` tests=`${{ steps.npm.outputs.tests }}`
-              ${{ steps.npm.outputs.notes }}
-            - **go:** changed=`${{ steps.go.outputs.changed }}` tests=`${{ steps.go.outputs.tests }}`
-              ${{ steps.go.outputs.notes }}
-            - **python:** changed=`${{ steps.python.outputs.changed }}` tests=`${{ steps.python.outputs.tests }}`
-              ${{ steps.python.outputs.notes }}
-            - **docker:** ${{ steps.docker.outputs.notes }}
-            - **gh-actions:** ${{ steps.actions.outputs.notes }}
-
-            `tests=not_run` means no test suite was found: nothing was verified.
-
-            ### Reviewer checklist
-            - [ ] Lockfile diff is present and reasonable
-            - [ ] No major version bumps slipped through
-            - [ ] CVE / GHSA list (if any) maps to the bumps
-            - [ ] CI is green on this PR
-            - [ ] Layer A `security-audit` workflow passes
-
-            ---
-            Design: shared-brain decision `81b962de-3e94-4d67-9093-7dbb5644094d`
-            Critique: shared-brain knowledge `7b258d5c-dcf4-49e9-973a-5e92b951a019`
+          title: "chore: weekly auto-apply ${{ steps.verify.outputs.date_str }}"
+          body-path: ${{ steps.verify.outputs.body_path }}
           labels: |
             auto-apply
             dependencies
@@ -673,37 +1085,21 @@ jobs:
           sign-commits: false
 
       - name: Open PR (broken path — tests failed)
-        if: steps.enroll.outputs.enrolled == 'true' && steps.agg.outputs.any_changed == 'true' && steps.agg.outputs.tests_failed == 'true'
+        if: needs.apply.result == 'success' && steps.verify.outputs.tests_failed == 'true'
         id: pr_broken
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          branch: ${{ steps.agg.outputs.branch }}-broken
+          branch: ${{ steps.verify.outputs.branch }}-broken
           base: ${{ github.event.repository.default_branch }}
+          add-paths: ${{ steps.verify.outputs.add_paths }}
           commit-message: |
-            chore(broken): weekly auto-apply ${{ steps.agg.outputs.date_str }} — tests failed
+            chore(broken): weekly auto-apply ${{ steps.verify.outputs.date_str }} — tests failed
 
             Auto-applied by dep-auto-apply.yml (Layer B). Tests failed inside
             the workflow run; this PR is opened as a DRAFT for human triage.
-          title: "chore(broken): weekly auto-apply ${{ steps.agg.outputs.date_str }} — tests failed"
+          title: "chore(broken): weekly auto-apply ${{ steps.verify.outputs.date_str }} — tests failed"
           draft: true
-          body: |
-            ## Weekly auto-apply — TESTS FAILED
-
-            Layer B applied dependency bumps but the resulting test run
-            failed. Marked draft so a human can decide whether to:
-            - investigate + fix the test, then mark ready
-            - revert the bumps (close + delete branch)
-            - cherry-pick the safe subset
-
-            ### Per-ecosystem
-            - **npm:**    changed=`${{ steps.npm.outputs.changed }}` tests=`${{ steps.npm.outputs.tests }}`
-              ${{ steps.npm.outputs.notes }}
-            - **go:**     changed=`${{ steps.go.outputs.changed }}` tests=`${{ steps.go.outputs.tests }}`
-              ${{ steps.go.outputs.notes }}
-            - **python:** changed=`${{ steps.python.outputs.changed }}` tests=`${{ steps.python.outputs.tests }}`
-              ${{ steps.python.outputs.notes }}
-
-            See workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body-path: ${{ steps.verify.outputs.body_path }}
           labels: |
             auto-apply-broken
             dependencies
@@ -716,12 +1112,14 @@ jobs:
       # built-in public one.
       - name: Notify ntfy (PR opened, tests failed, or run failed)
         if: >-
-          always() && vars.DEP_AUTO_APPLY_NTFY_URL != '' && steps.enroll.outputs.enrolled == 'true'
-          && (failure() || steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url)
+          always() && vars.DEP_AUTO_APPLY_NTFY_URL != ''
+          && (needs.apply.result == 'failure' || failure()
+              || steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url)
         shell: bash
         env:
           NTFY_URL: ${{ vars.DEP_AUTO_APPLY_NTFY_URL }}
           NTFY_TOKEN: ${{ secrets.DEP_AUTO_APPLY_NTFY_TOKEN }}
+          APPLY_RESULT: ${{ needs.apply.result }}
           JOB_STATUS: ${{ job.status }}
           PR_OK_URL: ${{ steps.pr_ok.outputs.pull-request-url }}
           PR_BROKEN_URL: ${{ steps.pr_broken.outputs.pull-request-url }}
@@ -733,9 +1131,14 @@ jobs:
             https://*) ;;
             *) echo "::warning::DEP_AUTO_APPLY_NTFY_URL is not an https:// URL; not posting"; exit 0 ;;
           esac
-          if [ "$JOB_STATUS" = "failure" ]; then
+          if [ "$APPLY_RESULT" = "failure" ]; then
             title="auto-apply FAILED: ${REPO}"
             body="Weekly auto-apply could not examine every ecosystem. Run: ${RUN_URL}"
+            tags="rotating_light,auto-apply-failed"
+            prio="urgent"
+          elif [ "$JOB_STATUS" = "failure" ]; then
+            title="auto-apply REFUSED: ${REPO}"
+            body="The publish job refused or could not open the auto-apply PR (patch validation or PR step failed). Run: ${RUN_URL}"
             tags="rotating_light,auto-apply-failed"
             prio="urgent"
           elif [ -n "${PR_BROKEN_URL:-}" ]; then
@@ -761,14 +1164,14 @@ jobs:
             echo "::warning::ntfy publish failed (non-fatal)"
 
       - name: Brain ingest (PR opened only)
-        if: steps.enroll.outputs.enrolled == 'true' && (steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url)
+        if: steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url
         shell: bash
         env:
           BRAIN_TOKEN: ${{ secrets.SHARED_BRAIN_TOKEN }}
           PR_OK_URL: ${{ steps.pr_ok.outputs.pull-request-url }}
           PR_BROKEN_URL: ${{ steps.pr_broken.outputs.pull-request-url }}
           REPO: ${{ github.repository }}
-          DATE_STR: ${{ steps.agg.outputs.date_str }}
+          DATE_STR: ${{ steps.verify.outputs.date_str }}
         run: |
           set -euo pipefail
           if [ -z "${BRAIN_TOKEN:-}" ]; then
