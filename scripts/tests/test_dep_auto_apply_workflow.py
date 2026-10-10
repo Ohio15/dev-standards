@@ -205,7 +205,7 @@ def parse_outputs(text: str) -> dict[str, str]:
 def run_step(step_id: str, cwd: Path, shim_path: str, env_values: dict[str, str], *, job: str = "apply", **fake: str):
     """Run a step as Actions would: its `env:` expressions are evaluated from
     env_values, and the script sees only environment variables."""
-    s = step(step_id) if job == "apply" else publish_step(step_id)
+    [s] = [x for x in JOBS[job]["steps"] if x.get("id") == step_id]
     env = {}
     for name, expr in s.get("env", {}).items():
         if name in fake:
@@ -485,7 +485,7 @@ def test_checkouts_do_not_persist_the_token(path):
 def test_ntfy_is_opt_in_and_never_the_public_topic():
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "ntfy.sh/nexus-alerts" not in text
-    [notify] = [s for s in JOBS["publish"]["steps"] if "ntfy" in (s.get("name") or "").lower()]
+    [notify] = [s for s in JOBS["notify"]["steps"] if "ntfy" in (s.get("name") or "").lower()]
     assert "vars.DEP_AUTO_APPLY_NTFY_URL != ''" in notify["if"]
 
 
@@ -556,10 +556,36 @@ def test_publish_runs_no_dependency_code():
     assert publish["needs"] == "apply"
 
 
-def test_only_publish_holds_write_or_secrets():
+def test_write_token_and_secrets_live_in_different_jobs():
     assert JOBS["apply"]["permissions"] == {"contents": "read"}
     assert JOBS["publish"]["permissions"] == {"contents": "write", "pull-requests": "write"}
-    assert "secrets." in yaml.safe_dump(JOBS["publish"])
+    assert JOBS["notify"]["permissions"] == {}
+    assert "secrets." not in yaml.safe_dump(JOBS["publish"])
+    assert "secrets." in yaml.safe_dump(JOBS["notify"])
+    assert set(JOBS) == {"apply", "publish", "notify"}
+
+
+@pytest.mark.parametrize("name", sorted(JOBS))
+def test_a_secret_holding_job_runs_no_third_party_action(name):
+    # Gate pass 2 (SC-29): a third-party action release can rewrite
+    # $GITHUB_PATH/$GITHUB_ENV for every later step of its job, so no job that
+    # references a secret may use one. Only actions/* (first-party) qualify.
+    job = JOBS[name]
+    if "secrets." not in yaml.safe_dump(job):
+        return
+    third_party = [s["uses"] for s in job["steps"] if "uses" in s and not str(s["uses"]).startswith("actions/")]
+    assert third_party == [], f"{name} holds a secret and runs {third_party}"
+    assert not any(runs_dependency_code(s) for s in job["steps"])
+
+
+def test_notify_runs_no_action_and_takes_publish_values_through_env():
+    notify = JOBS["notify"]
+    assert all("uses" not in s for s in notify["steps"])
+    assert notify["needs"] == ["apply", "publish"]
+    for s in notify["steps"]:
+        assert "needs.publish.outputs" not in s.get("run", "")
+    outs = JOBS["publish"]["outputs"]
+    assert set(outs) == {"pr_ok_url", "pr_broken_url", "date_str"}
 
 
 def test_every_pr_step_commits_only_the_verified_paths():
@@ -868,12 +894,13 @@ def test_pr_body_notes_cannot_break_out_of_their_block(tmp_path, shim_path):
 DEFAULT_REF_IF = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
 
 
-def test_publish_uses_the_protected_environment():
+def test_secret_and_write_jobs_use_the_protected_environment():
     assert JOBS["publish"]["environment"] == "auto-apply-publish"
+    assert JOBS["notify"]["environment"] == "auto-apply-publish"
     assert "environment" not in JOBS["apply"]
 
 
-@pytest.mark.parametrize("name", ["apply", "publish"])
+@pytest.mark.parametrize("name", ["apply", "publish", "notify"])
 def test_both_jobs_refuse_any_ref_but_the_default_branch(name):
     job = JOBS[name]
     assert DEFAULT_REF_IF in job["if"]
@@ -906,29 +933,35 @@ PUBLISH_STEPS = [
     "id:verify",
     "id:pr_ok",
     "id:pr_broken",
-    "id:notify",
-    "id:brain",
 ]
-PUBLISH_RUN_SHA256 = {
-    "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-    "verify": "72bac55e1ce58f664a64923fd69387e907a7d5b78130fc922a5e16e640b9682c",
-    "notify": "b4e5d0d340fc9a234d1b2830896d72e9a692542cf26b52b4369c058d1bc4a166",
-    "brain": "431c1d088d3b7ebc83b0d4b7b9c1e4a7a4661986cc8a0595368bfcb128abf9c0",
+NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
+RUN_SHA256 = {
+    "publish": {
+        "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
+        "verify": "f3827ed24ddddac7537703a451bd33b8ac2c28fcdd929aecb44eb3fbe01c4a56",
+    },
+    "notify": {
+        "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
+        "notify": "dac4e53d86d42985dfee24e29f219d0c06f554e76c1b81ba73c016c381a93cf6",
+        "brain": "77e973a7709ddc0a807805543e3c2b6c14971d37ffb7dc64c0dd99606b7a205b",
+    },
 }
 
 
-def test_publish_step_list_is_fixed():
+@pytest.mark.parametrize("name,expected", [("publish", PUBLISH_STEPS), ("notify", NOTIFY_STEPS)])
+def test_publish_step_list_is_fixed(name, expected):
     got = [f"id:{s['id']}" if "id" in s else "uses:" + str(s["uses"]).split("@")[0]
-           for s in JOBS["publish"]["steps"]]
-    assert got == PUBLISH_STEPS
+           for s in JOBS[name]["steps"]]
+    assert got == expected
 
 
-def test_publish_run_bodies_are_exactly_the_reviewed_ones():
+@pytest.mark.parametrize("name", ["publish", "notify"])
+def test_publish_run_bodies_are_exactly_the_reviewed_ones(name):
     got = {s["id"]: hashlib.sha256(s["run"].encode("utf-8")).hexdigest()
-           for s in JOBS["publish"]["steps"] if "run" in s}
-    assert got == PUBLISH_RUN_SHA256, (
-        "a publish run: body changed. Read it for anything that executes repo or dependency "
-        "code, then update PUBLISH_RUN_SHA256")
+           for s in JOBS[name]["steps"] if "run" in s}
+    assert got == RUN_SHA256[name], (
+        f"a {name} run: body changed. Read it for anything that executes repo or dependency "
+        "code, then update RUN_SHA256")
 
 
 @pytest.mark.parametrize("spelling", [
@@ -1014,7 +1047,7 @@ def lock_with(**packages) -> str:
     ({"link": True, "resolved": "../evil"}, "becomes a link"),
     ({"version": "1.0.0", "resolved": "../evil"}, "new URL"),
     ({"version": "1.0.0", "resolved": "git@github.com:o/r"}, "new URL"),
-    ({"version": "1.0.0", "resolved": "git+ssh://git@github.com/o/r.git"}, "new URL"),
+    ({"version": "1.0.0", "resolved": "git+ssh://git@github.com/o/r.git"}, "authority"),
     ({"version": "1.0.0", "resolved": "http://registry.npmjs.org/b/-/b-1.0.0.tgz"}, "new URL"),
     ({"version": "1.0.0", "resolved": "https://evil.example/b-1.0.0.tgz"}, "new URL"),
     ({"version": "github:o/r", "resolved": "https://registry.npmjs.org/b/-/b-1.0.0.tgz"}, "not a plain version"),
@@ -1062,12 +1095,12 @@ PNPM = ("lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      
 
 
 @pytest.mark.parametrize("added,expect", [
-    ("      b:\n        specifier: git@github.com:o/r\n", "scp-style"),
-    ("      b:\n        specifier: github.com:o/r\n", "scp-style"),
+    ("      b:\n        version: git@github.com:o/r\n", "scp-style"),
+    ("      b:\n        version: github.com:o/r\n", "scp-style"),
     # Identical text to an existing line elsewhere: no longer exempt.
     ("      b:\n        version: link:../local\n", "local/git reference"),
     ("      b:\n        version: file:../b\n", "local/git reference"),
-    ("      b:\n        specifier: github:o/r\n", "local/git reference"),
+    ("      b:\n        version: github:o/r\n", "local/git reference"),
     ("  b@1.0.0:\n    resolution: {tarball: https://evil.example/b.tgz}\n", "only https"),
 ])
 def test_refuses_pnpm_lock_spellings(tmp_path, shim_path, added, expect):
@@ -1154,16 +1187,18 @@ def run_with_curl_spy(tmp_path, shim_path, step_id, **env):
     spy.mkdir()
     work = tmp_path / "w"
     work.mkdir()
-    proc = run_step(step_id, work, shim_path, {}, job="publish",
+    proc = run_step(step_id, work, shim_path, {}, job="notify",
                     CURL_ARGV=(spy / "argv").as_posix(), CURL_STDIN=(spy / "stdin").as_posix(), **env)
     argv = (spy / "argv").read_text(encoding="utf-8") if (spy / "argv").exists() else None
     stdin = (spy / "stdin").read_text(encoding="utf-8") if (spy / "stdin").exists() else None
     return proc, argv, stdin
 
 
-NOTIFY_ENV = dict(NTFY_URL="https://ntfy.example/t", APPLY_RESULT="success", JOB_STATUS="success",
+NOTIFY_ENV = dict(NTFY_URL="https://ntfy.example/t", APPLY_RESULT="success", PUBLISH_RESULT="success",
                   PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
-                  RUN_URL="https://github.com/o/r/actions/runs/1")
+                  SERVER_URL="https://github.com", RUN_ID="1")
+BRAIN_ENV = dict(PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
+                 SERVER_URL="https://github.com", DATE_STR="2026-10-10")
 
 
 def test_ntfy_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
@@ -1182,8 +1217,7 @@ def test_ntfy_without_token_sends_no_header(tmp_path, shim_path):
 
 def test_brain_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
     proc, argv, stdin = run_with_curl_spy(
-        tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, PR_OK_URL="https://github.com/o/r/pull/1",
-        PR_BROKEN_URL="", REPO="o/r", DATE_STR="2026-10-10")
+        tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, **BRAIN_ENV)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "tk_s3cret" not in argv
     assert stdin.strip() == 'header = "Authorization: Bearer tk_s3cret\\"q\\\\z"'
@@ -1201,3 +1235,82 @@ def test_this_repo_has_dependabot_for_both_workflow_trees():
     [gha] = [u for u in cfg["updates"] if u["package-ecosystem"] == "github-actions"]
     assert set(gha["directories"]) == {"/", "/templates"}
     assert gha["schedule"]["interval"] == "weekly"
+
+
+# ─── security gate pass 2 on PR #39 ──────────────────────────────────────────
+
+# SC-29: values from publish are job outputs; notify accepts only this repo's
+# own PR URL and a plain date.
+@pytest.mark.parametrize("url", [
+    "https://evil.example/o/r/pull/1", "https://github.com/o/other/pull/1", "https://github.com/o/r/pull/1x",
+    "https://github.com/o/r/pull/1\nTitle: forged", "https://github.com/o/r/pull/",
+])
+def test_notify_ignores_a_forged_pr_url(tmp_path, shim_path, url):
+    env = {**NOTIFY_ENV, "PR_OK_URL": url}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert argv is None, "nothing may be posted for a forged URL"
+    assert "malformed PR URL" in proc.stdout
+
+
+@pytest.mark.parametrize("override", [
+    {"PR_OK_URL": "https://evil.example/o/r/pull/1"},
+    {"DATE_STR": "2026-10-10) evil"},
+])
+def test_brain_ignores_forged_values(tmp_path, shim_path, override):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, **{**BRAIN_ENV, **override})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert argv is None
+
+
+def test_notify_reports_a_refused_publish(tmp_path, shim_path):
+    env = {**NOTIFY_ENV, "PUBLISH_RESULT": "failure", "PR_OK_URL": ""}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="", **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Title: auto-apply REFUSED: o/r" in argv
+
+
+# SC-19: the authority is checked before urlsplit; pnpm specifiers are an
+# allow-list. Each spelling is tried in an npm lockfile and in pnpm-lock.
+URL_SPELLINGS = [
+    ("https://evil.example\\@registry.npmjs.org/a.tgz", "authority"),
+    ("https://user@registry.npmjs.org/a.tgz", "authority"),
+    ("https://registry.npmjs.org @evil.example/a.tgz", "authority"),
+    ("../x", "new URL"),
+    ("owner/repo", "new URL"),
+]
+
+
+@pytest.mark.parametrize("url,expect", URL_SPELLINGS)
+def test_npm_lock_resolved_spellings(tmp_path, shim_path, url, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": lock_with()},
+            lambda r: write(r, "package-lock.json",
+                            lock_with(**{"node_modules/b": {"version": "1.0.0", "resolved": url}})), expect=expect)
+
+
+@pytest.mark.parametrize("url,expect", [u for u in URL_SPELLINGS if "://" in u[0]])
+def test_pnpm_tarball_spellings(tmp_path, shim_path, url, expect):
+    added = "  b@1.0.0:\n    resolution: {tarball: " + url + "}\n"
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM + added), expect=expect)
+
+
+@pytest.mark.parametrize("spec", [
+    "owner/repo", "../x", "https://registry.npmjs.org/b/-/b-1.0.0.tgz", "workspace:*", "catalog:", "npm:evil@git+x",
+    "user/repo#semver:^1.0.0", "git+x", "1.0.0 || evil/x", "^1.0.0 evil", "file:../x",
+])
+def test_pnpm_specifier_allow_list_refuses(tmp_path, shim_path, spec):
+    added = "      b:\n        specifier: " + spec + "\n"
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM.replace("\npackages:", added + "\npackages:")),
+            expect="is not a version range")
+
+
+@pytest.mark.parametrize("spec", ["^1.2.0", "'~1.2.3'", '">=1.0.0 <2.0.0"', "1.2.3", "npm:@scope/pkg@^1.2.0", "latest",
+                                  "1.x", "*", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "1.0.0-beta.1", "npm:pkg@~2.1.0"])
+def test_pnpm_specifier_allow_list_accepts(tmp_path, shim_path, spec):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", PNPM.replace("specifier: ^1.0.0", "specifier: " + spec))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr

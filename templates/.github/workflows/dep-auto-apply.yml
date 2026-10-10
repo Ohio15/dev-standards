@@ -14,9 +14,10 @@ name: Dependency Auto-Apply (Layer B)
 #            produces is trusted. It hands over one artifact: a `git diff` of
 #            the allow-listed manifests/lockfiles (ALLOWED_MANIFEST_RE below)
 #            plus a result.json of per-ecosystem flags and notes.
-#   publish  contents: write, pull-requests: write, and the notification
-#            secrets, which live in the `auto-apply-publish` environment (the
-#            repo owner gives it a default-branch-only deployment policy).
+#   publish  contents: write, pull-requests: write. NO secrets: it runs a
+#            third-party action (create-pull-request), and an action release
+#            can poison $GITHUB_PATH/$GITHUB_ENV for every later step of its
+#            job (audit gate pass 2, SC-29).
 #            Runs NO dependency code (no install, no build, no test, no setup-*
 #            toolchain, nothing from the repo's node_modules). Fresh checkout of
 #            the same commit; the artifact is read as DATA, never executed.
@@ -33,16 +34,25 @@ name: Dependency Auto-Apply (Layer B)
 #                             is a plain version
 #              pnpm-lock      every added line: URLs only https on known hosts,
 #                             no protocol prefix (file:, link:, git...), no
-#                             scp-style git ref
+#                             scp-style git ref; a `specifier:` must be a
+#                             version/range, optionally npm:-aliased
+#              (any URL)      refused if its authority holds a backslash,
+#                             userinfo (`@`) or whitespace, before parsing
 #              go.mod         parsed by directive, single-line and block form:
 #                             only require/go/toolchain may change; replace,
 #                             exclude, retract and the rest must equal the base
 #              go.sum         hash lines only
 #              requirements   pinned specs (== / ~=), markers, --hash only
 #            Added lines over 4096 chars are refused before any regex runs.
-#            Then create-pull-request with add-paths = exactly those files,
-#            then ntfy + shared-brain.
-# Both jobs refuse any ref but the default branch (job if: and a first step).
+#            Then create-pull-request with add-paths = exactly those files.
+#   notify   permissions {}, the two notification secrets, run: steps only
+#            (no action at all, no dependency code). Gets the PR URLs and
+#            date from publish as job outputs, through env:, and accepts
+#            only this repo's own PR URL and a plain date.
+# publish and notify declare environment `auto-apply-publish`, which the
+# repo owner gives a default-branch-only deployment policy; the secrets are
+# environment secrets there.
+# Every job refuses any ref but the default branch (job if: and a first step).
 # Both jobs run on vars.CI_RUNNER when set: that runner (nexus-ci) is an
 # ephemeral VM per job. A persistent runner would carry the apply job's
 # compromise into publish and void this boundary; never point CI_RUNNER at one.
@@ -82,7 +92,7 @@ name: Dependency Auto-Apply (Layer B)
 #   a scanner could not run              -> apply fails; no PR; ntfy if configured
 #   the patch fails validation           -> publish fails; no PR; ntfy if configured
 #
-# Notifications (publish job only):
+# Notifications (notify job only):
 #   ntfy: OFF unless the repo/org variable DEP_AUTO_APPLY_NTFY_URL is set
 #   (full topic URL). That URL is an operator-owned sink: whoever can set the
 #   variable receives the post AND the DEP_AUTO_APPLY_NTFY_TOKEN bearer (sent
@@ -796,7 +806,10 @@ jobs:
           overwrite: true
 
   # ===================================================================
-  # publish: the ONLY job with a write token or a secret. It runs no
+  # publish: the ONLY job with a write token. It holds NO secret: it runs a
+  # third-party action (create-pull-request), and anything an action release
+  # does to $GITHUB_PATH/$GITHUB_ENV reaches every later step of its job, so
+  # the notification secrets live in the separate `notify` job. It runs no
   # dependency code. Do not add an install, build, test or setup-* step here;
   # scripts/tests/test_dep_auto_apply_workflow.py fails the build if you do
   # (it also pins the exact run: bodies of this job).
@@ -807,17 +820,22 @@ jobs:
       && needs.apply.outputs.enrolled == 'true'
       && (needs.apply.result == 'failure'
           || (needs.apply.result == 'success' && needs.apply.outputs.any_changed == 'true'))
-    # The secrets belong in this environment, created by the repo owner with a
-    # deployment policy that admits the default branch only (README, Layer B).
-    # Then a workflow_dispatch of some other branch's edited copy of this file
-    # cannot reach them, whatever that copy says. GitHub creates the
-    # environment unprotected on first use if it is missing; the policy is
-    # the operator's step, never this workflow's.
+    # The environment's deployment policy (default branch only, set by the
+    # repo owner; README, Layer B) gates this write-token job and `notify`,
+    # which holds the secrets. A workflow_dispatch of another branch's edited
+    # copy of this file cannot pass it, whatever that copy says. GitHub
+    # creates the environment unprotected on first use if it is missing; the
+    # policy is the operator's step, never this workflow's.
     environment: auto-apply-publish
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
+    # Read by `notify` through env: and validated there.
+    outputs:
+      pr_ok_url: ${{ steps.pr_ok.outputs.pull-request-url }}
+      pr_broken_url: ${{ steps.pr_broken.outputs.pull-request-url }}
+      date_str: ${{ steps.verify.outputs.date_str }}
     steps:
       - name: Refuse to run from any ref but the default branch
         id: ref_guard
@@ -879,7 +897,16 @@ jobs:
           REQ_SPEC = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?(?:==|~=)[A-Za-z0-9.*+!-]+")
           REQ_MARKER = re.compile(r"[A-Za-z0-9_.<>=!~'\" ()-]*")
           REQ_HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
-          URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>,}]+")
+          # semver version / comparator / range grammar (node-semver shapes).
+          _VER = r"v?(?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+          _COMP = r"(?:[~^]|[<>]=?|=)?" + _VER
+          _SET = rf"(?:{_VER} - {_VER}|{_COMP}(?: {_COMP})*)"
+          _RANGE = rf"{_SET}(?: ?\|\| ?{_SET})*"
+          PNPM_SPEC = re.compile(
+              rf"(?:npm:(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@)?(?:{_RANGE}|[a-z][a-z0-9-]{{0,63}})")
+          # Runs to the next delimiter, not the next space, so whitespace
+          # inside an authority is caught by the authority check.
+          URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^'\"<>,}\r\n]*[^\s'\"<>,}]")
           # Protocol prefixes npm/pnpm use for non-registry sources.
           LOCAL_REF = re.compile(
               r"(?:^|[\s'\"{,(])(?:link|file|portal|workspace|git|git\+[a-z]+|github|gitlab|bitbucket"
@@ -1005,6 +1032,14 @@ jobs:
               return lines
 
           def https_on_known_host(path, url, known):
+              # urlsplit and the fetcher can disagree on where the host is
+              # (`https://evil.example\@registry.npmjs.org/`); refuse any
+              # authority with a backslash, userinfo or whitespace first.
+              m = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://([^/]*)", url)
+              if not m:
+                  die(f"{path}: new URL {url!r} (only https to a host the lockfile already used)")
+              if re.search(r"[\\@\s]", m.group(1)):
+                  die(f"{path}: URL authority {m.group(1)!r} has a backslash, userinfo or whitespace")
               parts = urlsplit(url)
               if parts.scheme != "https" or parts.hostname not in known:
                   die(f"{path}: new URL {url!r} (only https to a host the lockfile already used)")
@@ -1071,6 +1106,15 @@ jobs:
           def check_lock_lines(path, old, lines):
               known = (DEFAULT_HOSTS | {urlsplit(u).hostname for u in URL.findall(old or "")}) - {None}
               for ln in lines:
+                  # Allow-list, not deny-list: a specifier is a version, a range
+                  # or a plain dist-tag, optionally npm:-aliased. Anything else
+                  # (owner/repo shorthand, relative paths, tarball URLs, git,
+                  # link:, workspace:, catalog:) is refused.
+                  stripped = ln.strip()
+                  if stripped.startswith("specifier:"):
+                      spec = stripped[len("specifier:"):].strip().strip("'").strip('"')
+                      if not PNPM_SPEC.fullmatch(spec):
+                          die(f"{path}: specifier {spec!r} is not a version range")
                   for url in URL.findall(ln):
                       https_on_known_host(path, url, known)
                   if LOCAL_REF.search(ln):
@@ -1309,52 +1353,96 @@ jobs:
           delete-branch: false
           sign-commits: false
 
-      # ------------------------------------------------------ notifications
+  # ===================================================================
+  # notify: the ONLY job holding DEP_AUTO_APPLY_NTFY_TOKEN and
+  # SHARED_BRAIN_TOKEN. It runs no action at all (run: steps only) and no
+  # dependency code, so neither a dependency nor a third-party action release
+  # (create-pull-request lives in publish) can poison $GITHUB_PATH/$GITHUB_ENV
+  # ahead of a step that reads a secret. Values from publish arrive as job
+  # outputs, through env:, and are validated before use.
+  notify:
+    needs: [apply, publish]
+    if: >-
+      always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      && needs.apply.outputs.enrolled == 'true'
+      && (needs.apply.result == 'failure' || needs.publish.result == 'failure'
+          || needs.publish.outputs.pr_ok_url != '' || needs.publish.outputs.pr_broken_url != '')
+    # The secrets live in this environment (default-branch-only deployment
+    # policy, README Layer B). publish declares it too: the policy then also
+    # gates the job that holds the write token.
+    environment: auto-apply-publish
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions: {}
+    steps:
+      - name: Refuse to run from any ref but the default branch
+        id: ref_guard
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::dep-auto-apply runs only from refs/heads/$DEFAULT_BRANCH; this run is $REF"
+            exit 1
+          fi
+
       # Opt-in: the post names the repo and the PR, so it goes only to a
       # topic the repo owner configured (DEP_AUTO_APPLY_NTFY_URL), never to a
       # built-in public one.
       - name: Notify ntfy (PR opened, tests failed, or run failed)
         id: notify
-        if: >-
-          always() && vars.DEP_AUTO_APPLY_NTFY_URL != ''
-          && (needs.apply.result == 'failure' || failure()
-              || steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url)
+        if: vars.DEP_AUTO_APPLY_NTFY_URL != ''
         shell: bash
         env:
           NTFY_URL: ${{ vars.DEP_AUTO_APPLY_NTFY_URL }}
           NTFY_TOKEN: ${{ secrets.DEP_AUTO_APPLY_NTFY_TOKEN }}
           APPLY_RESULT: ${{ needs.apply.result }}
-          JOB_STATUS: ${{ job.status }}
-          PR_OK_URL: ${{ steps.pr_ok.outputs.pull-request-url }}
-          PR_BROKEN_URL: ${{ steps.pr_broken.outputs.pull-request-url }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PR_OK_URL: ${{ needs.publish.outputs.pr_ok_url }}
+          PR_BROKEN_URL: ${{ needs.publish.outputs.pr_broken_url }}
           REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           case "$NTFY_URL" in
             https://*) ;;
             *) echo "::warning::DEP_AUTO_APPLY_NTFY_URL is not an https:// URL; not posting"; exit 0 ;;
           esac
+          # A PR URL from publish is accepted only as this repo's own PR URL.
+          pr_url_ok() { local p="$SERVER_URL/$REPO/pull/"; [[ "$1" == "$p"* ]] && [[ "${1#"$p"}" =~ ^[0-9]+$ ]]; }
+          ok_url=""; broken_url=""
+          if [ -n "${PR_OK_URL:-}" ]; then
+            if pr_url_ok "$PR_OK_URL"; then ok_url=$PR_OK_URL; else echo "::warning::ignoring a malformed PR URL from publish"; fi
+          fi
+          if [ -n "${PR_BROKEN_URL:-}" ]; then
+            if pr_url_ok "$PR_BROKEN_URL"; then broken_url=$PR_BROKEN_URL; else echo "::warning::ignoring a malformed PR URL from publish"; fi
+          fi
+          run_url="$SERVER_URL/$REPO/actions/runs/$RUN_ID"
           if [ "$APPLY_RESULT" = "failure" ]; then
             title="auto-apply FAILED: ${REPO}"
-            body="Weekly auto-apply could not examine every ecosystem. Run: ${RUN_URL}"
+            body="Weekly auto-apply could not examine every ecosystem. Run: ${run_url}"
             tags="rotating_light,auto-apply-failed"
             prio="urgent"
-          elif [ "$JOB_STATUS" = "failure" ]; then
+          elif [ "$PUBLISH_RESULT" = "failure" ]; then
             title="auto-apply REFUSED: ${REPO}"
-            body="The publish job refused or could not open the auto-apply PR (patch validation or PR step failed). Run: ${RUN_URL}"
+            body="The publish job refused or could not open the auto-apply PR (patch validation or PR step failed). Run: ${run_url}"
             tags="rotating_light,auto-apply-failed"
             prio="urgent"
-          elif [ -n "${PR_BROKEN_URL:-}" ]; then
+          elif [ -n "$broken_url" ]; then
             title="auto-apply BROKEN: ${REPO}"
-            body="Tests failed on weekly auto-apply. Draft PR: ${PR_BROKEN_URL}"
+            body="Tests failed on weekly auto-apply. Draft PR: ${broken_url}"
             tags="warning,auto-apply-broken"
             prio="urgent"
-          else
+          elif [ -n "$ok_url" ]; then
             title="auto-apply PR: ${REPO}"
-            body="Weekly auto-apply opened a PR: ${PR_OK_URL}"
+            body="Weekly auto-apply opened a PR: ${ok_url}"
             tags="white_check_mark,auto-apply"
             prio="default"
+          else
+            echo "::warning::nothing valid to notify about"
+            exit 0
           fi
           # The bearer header goes to curl as a config on stdin (-K -), never
           # in argv, which any process on the runner can read.
@@ -1376,14 +1464,15 @@ jobs:
 
       - name: Brain ingest (PR opened only)
         id: brain
-        if: steps.pr_ok.outputs.pull-request-url || steps.pr_broken.outputs.pull-request-url
+        if: needs.publish.outputs.pr_ok_url != '' || needs.publish.outputs.pr_broken_url != ''
         shell: bash
         env:
           BRAIN_TOKEN: ${{ secrets.SHARED_BRAIN_TOKEN }}
-          PR_OK_URL: ${{ steps.pr_ok.outputs.pull-request-url }}
-          PR_BROKEN_URL: ${{ steps.pr_broken.outputs.pull-request-url }}
+          PR_OK_URL: ${{ needs.publish.outputs.pr_ok_url }}
+          PR_BROKEN_URL: ${{ needs.publish.outputs.pr_broken_url }}
+          DATE_STR: ${{ needs.publish.outputs.date_str }}
           REPO: ${{ github.repository }}
-          DATE_STR: ${{ steps.verify.outputs.date_str }}
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
           if [ -z "${BRAIN_TOKEN:-}" ]; then
@@ -1395,7 +1484,17 @@ jobs:
             url="${PR_BROKEN_URL}"
           else
             kind="auto-apply"
-            url="${PR_OK_URL}"
+            url="${PR_OK_URL:-}"
+          fi
+          # Values from publish: this repo's own PR URL and a plain date only.
+          prefix="$SERVER_URL/$REPO/pull/"
+          if [[ "$url" != "$prefix"* ]] || ! [[ "${url#"$prefix"}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::ignoring a malformed PR URL from publish; no brain ingest"
+            exit 0
+          fi
+          if ! [[ "${DATE_STR:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::warning::ignoring a malformed date from publish; no brain ingest"
+            exit 0
           fi
           payload=$(jq -nc \
             --arg c "${kind} PR opened on ${REPO} (${DATE_STR}): ${url}" \
