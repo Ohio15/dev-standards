@@ -1,0 +1,20 @@
+# dev-standards' own Dependabot config, modelled on the copy install.sh seeds
+# into consumer repos (templates/.github/dependabot.yml). Every workflow here
+# pins its actions to a full commit SHA, and a SHA pin never moves by itself:
+# without this file the pins go stale and miss upstream security fixes
+# (SC-25). Dependabot bumps the SHA pins and their same-line version comments.
+# Both workflow trees are listed so one grouped PR bumps .github/workflows and
+# templates/.github/workflows together (tests require dep-auto-apply.yml and
+# its template to stay byte-identical).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /templates
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
