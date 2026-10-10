@@ -146,22 +146,27 @@ jobs declare `environment: release-promoter`, run only when
 Those checks live in the workflow file, and a `workflow_dispatch` runs the
 dispatched ref's own copy of the file, so they stop an unmodified copy
 dispatched from a branch and nothing more. The boundary is repository
-configuration the owner creates:
+configuration, which exists (2026-10-10):
 
-1. Environment `release-promoter` with a deployment-branch policy of `main`
-   only. Move `RELEASE_PROMOTER_PRIVATE_KEY` into it as an environment
-   secret, then delete the repository-level secret. A required reviewer is
-   optional and costly here: it would gate every monitor cycle and every
-   re-dispatch (about four approvals per RC), and a run waiting for approval
-   holds the single-flight concurrency group.
-2. A ruleset on `main` requiring a pull request, and a ruleset on
-   `refs/tags/v*` restricting update and deletion to the release-promoter App.
+1. Environment `release-promoter`: required reviewer Ohio15, deployment
+   policies `main` (branch) and `v*` (tag), `RELEASE_PROMOTER_PRIVATE_KEY`
+   set as an environment secret. The required reviewer gates every job run
+   of this workflow (each tag-rc, monitor cycle and self-re-dispatch, about
+   four approvals per RC), and a run waiting for approval holds the
+   single-flight concurrency group.
+2. Ruleset 24843941 on `refs/heads/main`: pull request required, required
+   checks `size-guard` and `Audit summary (always runs)`, no force push, no
+   deletion; sole bypass actor the release-promoter App (5165373), which
+   pushes the state commits.
+3. Ruleset 24843943 on `refs/tags/v*`: no update, deletion or force push;
+   bypass actor the release-promoter App (5165373).
 
-GitHub creates an environment named in a workflow on its first use with no
-protection rules, and repository-level secrets remain visible to environment
-jobs, so this workflow keeps working on the repository secret until step 1 is
-complete. Until it is, anyone who can push a branch can still dispatch an
-edited copy of this workflow and use the key.
+One step remains: delete the REPOSITORY-level `RELEASE_PROMOTER_PRIVATE_KEY`
+immediately after the workflow declaring `environment: release-promoter` is
+merged. Repository secrets are visible to every job, so until it is deleted
+an edited copy dispatched from a pushed branch can still read the key.
+Deleting it before that merge breaks the old workflow, which declares no
+environment.
 
 ### Canary contract (sibling C2 owns)
 
@@ -232,7 +237,8 @@ ensures push-storms during rapid main commits all get tagged in order.
 | Failure | Behaviour |
 |---|---|
 | Release-promoter token not minted | tag-rc job fails fast with explicit error; monitor job same. |
-| Dispatched from a ref other than `main` | The job `if:` skips it; an edited copy that drops the `if:` fails at the first step. An edited copy that drops both is stopped only by the environment branch policy (see "Storage and trust boundary"). |
+| Dispatched from a ref other than `main` | The job `if:` skips it; an edited copy that drops the `if:` fails at the first step. An edited copy that drops both is stopped by the environment's deployment policy and required reviewer, once the repository-level secret is deleted (see "Storage and trust boundary"). |
+| Promotion of a legacy `pin_canary: false` RC | Refused: `Promote v1` requires `current_rc_canary_ref == current_rc_sha`; greens from a canary calling `@main` never move `v1`. |
 | HEAD is not `origin/main` HEAD | Behind main (push storm): tag-rc stands down and the newer push run tags. Not on main at all: tag-rc fails. |
 | App lacks `workflows: write` | The pin-token mint fails and tag-rc fails before tagging anything, with an error naming the permission. |
 | Canary `release.yml` has no `uses: Ohio15/dev-standards/...` line | tag-rc fails before tagging. |
@@ -256,10 +262,11 @@ ensures push-storms during rapid main commits all get tagged in order.
 
 2. **Self-promotion guard.** This workflow lives in `dev-standards`; if a
    commit to `dev-standards/main` regresses `promote-canary.yml` itself,
-   the broken workflow could mis-promote v1. There is NO mitigation today:
-   as of 2026-10-10 `main` has no branch protection, no ruleset and no
-   required review (audit-dev-standards-2026-10-10). The owner-created
-   controls under "Storage and trust boundary" are the mitigation. Future:
+   the broken workflow could mis-promote v1. Mitigation: ruleset 24843941
+   requires a pull request and the `size-guard` and
+   `Audit summary (always runs)` checks for every change to `main` (no
+   approving review is required), and every promoter job waits on the
+   `release-promoter` environment's required reviewer. Future:
    the canary should itself test changes to `promote-canary.yml` (a
    self-host pattern), tracked separately from IMPL-11.
 

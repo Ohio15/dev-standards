@@ -37,14 +37,19 @@ name: promote-canary
 #   DISPATCHED REF's copy of the file, so a pushed branch that edits them away
 #   is not stopped by them. They close the no-edit variant (dispatching an
 #   unmodified copy from a branch) and nothing more. The real boundary is
-#   repository configuration the owner creates, not this file:
-#     - environment `release-promoter` with a deployment-branch policy of
-#       `main` only, holding RELEASE_PROMOTER_PRIVATE_KEY as an ENVIRONMENT
-#       secret, and the repository-level secret of that name deleted;
-#     - a ruleset on `main` (PR required) and on `refs/tags/v*` (no update or
-#       deletion except by the release-promoter App).
-#   Until both exist, anyone who can push a branch can still dispatch an
-#   edited copy and use the repository-level key. See release/SPEC.md.
+#   repository configuration, which exists (2026-10-10):
+#     - environment `release-promoter`: required reviewer Ohio15, deployment
+#       policies `main` (branch) and `v*` (tag), RELEASE_PROMOTER_PRIVATE_KEY
+#       set as an environment secret;
+#     - ruleset 24843941 on refs/heads/main: PR required, required checks
+#       `size-guard` + `Audit summary (always runs)`, no force push, no
+#       deletion; sole bypass actor the release-promoter App (5165373), which
+#       is how this workflow's state commits reach main;
+#     - ruleset 24843943 on refs/tags/v*: no update, deletion or force; App
+#       5165373 bypass.
+#   One step remains: delete the REPOSITORY-level RELEASE_PROMOTER_PRIVATE_KEY
+#   immediately after this workflow (with `environment:`) is on main. Until
+#   then a dispatched edited copy can still read it. See release/SPEC.md.
 #
 # Cross-repo prereqs:
 #   vars.RELEASE_PROMOTER_APP_ID + secrets.RELEASE_PROMOTER_PRIVATE_KEY
@@ -117,8 +122,10 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: write    # to push v1-rcN, fast-forward v1, and commit state file
+# GITHUB_TOKEN gets nothing. Every write (tags, state commits, dispatches, the
+# v1 move) and the checkout itself use the release-promoter App token; the
+# jobs repeat `permissions: {}` so a later job cannot inherit a grant.
+permissions: {}
 
 concurrency:
   # Single-flight. Two simultaneous tag-rc runs would race on N selection;
@@ -150,6 +157,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && github.event.inputs.force_action == 'tag-rc'))
     runs-on: ubuntu-latest
     environment: release-promoter
+    permissions: {}
     outputs:
       rc_tag: ${{ steps.cut.outputs.rc_tag }}
       rc_sha: ${{ steps.cut.outputs.rc_sha }}
@@ -543,6 +551,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && (github.event.inputs.force_action == 'monitor' || github.event.inputs.force_action == 'reset')))
     runs-on: ubuntu-latest
     environment: release-promoter
+    permissions: {}
     steps:
       # First step, before any key material: see "Trust boundary" above for
       # why this is necessary but not sufficient.
@@ -634,6 +643,7 @@ jobs:
           rc=$(jq -r '.current_rc // empty' "$STATE_FILE")
           rc_sha=$(jq -r '.current_rc_sha // empty' "$STATE_FILE")
           canary_sha=$(jq -r '.current_rc_canary_sha // empty' "$STATE_FILE")
+          canary_ref=$(jq -r '.current_rc_canary_ref // empty' "$STATE_FILE")
           rc_at=$(jq -r '.current_rc_created_at // empty' "$STATE_FILE")
           green=$(jq -r '.consecutive_green_runs' "$STATE_FILE")
           last_run_id=$(jq -r '.last_observed_run_id // empty' "$STATE_FILE")
@@ -642,6 +652,7 @@ jobs:
             echo "rc=$rc"
             echo "rc_sha=$rc_sha"
             echo "canary_sha=$canary_sha"
+            echo "canary_ref=$canary_ref"
             echo "rc_at=$rc_at"
             echo "green=$green"
             echo "last_run_id=$last_run_id"
@@ -730,6 +741,11 @@ jobs:
         run: |
           set -euo pipefail
           gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
+          # Run names and URLs come from the canary repo and are written to
+          # GITHUB_OUTPUT (first_red) and into a workflow command later: strip
+          # control characters (a newline would inject an output key) and the
+          # '|' field separator.
+          JQ_CLEAN='def clean: tostring | gsub("[[:cntrl:]|]"; " "); '
           if ! [[ "$CANARY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::State has no current_rc_canary_sha (primed before schema_version 2). It cannot be scored against a canary commit; dispatch force_action=tag-rc from main to re-cut."
             exit 1
@@ -756,8 +772,8 @@ jobs:
           echo "in_flight=${in_flight}" >> "$GITHUB_OUTPUT"
           echo "::notice::Canary has ${total} release.yml run(s) at ${RC} @ ${CANARY_SHA:0:7}."
 
-          foreign=$(jq -r '.foreign | (.[0] // null)
-            | if . == null then "none" else "\(.id)|foreign_head_sha:\(.head_sha)|\(.html_url)|\(.name)" end' /tmp/runs.json)
+          foreign=$(jq -r "${JQ_CLEAN}"'.foreign | (.[0] // null)
+            | if . == null then "none" else "\(.id)|foreign_head_sha:\(.head_sha | clean)|\(.html_url | clean)|\(.name | clean)" end' /tmp/runs.json)
 
           # Reduce to runs that have terminated (status=completed). In-flight
           # runs are simply not yet eligible — we will see them next cycle.
@@ -791,10 +807,10 @@ jobs:
           # completed history at this RC. STANDARDS section 5: "any canary
           # red blocks v1 promotion" — a transient red and then 3 greens does
           # NOT promote. We require a clean record at this RC.
-          first_red=$(jq -r '
+          first_red=$(jq -r "${JQ_CLEAN}"'
             [.[] | select(.conclusion != "success")]
             | (.[0] // null)
-            | if . == null then "none" else "\(.id)|\(.conclusion)|\(.html_url)|\(.name)" end
+            | if . == null then "none" else "\(.id)|\(.conclusion | clean)|\(.html_url | clean)|\(.name | clean)" end
           ' /tmp/completed.json)
 
           # Greens count in the window (newest first), but only if no red
@@ -945,8 +961,16 @@ jobs:
           GREEN_THRESHOLD: ${{ env.GREEN_THRESHOLD }}
           RC: ${{ steps.state.outputs.rc }}
           RC_SHA: ${{ steps.state.outputs.rc_sha }}
+          CANARY_REF: ${{ steps.state.outputs.canary_ref }}
         run: |
           set -euo pipefail
+          # Only canary evidence that ran the RC commit may move v1. A legacy
+          # pin_canary=false RC (canary called @main) tested main at run time,
+          # not RC_SHA, so its greens never promote (SC-30).
+          if ! [[ "$RC_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$CANARY_REF" != "$RC_SHA" ]; then
+            echo "::error::Canary ref '${CANARY_REF}' is not the RC commit ${RC_SHA}; its runs did not test this RC. Refusing to promote. Re-cut with force_action=tag-rc (pin_canary=true)."
+            exit 1
+          fi
           gh_curl() { printf 'header = "Authorization: Bearer %s"\n' "$T" | curl -K - -H "Accept: application/vnd.github+json" "$@"; }
           # Bind the promotion to main and the RC: the state's RC_SHA must be
           # what the RC tag in this repo points at, and must be on main.

@@ -66,9 +66,25 @@ jobs:
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
+# Any way a job can reach a secret: `secrets.X` / `secrets['X']` /
+# `secrets["X"]` in any case, `toJSON(secrets)`, or a `secrets: inherit` /
+# `secrets:` mapping on a reusable-workflow call. Case-insensitive because
+# Actions expressions are.
+SECRET_TOKEN = re.compile(r"secrets\s*(\.\s*[A-Za-z0-9_-]+|\[\s*['\"][^'\"]*['\"]\s*\]|\)|\b)", re.I)
+
+
+def secret_refs(obj) -> list[str]:
+    """Every secret reference spelling in a parsed workflow fragment."""
+    text = yaml.safe_dump(obj, width=10_000)
+    refs = [m.group(0) for m in SECRET_TOKEN.finditer(text)]
+    if isinstance(obj, dict) and "secrets" in obj:
+        refs.append(f"secrets: {obj['secrets']}")
+    return refs
+
+
 def key_jobs() -> dict[str, dict]:
-    found = {name: job for name, job in JOBS.items() if KEY_REF in yaml.safe_dump(job)}
-    assert found, "no job references the release-promoter key; the test is looking at the wrong file"
+    found = {name: job for name, job in JOBS.items() if secret_refs(job)}
+    assert found, "no job references any secret; the test is looking at the wrong file"
     return found
 
 
@@ -213,6 +229,36 @@ REL = ".github/workflows/release.yml"
 
 # ─── structural: the key is bound to main and an environment ────────────────
 
+def test_secret_scan_finds_every_mint_site():
+    # Self-test of the scanner: the workflow has three App-token mints (tag-rc
+    # general + canary pin, monitor general). A scan finding fewer is broken.
+    mints = [(j, s) for j, s in all_steps()
+             if any(r == KEY_REF for r in secret_refs(s))]
+    assert len(mints) >= 3, mints
+    assert {j for j, _ in mints} == {"tag-rc", "monitor"}
+
+
+def test_secret_scan_catches_other_spellings():
+    for spelling in ("${{ secrets['RELEASE_PROMOTER_PRIVATE_KEY'] }}", '${{ SECRETS.release_promoter_private_key }}',
+                     "${{ toJSON(secrets) }}", "${{ secrets[format('{0}', 'X')] }}"):
+        assert secret_refs({"run": f"echo {spelling}"}), spelling
+    assert secret_refs({"uses": "o/r/.github/workflows/x.yml@" + "a" * 40, "secrets": "inherit"})
+
+
+def test_the_only_secret_reference_is_the_exact_promoter_key():
+    # No job reaches a secret by any other spelling, nor any other secret.
+    for name, job in JOBS.items():
+        for ref in secret_refs(job):
+            assert ref == KEY_REF, f"{name}: secret reached as {ref!r}"
+    assert secret_refs(WORKFLOW.get("env", {})) == []
+
+
+def test_github_token_gets_no_permissions():
+    assert WORKFLOW["permissions"] == {}
+    for name, job in JOBS.items():
+        assert job.get("permissions") == {}, f"{name}: GITHUB_TOKEN permissions not dropped to none"
+
+
 def test_every_key_job_requires_main_in_its_if():
     for name, job in key_jobs().items():
         cond = job.get("if", "")
@@ -327,6 +373,28 @@ def test_promote_step_binds_rc_sha_to_its_tag_and_main():
     assert body.index("merge-base --is-ancestor") < body.index("-X PATCH")
 
 
+def run_promote_guard(tmp_path: Path, canary_ref: str):
+    env = {**os.environ, "T": TOKEN, "RC": RC_TAG, "RC_SHA": RC_SHA, "CANARY_REF": canary_ref,
+           "STATE_FILE": "x", "STABLE_TAG": "v1", "GREEN_THRESHOLD": "3",
+           # No git and no curl reachable: anything past the guard fails fast.
+           "PATH": "/nonexistent"}
+    return subprocess.run([bash_exe(), "-c", step("monitor", "Promote v1")["run"]], cwd=tmp_path,
+                          env=env, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("ref", ["main", "", "a" * 40])
+def test_promote_refuses_evidence_that_did_not_run_the_rc_commit(tmp_path, ref):
+    proc = run_promote_guard(tmp_path, ref)
+    assert proc.returncode == 1
+    assert "Refusing to promote" in proc.stdout
+
+
+def test_promote_guard_passes_a_pinned_rc(tmp_path):
+    proc = run_promote_guard(tmp_path, RC_SHA)
+    assert "Refusing to promote" not in proc.stdout
+    assert proc.returncode != 0  # reached the git fetch, which cannot run here
+
+
 def test_state_schema_is_documented_at_version_2():
     doc = (ROOT / "release" / "canary-promotion.md").read_text(encoding="utf-8")
     assert '"schema_version": 2' in doc
@@ -431,6 +499,9 @@ def test_release_run_at_another_commit_blocks_promotion(fake_env):
     assert proc.returncode == 0, proc.stderr
     assert o["verdict"] == "red"
     assert "foreign_head_sha" in o["first_red"]
+    # The scored population is the pinned commit only, independently of the
+    # foreign-run block (each guard must hold on its own).
+    assert o["completed"] == "3"
 
 
 @needs_jq
@@ -440,6 +511,19 @@ def test_any_red_at_the_rc_blocks_even_after_greens(fake_env):
     proc, o = score(fake_env, runs)
     assert proc.returncode == 0, proc.stderr
     assert o["verdict"] == "red"
+
+
+@needs_jq
+def test_canary_run_name_cannot_inject_an_output_key(fake_env):
+    evil = "Release\nverdict=green\ngreens_in_window=3|x"
+    runs = [run_obj(1, REL, CANARY_PINNED, "failure", name=evil, minute=1)]
+    proc, _ = score(fake_env, runs)
+    assert proc.returncode == 0, proc.stderr
+    lines = fake_env["out"].read_text(encoding="utf-8").splitlines()
+    assert "verdict=green" not in lines and "greens_in_window=3|x" not in lines
+    first_red = [ln for ln in lines if ln.startswith("first_red=")]
+    assert len(first_red) == 1 and first_red[0].count("|") == 3
+    assert [ln for ln in lines if ln.startswith("verdict=")] == ["verdict=red"]
 
 
 @needs_jq
