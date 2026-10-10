@@ -244,9 +244,22 @@ repo waits its turn.
   (records actual deployed-and-healthy state) but requires the registry
   to be in place first — Phase 1C dependency.
 - Self-hosted runner security: Docker-socket access lets a compromised
-  workflow take over NEXUS. Mitigate with branch protection (only `main`
-  + tags can dispatch deploy jobs) and required reviews on workflow file
-  changes in this repo.
+  workflow take over NEXUS. The same exposure applies to the release-promoter
+  App key in `promote-canary.yml`, which can move `v1` for every consumer.
+  Controls that EXIST in this repo as of 2026-10-10: none at the repository
+  level. `main` has no branch protection, no ruleset, no required review, and
+  the repository has no environments (audit-dev-standards-2026-10-10, HIGH 1).
+  In-workflow checks only: the promoter jobs run only when
+  `github.ref == 'refs/heads/main'` and re-assert it as their first step, but
+  a `workflow_dispatch` runs the dispatched ref's own copy of the file, so an
+  edited copy on any pushed branch drops both. Controls the OWNER must create
+  to make this a boundary: (1) a ruleset on `main` requiring a pull request
+  (review on workflow-file changes) and a ruleset on `refs/tags/v*`
+  restricting update and deletion to the release-promoter App; (2) an
+  environment `release-promoter` with a deployment-branch policy of `main`
+  only, holding `RELEASE_PROMOTER_PRIVATE_KEY` as an environment secret, with
+  the repository-level secret deleted (optional required reviewer: see
+  `canary-promotion.md` for its per-cycle cost).
 
 ## Runner selection
 
