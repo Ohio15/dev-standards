@@ -106,6 +106,9 @@ docker:
         # Rare: bake a secret into the image. Emits a ::warning:: per build.
         # NPM_TOKEN: ${secrets.NPM_READ_TOKEN}
   deploy:
+    # The whole deploy block is ignored when the caller passes the
+    # `nexus_deploy_stack` workflow input: the root-owned nexus-deploy helper
+    # (Ohio15/infra) then owns source, compose, health and rollback.
     nexus_path: ~/Sentinel      # cwd on NEXUS for `docker compose up -d`
     compose_file: docker-compose.yml
     services: [backend, frontend]   # which services to roll. Compose entries

@@ -202,6 +202,8 @@ Per the lesson from the `tj-actions/changed-files` Mar-2025 supply-chain attack:
 
 Requirements: `gh` authenticated with `repo` scope, ssh access to `ohio_@100.98.48.63` (Tailscale), and passwordless sudo on NEXUS. On success the script prints `<runner-name>: online` and exits 0; on any failure it prints `<runner-name>: ERROR: <reason>` and exits 1.
 
+Stacks migrated to the root-owned NEXUS helper (Ohio15/infra `nexus-deploy/`) pass `nexus_deploy_stack: <stack>` instead and deploy from a `runner-<stack>` runner; see the input's description in `docker-release.yml`. Tests (stack-name guard, exit-code map, mutation battery): `python -m pytest scripts/tests/test_docker_release_helper.py -q`, gated on commit by `.pre-commit-tests`.
+
 ## Hygiene automation
 
 Two scripts under `scripts/` keep repos honest. Both are stdlib-only (Python 3.8+ / bash + jq + curl), idempotent, and side-effect-free on the scanned repos.

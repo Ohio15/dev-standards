@@ -1,0 +1,8 @@
+# Parsed (never sourced) by .githooks/pre-commit-tests.sh. Keys: TEST_CMD,
+# TEST_TIMEOUT, TEST_PATHS. Scoped to the docker-release helper-mode guard
+# (PR #38, SC-14): the full scripts/tests suite is not gated here because it
+# is red on main (test_action_pins: version comment above a pin, 5 cases).
+# `python` first: on Windows `python3` is often the Store stub.
+TEST_CMD=py="$(command -v python || command -v python3)"; "$py" -m pytest scripts/tests/test_docker_release_helper.py -q
+TEST_TIMEOUT=300
+TEST_PATHS=.github/workflows/docker-release.yml|scripts/tests/test_docker_release_helper.py|.pre-commit-tests

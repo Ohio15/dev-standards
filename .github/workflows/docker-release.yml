@@ -17,6 +17,23 @@ name: docker-release
 #   - Compose file uses `image: ghcr.io/<owner>/<repo>-<svc>:dollar-IMAGE_TAG-or-latest`
 #     so the deploy can swap tags atomically and roll back.
 #
+# ─── Helper mode (nexus_deploy_stack input) ──────────────────────────────────
+# Set `nexus_deploy_stack: <stack>` once the stack is registered with the
+# root-owned NEXUS helper (Ohio15/infra nexus-deploy/) and its deploy runner
+# runs as the `runner-<stack>` user (label still `nexus-deploy`). Step 3 then
+# becomes a single `sudo -n /usr/local/sbin/nexus-deploy <stack> deploy v<version>`;
+# the legacy GHCR-login/checkout/compose/health/version-probe/rollback steps
+# are skipped because the helper does source sync, digest pinning, policy,
+# health (including the version match), audit and rollback itself.
+# docker.deploy.nexus_path is not needed in this mode. Helper exit codes map
+# to the deploy_status / rolled_back outputs so the notify job is unchanged:
+#   0 ok (healthy) | 2 usage | 3 denied (authorization, policy, source or
+#   pre-flight) | 4 health/audit failed, rolled back | 5 rollback failed |
+#   6 stack lock held by another run | 7 status drift (status only) |
+#   8 rate bound | 1 anything else.
+# Leaving the input empty (the default) keeps the legacy ohio_-runner path
+# exactly as before.
+#
 # ─── Build-arg substitution ──────────────────────────────────────────────────
 # Each `docker.images[*].build_args` map in release-config.yml is passed to
 # `docker/build-push-action`. Values support two placeholder forms that are
@@ -106,6 +123,21 @@ on:
           Empty (the default) means the probe is skipped with a `::warning::`,
           which is intentional during the soak window so consumers without an
           IMPL-26-compliant /health shape are not auto-blocked.
+          Ignored in helper mode (nexus_deploy_stack set): the helper's own
+          health check already requires `.version` to equal the tag.
+      nexus_deploy_stack:
+        type: string
+        default: ''
+        description: |
+          Name of the stack registered in /etc/nexus-deploy/stacks/<stack>.json
+          on NEXUS. When set, the deploy job runs
+          `sudo -n /usr/local/sbin/nexus-deploy <stack> deploy v<version>` on a
+          nexus-deploy runner registered as the runner-<stack> user, and the
+          legacy checkout/compose/health/rollback steps are skipped because the
+          helper does source sync, digest pinning, policy, health, audit and
+          rollback itself. Use it once the stack has been migrated to the
+          helper (infra nexus-deploy/README.md runbook); leave it empty to keep
+          the legacy ohio_-runner deploy. Must match ^[a-z][a-z0-9-]{0,31}$.
 
 permissions:
   contents: read
@@ -388,18 +420,76 @@ jobs:
     needs: [read-docker-config, build-and-push]
     # A consumer with no docker.deploy block (the canary) has nothing to
     # deploy and no nexus-deploy runner; without this gate the job waits
-    # for a runner forever and the run never completes.
-    if: needs.read-docker-config.outputs.nexus_path != ''
+    # for a runner forever and the run never completes. Helper mode
+    # (nexus_deploy_stack) needs no nexus_path: the helper owns the source.
+    if: needs.read-docker-config.outputs.nexus_path != '' || inputs.nexus_deploy_stack != ''
     runs-on: [self-hosted, nexus-deploy]
     outputs:
-      deploy_status: ${{ steps.healthcheck.outputs.status }}
-      rolled_back: ${{ steps.rollback.outputs.rolled_back }}
+      # Exactly one of each pair runs, so the fallback only ever picks the
+      # active mode's value; legacy mode output is unchanged.
+      deploy_status: ${{ steps.healthcheck.outputs.status || steps.helper.outputs.status }}
+      rolled_back: ${{ steps.rollback.outputs.rolled_back || steps.helper.outputs.rolled_back }}
     steps:
+      - name: Deploy via nexus-deploy helper
+        id: helper
+        if: inputs.nexus_deploy_stack != ''
+        shell: bash
+        env:
+          STACK: ${{ inputs.nexus_deploy_stack }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+          # C collation so [a-z] means ASCII a-z only, whatever the runner locale.
+          export LC_ALL=C
+          stack_re='^[a-z][a-z0-9-]{0,31}$'
+          if ! [[ "${STACK}" =~ ${stack_re} ]]; then
+            echo "::error::nexus_deploy_stack is not a valid stack name (must match ${stack_re})"
+            {
+              echo "status=invalid-stack"
+              echo "rolled_back=false"
+              echo "exit_code=2"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # stdout/stderr go straight to the log: the helper prints its own
+          # ::error:: lines and masks env values, so nothing is piped or filtered.
+          set +e
+          sudo -n /usr/local/sbin/nexus-deploy "${STACK}" deploy "v${VERSION}"
+          rc=$?
+          set -e
+
+          rolled_back=false
+          case "${rc}" in
+            0) status=healthy;        meaning="ok" ;;
+            2) status=usage;          meaning="usage error" ;;
+            3) status=denied;         meaning="denied (authorization, policy, source or pre-flight)" ;;
+            4) status=unhealthy;      meaning="health/audit failed and the stack was rolled back"; rolled_back=true ;;
+            5) status=unhealthy;      meaning="rollback failed; manual intervention required"; rolled_back=failed ;;
+            6) status=locked;         meaning="another run holds the stack lock" ;;
+            7) status=drift;          meaning="status drift (status subcommand only)" ;;
+            8) status=rate-limited;   meaning="runner exceeded the per-stack rate bound" ;;
+            *) status=failed;         meaning="unexpected failure" ;;
+          esac
+          {
+            echo "status=${status}"
+            echo "rolled_back=${rolled_back}"
+            echo "exit_code=${rc}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::nexus-deploy ${STACK} deploy v${VERSION} exited ${rc}: ${meaning}"
+            exit 1
+          fi
+          echo "nexus-deploy ${STACK} deploy v${VERSION}: ${meaning}"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.nexus_deploy_stack == ''
         with:
           persist-credentials: false
 
       - name: Login to GHCR
+        if: inputs.nexus_deploy_stack == ''
         shell: bash
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -410,6 +500,7 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Sync nexus_path to tagged commit
+        if: inputs.nexus_deploy_stack == ''
         shell: bash
         env:
           NEXUS_PATH: ${{ needs.read-docker-config.outputs.nexus_path }}
@@ -432,6 +523,7 @@ jobs:
 
       - name: Record current image digests for rollback
         id: snapshot
+        if: inputs.nexus_deploy_stack == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -454,6 +546,7 @@ jobs:
 
       - name: Deploy new image
         id: deploy
+        if: inputs.nexus_deploy_stack == ''
         shell: bash
         env:
           IMAGE_TAG: v${{ needs.build-and-push.outputs.version }}
@@ -472,6 +565,7 @@ jobs:
 
       - name: Health check
         id: healthcheck
+        if: inputs.nexus_deploy_stack == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -511,13 +605,24 @@ jobs:
         #     shape) has propagated and consumers with multiple version.json
         #     files (IMPL-5 root-cause class) have migrated.
         # Search this file for "SOAK_END_2026-05-15" when flipping.
+        #
+        # Helper mode: skipped with a status (existing skipped-* pattern). The
+        # helper's health check already requires `.version` == tag, and the
+        # runner-<stack> uid is egress-fenced from loopback, so a localhost
+        # probe from here could not reach the service anyway.
         shell: bash
         env:
+          HELPER_STACK: ${{ inputs.nexus_deploy_stack }}
           PROBE_URL: ${{ inputs.version_probe_url }}
           NEXUS_PATH: ${{ needs.read-docker-config.outputs.nexus_path }}
           EXPECTED_VERSION: ${{ needs.build-and-push.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -n "${HELPER_STACK}" ]; then
+            echo "::notice::Helper mode: nexus-deploy verified the deployed version during its own health check; IMPL-15 probe skipped."
+            echo "status=skipped-helper-mode" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "${PROBE_URL}" ]; then
             echo "::warning::version_probe_url not set on caller workflow — post-deploy version-match probe (IMPL-15) skipped. Add `version_probe_url: http://localhost:<port>/api/health` to the caller's \`with:\` block to enable. See dev-standards STANDARDS section 8."
             echo "status=skipped-no-url" >> "$GITHUB_OUTPUT"
@@ -574,7 +679,7 @@ jobs:
 
       - name: Rollback on health failure
         id: rollback
-        if: failure() && needs.read-docker-config.outputs.rollback_on_health_fail == 'true'
+        if: failure() && inputs.nexus_deploy_stack == '' && needs.read-docker-config.outputs.rollback_on_health_fail == 'true'
         shell: bash
         env:
           NEW_VERSION: v${{ needs.build-and-push.outputs.version }}
@@ -622,7 +727,7 @@ jobs:
 
   notify:
     needs: [read-docker-config, build-and-push, deploy]
-    if: always() && needs.read-docker-config.outputs.nexus_path != ''
+    if: always() && (needs.read-docker-config.outputs.nexus_path != '' || inputs.nexus_deploy_stack != '')
     runs-on: [self-hosted, nexus-deploy]
     steps:
       - name: Publish ntfy
