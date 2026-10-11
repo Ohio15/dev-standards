@@ -218,3 +218,89 @@ def test_scan_repo_includes_independence_findings(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(hygiene, "scan_hook_drift", lambda r: [])
     report = hygiene.scan_repo(repo, age_threshold=7)
     assert "independence-runbook-missing" in codes(report["findings"])
+
+
+# --- unexamined is not clean (gate pass 1 on PR #45, SC-07) -------------------
+
+def test_oversized_runtime_file_is_reported_unexamined_not_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file the scan could not read must surface as unexamined; silently
+    skipping it would let a vendor literal inside it pass as clean."""
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/big.ts", "// " + "x" * 80 + "\nfetch('https://api.openai.com');\n"))
+    found = codes(hygiene.scan_independence(repo, tracked))
+    assert "independence-ai-vendor-runtime" not in found
+    f = found["independence-unexamined"]
+    assert f["severity"] == "LOW"
+    assert f["count"] == 1
+    assert f["items"][0]["path"] == "src/big.ts"
+    assert f["items"][0]["kind"] == "runtime-source"
+    assert "exceeds" in f["items"][0]["reason"]
+    assert "not clean" in f["note"]
+
+
+def test_unreadable_runtime_file_is_reported_unexamined(tmp_path: Path) -> None:
+    repo, tracked = conforming(tmp_path)
+    tracked.append("src/missing.ts")  # tracked in the index, absent from the tree
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-unexamined"]
+    assert f["items"] == [{"path": "src/missing.ts", "kind": "runtime-source", "reason": "unreadable: FileNotFoundError"}]
+
+
+def test_oversized_adr_and_workflow_are_reported_unexamined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A skipped ADR cannot grant an exemption and a skipped workflow body cannot
+    prove a release path; both are named so the HIGH/MEDIUM verdicts are read
+    with their blind spots."""
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    repo, tracked = conforming(tmp_path)
+    # no workflow named for release: the body read is the only way to prove one
+    tracked = [t for t in tracked if t != ".github/workflows/release.yml"]
+    tracked.append(write(repo, "docs/adr/0001-llm.md", "# ADR\n" + "api.openai.com " * 20))
+    tracked.append(write(repo, ".github/workflows/ci.yml", "name: ci\n" + "# " + "y" * 80 + "\n"))
+    found = codes(hygiene.scan_independence(repo, tracked))
+    assert "independence-no-release-workflow" in found  # unproven, so still owed
+    kinds = sorted((i["kind"], i["path"]) for i in found["independence-unexamined"]["items"])
+    assert kinds == [("adr", "docs/adr/0001-llm.md"), ("workflow", ".github/workflows/ci.yml")]
+
+
+def test_readable_clean_file_is_neither_flagged_nor_unexamined(tmp_path: Path) -> None:
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/clean.ts", "export const n = 1;\n"))
+    found = codes(hygiene.scan_independence(repo, tracked))
+    assert "independence-ai-vendor-runtime" not in found
+    assert "independence-unexamined" not in found
+
+
+# --- suffix-aware comment rule ----------------------------------------------
+
+def test_json_line_led_by_semicolon_or_hash_is_data_not_comment(tmp_path: Path) -> None:
+    """JSON has no comment syntax; a `;`- or `#`-led line is a value and still a literal."""
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "config/a.json", '{\n; "llm": "https://api.openai.com"\n}\n'))
+    tracked.append(write(repo, "config/b.json", '{\n# "llm": "https://api.anthropic.com"\n}\n'))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-ai-vendor-runtime"]
+    assert sorted(i["path"] for i in f["items"]) == ["config/a.json", "config/b.json"]
+
+
+def test_semicolon_is_a_comment_only_in_ini(tmp_path: Path) -> None:
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "config/app.ini", "; https://api.openai.com is documented, not used\nhost = ${LLM_HOST}\n"))
+    tracked.append(write(repo, "src/llm.py", "; 'https://api.openai.com'\n"))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-ai-vendor-runtime"]
+    assert [i["path"] for i in f["items"]] == ["src/llm.py"]
+
+
+def test_hash_is_not_a_comment_in_c_family_source(tmp_path: Path) -> None:
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/llm.cs", '#region\nvar u = "https://api.openai.com";\n#endregion\n'))
+    tracked.append(write(repo, "src/pre.ts", '# "https://api.mistral.ai"\n'))
+    tracked.append(write(repo, "src/ok.py", "# https://api.cohere.com is never called\n"))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-ai-vendor-runtime"]
+    assert sorted(i["path"] for i in f["items"]) == ["src/llm.cs", "src/pre.ts"]
+
+
+def test_xaml_comment_and_double_slash_in_xaml_data(tmp_path: Path) -> None:
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/ok.xaml", "<!-- https://api.openai.com documented -->\n"))
+    tracked.append(write(repo, "src/bad.xaml", '<TextBlock Text="// https://api.openai.com"/>\n'))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-ai-vendor-runtime"]
+    assert [i["path"] for i in f["items"]] == ["src/bad.xaml"]

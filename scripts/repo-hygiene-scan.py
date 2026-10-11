@@ -151,8 +151,23 @@ RUNTIME_SOURCE_SUFFIXES = {
 # Path segments that mark test code, which §13 AI-1 does not govern.
 TEST_PATH_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "fixtures", "mocks", "testdata"}
 # A line that is only a comment is not a call. Crude by design: a host inside a
-# string literal on a code line is still flagged.
-COMMENT_LINE_RE = re.compile(r"^\s*(//|#|/\*|\*|///|<!--|;)")
+# string literal on a code line is still flagged. Which prefixes count as a
+# comment depends on the language: `;` is a comment only in .ini, and JSON has
+# no comments at all, so a `;`- or `#`-led JSON line is data and stays flagged.
+_HASH_COMMENT = ("#",)
+_C_FAMILY_COMMENT = ("///", "//", "/*", "*")
+COMMENT_PREFIXES_BY_SUFFIX: dict[str, tuple[str, ...]] = {
+    ".py": _HASH_COMMENT, ".sh": _HASH_COMMENT, ".ps1": _HASH_COMMENT, ".psm1": _HASH_COMMENT,
+    ".yml": _HASH_COMMENT, ".yaml": _HASH_COMMENT, ".toml": _HASH_COMMENT, ".rb": _HASH_COMMENT,
+    ".env.example": _HASH_COMMENT,
+    ".ini": ("#", ";"),
+    ".cs": _C_FAMILY_COMMENT, ".ts": _C_FAMILY_COMMENT, ".tsx": _C_FAMILY_COMMENT,
+    ".js": _C_FAMILY_COMMENT, ".jsx": _C_FAMILY_COMMENT, ".mjs": _C_FAMILY_COMMENT, ".cjs": _C_FAMILY_COMMENT,
+    ".go": _C_FAMILY_COMMENT, ".rs": _C_FAMILY_COMMENT, ".java": _C_FAMILY_COMMENT, ".kt": _C_FAMILY_COMMENT,
+    ".swift": _C_FAMILY_COMMENT, ".php": _C_FAMILY_COMMENT + _HASH_COMMENT,
+    ".xaml": ("<!--",),
+    ".json": (),
+}
 ADR_PATH_RE = re.compile(r"(^|/)(docs/)?adr[s]?/|(^|/)adr-\d+|(^|/)ADR", re.IGNORECASE)
 MAX_RUNTIME_SOURCE_BYTES = 1024 * 1024  # skip anything bigger; not hand-written code
 
@@ -565,23 +580,39 @@ def _is_test_path(rel: str) -> bool:
     return ".test." in name or ".spec." in name or name.endswith(("_test.go", "_test.py", "tests.cs", "test.cs"))
 
 
-def _read_text_capped(path: Path) -> str | None:
+def _is_comment_line(rel: str, line: str) -> bool:
+    """True when `line` is a comment in the language `rel`'s suffix implies.
+    Unknown suffixes have no comment syntax here, so every line is a call site."""
+    lower = rel.lower()
+    for suf in sorted(COMMENT_PREFIXES_BY_SUFFIX, key=len, reverse=True):
+        if lower.endswith(suf):
+            return line.lstrip().startswith(COMMENT_PREFIXES_BY_SUFFIX[suf])
+    return False
+
+
+def _read_text_capped(path: Path) -> tuple[str | None, str | None]:
+    """(text, None) when the file was read; (None, reason) when it was NOT
+    examined. Callers must surface the second shape: a file the scan skipped is
+    unexamined, never clean."""
     try:
-        if path.stat().st_size > MAX_RUNTIME_SOURCE_BYTES:
-            return None
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+        size = path.stat().st_size
+        if size > MAX_RUNTIME_SOURCE_BYTES:
+            return None, f"size {size} bytes exceeds {MAX_RUNTIME_SOURCE_BYTES}-byte cap"
+        return path.read_text(encoding="utf-8", errors="replace"), None
+    except OSError as e:
+        return None, f"unreadable: {e.__class__.__name__}"
 
 
-def _adr_mentions(repo: Path, tracked: list[str]) -> set[str]:
+def _adr_mentions(repo: Path, tracked: list[str], skipped: list[dict[str, str]]) -> set[str]:
     """Hosts named in any tracked ADR document. §13.3 item 3: a runtime AI-vendor
     dependency is admissible only with an ADR that names the provider."""
     hosts: set[str] = set()
     for rel in tracked:
         if not rel.lower().endswith(".md") or not ADR_PATH_RE.search(rel):
             continue
-        text = _read_text_capped(repo / rel)
+        text, skip = _read_text_capped(repo / rel)
+        if skip:
+            skipped.append({"path": rel, "kind": "adr", "reason": skip})
         if not text:
             continue
         for host in AI_VENDOR_HOSTS:
@@ -598,6 +629,9 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
     path (AI-1). The tag-without-workflow-run check named in §13.4 needs the
     GitHub API and is not part of this pass."""
     findings: list[dict[str, Any]] = []
+    # Files this pass could not read. "Unknown is never clean": they are reported,
+    # not silently treated as conforming.
+    skipped: list[dict[str, str]] = []
     mode, mode_error = read_independence_mode(repo)
     if mode_error:
         findings.append({
@@ -616,13 +650,15 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
                     "reproduce is non-conforming (STANDARDS §13 AI-4)",
         })
 
-    workflows = [t for t in tracked_set if t.startswith(".github/workflows/") and t.endswith((".yml", ".yaml"))]
+    workflows = sorted(t for t in tracked_set if t.startswith(".github/workflows/") and t.endswith((".yml", ".yaml")))
     has_release_wf = False
     for wf in workflows:
         if RELEASE_WORKFLOW_NAME_RE.search(Path(wf).name):
             has_release_wf = True
             break
-        body = _read_text_capped(repo / wf)
+        body, skip = _read_text_capped(repo / wf)
+        if skip:
+            skipped.append({"path": wf, "kind": "workflow", "reason": skip})
         if body and RELEASE_WORKFLOW_BODY_RE.search(body):
             has_release_wf = True
             break
@@ -637,7 +673,7 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
         })
 
     if mode == "full":
-        exempt = _adr_mentions(repo, tracked)
+        exempt = _adr_mentions(repo, tracked, skipped)
         hits: list[dict[str, str]] = []
         for rel in sorted(tracked_set):
             lower = rel.lower()
@@ -645,14 +681,16 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
                 continue
             if _is_test_path(rel) or lower.startswith(".github/"):
                 continue
-            text = _read_text_capped(repo / rel)
+            text, skip = _read_text_capped(repo / rel)
+            if skip:
+                skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
             if not text:
                 continue
             for host in AI_VENDOR_HOSTS:
                 if host in exempt or host not in text:
                     continue
                 for n, line in enumerate(text.splitlines(), 1):
-                    if host in line and not COMMENT_LINE_RE.match(line):
+                    if host in line and not _is_comment_line(rel, line):
                         hits.append({"path": rel, "line": n, "host": host})
                         break
         if hits:
@@ -664,6 +702,16 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
                 "exempt_by_adr": sorted(exempt),
                 "note": "AI-vendor host literal on a runtime path with no ADR naming it (STANDARDS §13 AI-1 / §13.3 item 3)",
             })
+    if skipped:
+        findings.append({
+            "severity": "LOW",
+            "code": "independence-unexamined",
+            "mode": mode,
+            "count": len(skipped),
+            "items": skipped[:20],
+            "note": "files this pass could not read (oversized or unreadable): not examined, not clean; "
+                    "the §13 verdicts above exclude them",
+        })
     return findings
 
 
