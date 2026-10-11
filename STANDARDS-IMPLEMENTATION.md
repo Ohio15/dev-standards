@@ -45,6 +45,7 @@ Companion to `STANDARDS.md`. Each row is an AS-IS → TO-BE gap with a stable ID
 | IMPL-31 | Five gate items shipped in warn-mode (continue-on-error: true) through 2026-05-15. After soak: flip to blocking | Mechanical edit: delete `continue-on-error: true` lines + soak-end comment from each new gate job. Items: IMPL-5, IMPL-7 (×3 jobs: govulncheck/pip_audit/cargo_audit), IMPL-15 | S | P1 | blocked — preflight could not run 2026-05-15 (remote agent MCP scoped to dev-standards only; cannot reach consumer repos). Issue #2 filed. Flip deferred until preflight passes manually. | After soak window |
 | IMPL-32 | Once warn-mode soak ends (2026-05-15), enrolled repos that fail the new gates need fixing before next release. Pre-existing CVEs in APM (Go-side criticals already bumped this session, but other consumers may have similar gaps), version-uniqueness gaps, healthcheck-shape violations | Pre-flight: dry-run each new gate against every enrolled repo's HEAD before 2026-05-15. File per-repo issues for any failures. Resolve before flip | M | P1 | open | After IMPL-31 |
 | IMPL-33 | dev-standards reusable workflows (`docker-release.yml`, `release-gates.yml`) read `release-config.yml` from consumer repo root only — no `config_path` input. Blocks clean matrix-variant tag dispatch in canary; C2 worked around it via `scripts/stage-variant.sh` (promote-then-restore) | Add `config_path` + `working_directory` inputs to `docker-release.yml` and `release-gates.yml`. Default to `.` (current behavior). Canary's matrix variants then pass per-variant paths cleanly. Removes `stage-variant.sh` workaround | S | P1 | open | Discovered by C2 during IMPL-11 multi-variant work |
+| IMPL-34 | §13 Application Independence Floor (ratified 2026-10-11) has no enforcement: AIBrowser releases since 2.25.1 were agent-run from a brain-stored runbook; no repo has `RELEASE.md`; signing-key backup unverified | (a) `repo-hygiene-scan.py` check `independence` (missing RELEASE.md HIGH, no release workflow HIGH, tag without workflow run or manual-release note MEDIUM, AI-vendor host literal in runtime source without ADR MEDIUM); (b) `release-gates.yml` job `independence-note` in warn-mode; (c) AIWebBrowser `docs/RELEASE.md` from brain `d3b146a5`; (d) confirm `aibrowser-codesign.pfx` 1Password item; (e) `independence:` key in `release-config.yml` schema | M | P1 | open | Advisory first, flip per §4 rollout pattern. First consumer: AIWebBrowser |
 
 ---
 
@@ -52,7 +53,7 @@ Companion to `STANDARDS.md`. Each row is an AS-IS → TO-BE gap with a stable ID
 
 **P0 (7):** IMPL-10, IMPL-24, IMPL-28, IMPL-29 — plus done: IMPL-5 ✓, IMPL-7 ✓, IMPL-11 partial ✓, IMPL-15 ✓
 
-**P1 (15):** IMPL-1, IMPL-2, IMPL-4, IMPL-12, IMPL-16, IMPL-17, IMPL-19, IMPL-20, IMPL-21, IMPL-23, IMPL-26, IMPL-30, IMPL-31, IMPL-32, IMPL-33 — plus done: IMPL-9 ✓
+**P1 (16):** IMPL-1, IMPL-2, IMPL-4, IMPL-12, IMPL-16, IMPL-17, IMPL-19, IMPL-20, IMPL-21, IMPL-23, IMPL-26, IMPL-30, IMPL-31, IMPL-32, IMPL-33, IMPL-34 — plus done: IMPL-9 ✓
 
 **P2 (8):** IMPL-3, IMPL-6, IMPL-8, IMPL-13, IMPL-14, IMPL-22, IMPL-25, IMPL-27
 
@@ -64,7 +65,7 @@ Companion to `STANDARDS.md`. Each row is an AS-IS → TO-BE gap with a stable ID
 
 **S (small, sub-day):** IMPL-2, IMPL-3, IMPL-4, IMPL-5, IMPL-9, IMPL-12, IMPL-13, IMPL-14, IMPL-15, IMPL-16, IMPL-17, IMPL-18, IMPL-19, IMPL-20, IMPL-21, IMPL-22, IMPL-23, IMPL-25 — 18 items
 
-**M (1–3 days):** IMPL-1, IMPL-6, IMPL-7, IMPL-8, IMPL-10, IMPL-24, IMPL-26, IMPL-27 — 8 items
+**M (1–3 days):** IMPL-1, IMPL-6, IMPL-7, IMPL-8, IMPL-10, IMPL-24, IMPL-26, IMPL-27, IMPL-34 — 9 items
 
 **L (cross-cutting):** IMPL-11 (canary repo) — 1 item
 

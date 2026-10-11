@@ -501,6 +501,60 @@ These do NOT have a settled answer. Listed here so they don't get accidentally d
 
 9. **Retention of session-handoff memories beyond 90 days.** Section 1 says rolling 90 days. Question: should some session-handoffs auto-promote to `feedback` class if their lessons recurred? Open — needs the quarterly retrospective in section 9 to reveal patterns.
 
+## 13. Application Independence Floor
+
+**Ratified 2026-10-11 (Ron):** "application development, where applicable, is independent of AI and runs fully on its own infra as a complete deployable app."
+
+**Motivating case (AIBrowser 2.36.9, 2026-10-11):** the installed browser runs, polls, verifies and installs updates with no AI anywhere on the path — the source makes no AI-vendor call, and the agent surfaces (control plane, MCP bridge) are idle loopback listeners when no agent is attached. But every release since 2.25.1 was cut by an AI session following a brain-stored runbook because hosted Actions on Ohio15 is billing-blocked. Had the AI sessions stopped, the shipped app would have kept working and the *next* version could not have been produced without a human reconstructing the runbook. The app passed; the delivery path did not. This section makes both a requirement.
+
+**Rule:** every application or service Ron ships is a complete, deployable product that **runs, updates, and can be rebuilt and redeployed with no AI agent, AI vendor, or AI-mediated session in the loop.** AI may assist development. AI is never a runtime dependency, a release-path dependency, or the only holder of operational knowledge.
+
+### 13.1 Requirements
+
+| # | Requirement | Pass condition | Evidence lives in |
+|---|-------------|----------------|-------------------|
+| **AI-1 Runtime** | No AI-vendor API call on any startup, core-feature, update or recovery path. | App starts, performs its primary function, checks for and installs updates with every AI endpoint unreachable and no AI credential configured. | Harness/integration test with AI hosts blackholed, or a documented manual proof per release. |
+| **AI-2 AI-purpose apps** | Where the app's purpose *is* AI mediation (OpenClaw, personal-ai-pod, AIBrowser's agent surfaces), the AI layer is provider-plural and owner-chosen, and the non-AI functions still work with no provider configured. | Provider absent ⇒ feature reports "no provider", everything else unaffected. No single vendor is hard-wired. | Provider abstraction in code; AI-1 proof covers the non-AI core. |
+| **AI-3 Agent surfaces optional** | MCP servers, control planes, bridges and automation principals are add-ons. | App starts and functions with them disabled or unprovisioned. Their absence is never an error on the user's path. | Config flag or empty principal store exercised in the harness. |
+| **AI-4 Build & release by a human** | A human can cut a release from a checked-in runbook alone. | `docs/RELEASE.md` (or `RELEASE.md`) in the repo lists every step with exact commands, inputs, and the verification at the boundary. A release that was produced from a brain memory, a chat transcript or an agent's context is **non-conforming until the runbook is committed**. | Repo file; §6 provenance. |
+| **AI-5 Build & release by CI** | The same steps run unattended from a tag push. | A release workflow exists in the repo and the last tag either produced a release through it or the blocker is a tracked IMPL item with an owner and a closing condition. | `.github/workflows/`; §4 gates. |
+| **AI-6 Own infra** | Deployed to Ron-owned infrastructure (NEXUS, Hetzner, workstation). | No AI vendor hosts, stores, tunnels or serves any part of the running app or its update channel. Substitutable third parties (GitHub, Cloudflare, a registrar) are allowed and named in the runbook with their replacement path. | §7 deploy contracts; `release-config.yml`. |
+| **AI-7 Keys survive the machine** | Every secret or key the build, signing, deploy or update path needs is in 1Password (or a documented encrypted backup), not only on one workstation or in an agent's memory. | A fresh machine plus 1Password can reproduce a release. | 1Password item names in the runbook (never values). |
+| **AI-8 Operate by a human** | Install, update, rollback, backup and restore each have a written procedure and have been proven once at the observable boundary. | Each procedure cites the date and the boundary it was proven at. | `docs/OPERATIONS.md` or the runbook; §11. |
+
+### 13.2 Applicability
+
+- **Applies in full** to every application and service repo (AIWebBrowser, Sentinel, APM, ToolVault, PDFManager, GameManager, OpenClaw, n3xus-identity, personal-ai-pod, shared-brain-mcp, truck-mcp, …).
+- **Libraries, templates and tooling** (dev-standards, n3xus-notify, nexus-relay) inherit AI-4, AI-5 and AI-7.
+- **The AI harness itself** (cortex, cortex-hooks, cortex-core) is exempt from AI-1/2/3 by definition and still owes AI-4, AI-5 and AI-7.
+- **"Where applicable"** is decided per repo by Ron and recorded in `release-config.yml` as `independence: full | tooling | harness`. Absence of the key means `full`.
+
+### 13.3 What this changes in practice
+
+1. **Agent-run releases are debt, not a mode.** An AI session may cut a release *only* by executing the committed runbook verbatim. Each time it does, the session records the run in the release notes and in shared-brain as `manual-release` with the reason CI could not. Two consecutive agent-run releases on one repo open an IMPL item to restore CI.
+2. **Runbooks are files, not memories.** Brain memories may *point to* the runbook; they may not *be* it. The AIBrowser runbook `d3b146a5` is the first migration (see §13.5).
+3. **A new AI-vendor dependency is an ADR.** Adding any AI-vendor call to a runtime path requires an ADR that names the provider abstraction and the degraded behaviour, reviewed under the §4 gates.
+4. **Release notes carry the independence line.** Every release's notes state `independence: AI-1..AI-8 pass` or list the failing items with their IMPL numbers.
+
+### 13.4 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| `repo-hygiene-scan.py` check `independence` — advisory: missing `RELEASE.md`/`docs/RELEASE.md` (HIGH), no release workflow in a `full`/`tooling` repo (HIGH), release tag with no workflow run and no `manual-release` note (MEDIUM), AI-vendor host literal (`api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`, `localhost:11434`) in non-test runtime source of a `full` repo without an ADR reference (MEDIUM). | all Ron-owned repos, weekly | TO-BE — IMPL-34 |
+| Release-gate job `independence-note` — fails a release whose notes lack the independence line. | enrolled consumers | TO-BE — IMPL-34 (warn-mode first, per §4 rollout pattern) |
+| Session rule in global `CLAUDE.md` (Core Development Principle 5). | every AI session | ACTIVE 2026-10-11 |
+
+Findings are advisory until the gate flips; Ron triages weekly with the rest of the hygiene scan.
+
+### 13.5 State at ratification (2026-10-11)
+
+| Repo | AI-1 | AI-2/3 | AI-4 | AI-5 | AI-6 | AI-7 | AI-8 |
+|------|------|--------|------|------|------|------|------|
+| AIWebBrowser | pass (source-verified) | pass (loopback listeners idle without an agent) | **fail** — runbook lives in brain `d3b146a5` + `docs/draft/manual-release.md`; must land as `docs/RELEASE.md` | **blocked** — `release.yml` exists; Ohio15 Actions billing-blocked (every release since 2.25.1 agent-run) | pass (NEXUS, Traefik, Cloudflare DNS) | **unverified** — signing key `~/.codesigning/aibrowser-codesign.pfx` backup in 1Password not confirmed | partial — install/update proven; rollback/restore undocumented |
+| all other repos | not yet assessed | | | | | | |
+
+First actions: AIWebBrowser `docs/RELEASE.md` from the runbook; confirm the signing key's 1Password item; restore Actions billing or move the release workflow to the self-hosted `nexus-ci` runner. Assess the remaining repos in the first weekly hygiene scan after IMPL-34 lands.
+
 ---
 
 **End of v1.** Next retrospective: 2026-08-01 (quarterly). Living doc — all changes via PR with `docs(standards):` commit prefix. Companion: `STANDARDS-IMPLEMENTATION.md` for AS-IS → TO-BE work items.
