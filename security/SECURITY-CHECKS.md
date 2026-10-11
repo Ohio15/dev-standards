@@ -618,6 +618,85 @@ below the tolerance at the acceptance filter.
 **Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-35
 (LOW; approved by Ron 2026-10-09).
 
+### SC-39 · Code fetched over an unauthenticated channel and executed
+**Shape.** A script or binary is downloaded over HTTP (or over HTTPS with
+verification disabled) and run without a pinned hash or signature check:
+`iex (irm http://...)`, `DownloadString('http://...')`,
+`[scriptblock]::Create($downloaded)`, `Invoke-Expression` of a web response.
+This is worst when the run is elevated, and when an elevated child re-downloads
+instead of running the bytes already obtained. patriot-provisioning 2026-10-10:
+`setup-bootstrap.ps1` and `triage-workstation.ps1` (HIGH).
+**Check.** `grep -rnE "(iex|Invoke-Expression|ScriptBlock\]::Create|DownloadString)\b.*"
+--include=*.ps1` intersected with `http://` or a variable assigned from
+`Invoke-RestMethod` / `Invoke-WebRequest`. Every hit must verify a pinned
+SHA-256 or an Authenticode signer of the exact bytes before execution. Docs
+that tell an operator to paste such a one-liner count as siblings.
+**Fix form.** HTTPS with a pinned certificate, plus a pinned hash or signature
+of the executed bytes; elevated children run the verified bytes and never
+re-fetch.
+**Since.** 2026-10-10.
+**Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
+
+### SC-40 · Secret material embedded in generated script text
+**Shape.** A secret (decrypted password, token, key) is interpolated into the
+source text of a script that is then written to disk or compiled
+(`Set-Content *.ps1`, `[scriptblock]::Create`, `-replace '__PLACEHOLDER__'`).
+The file is a readable copy. On Windows PowerShell 5.1, a script block that also
+contains `Add-Type`, `DllImport` or other "suspicious" terms is auto-logged as
+event 4104 even with logging disabled, so the secret lands in the event log.
+patriot-provisioning 2026-10-10: `chrome-cred-migrate.ps1` Restore (HIGH).
+**Check.** `grep -nE "(-replace|\.Replace\(|-f ).*(__[A-Z0-9_]+__|\{[0-9]\})"
+--include=*.ps1`, then follow each result into `Set-Content`, `Out-File`,
+`ScriptBlock]::Create` or an Invoke-AsUser-style writer. Any hit whose inserted
+value derives from a secret is a finding. A test asserts the generated script
+text contains no secret value.
+**Fix form.** Pass secrets over an in-memory channel (WinRM argument, stdin,
+named pipe) or as an encrypted blob decrypted in-process; never in script
+source.
+**Since.** 2026-10-10.
+**Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
+
+### SC-41 · Privileged file or ACL operation on a path a lower-privileged principal can create or replace
+**Shape.** Admin or SYSTEM code writes, deletes, re-ACLs or takes ownership of a
+path inside a folder a standard user can create, own or modify: ProgramData
+subfolders created with `New-Item -Force`, user-profile subfolders, `/tmp` with
+a fixed name, or paths replayed from a collected baseline. There is no
+reparse-point check, so junctions and symlinks redirect the privileged
+operation. patriot-provisioning 2026-10-10: `parity-restore-acl.ps1` (HIGH),
+`lib.ps1` PatriotPrep and `/tmp/.cc_job.sh`, `chrome-reimport.ps1` Stage (MEDIUM).
+**Check.**
+- `grep -nE "icacls .*(/setowner|/grant)"` without `/L`;
+- `grep -nE "New-Item .*(ProgramData|Users\\\\).*-Force"` in privileged code;
+- `grep -nE "/tmp/[A-Za-z._-]+\b"` with a fixed name;
+- `grep -nE "Remove-Item .*-Recurse|WriteAllText|Set-Acl"` in code run as admin over WinRM.
+
+Each hit must refuse a pre-existing or reparse-point target, or operate by
+handle with `FILE_FLAG_OPEN_REPARSE_POINT`. A test plants a junction and asserts
+refusal.
+**Fix form.** Per-run, randomly named folders created with an explicit owner and
+DACL; refuse if the path exists; `/L` or handle-based operations;
+`mktemp` / `sudo sh -s`.
+**Since.** 2026-10-10.
+**Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
+
+### SC-42 · Credential authentication to a peer that is never authenticated
+**Shape.** A credential is presented to an endpoint whose identity is not
+verified: Negotiate/NTLM to a bare IP literal (no Kerberos, no server
+authentication), `-SkipCertificateCheck`, `-AcceptKey` / paramiko
+`AutoAddPolicy`, `verify=False`, or an http URL that carries a password.
+"Pinning" the address is treated as pinning the host. patriot-provisioning
+2026-10-10: WinRM to `192.168.0.180` with the fleet-shared PatriotUSA password,
+and DSM/SSH to the NAS (HIGH).
+**Check.** `grep -rnE "SkipCertificateCheck|AcceptKey|AutoAddPolicy|verify\s*=\s*False|-ComputerName\s+['\"]?[0-9]+(\.[0-9]+){3}"`.
+Every hit that carries a credential must pin a certificate fingerprint or host
+key and fail closed on a mismatch. Where a strong form exists elsewhere in the
+repo, the weak form is also SC-16.
+**Fix form.** Pinned certificate or host key (WinRM HTTPS, known_hosts with a
+reject policy); per-device credentials so that one capture does not open the
+fleet.
+**Since.** 2026-10-10.
+**Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -630,5 +709,6 @@ SC-22..SC-24 (audit-cortex-hooks-2026-09-15, approved 2026-09-16), SC-29..SC-31
 2026-10-05. SC-32..SC-34 (audit-infra-2026-10-08), approved 2026-10-08.
 SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
 and renumbered because those numbers were already graduated), approved
-2026-10-09. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
+2026-10-09. SC-39..SC-42 (audit-patriot-provisioning-2026-10-10), approved
+2026-10-10. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
 written as proposals; the numbers stay reserved.
