@@ -54,10 +54,27 @@ def test_every_action_is_sha_pinned_with_a_same_line_version(path: Path):
     assert bad == [], "want `uses: owner/repo@<40-hex> # vX.Y.Z`:\n" + "\n".join(bad)
 
 
+def detached_version_comments(lines: list[str]) -> list[str]:
+    """Version comments that sit above a `uses:` pin - the shape Dependabot never
+    rewrites. The walk from the comment to the pin steps over further comment
+    lines and blank lines only: a comment block ending in a pin is one detached
+    comment, while a version mentioned in prose that is followed by more prose
+    (a govulncheck compatibility note, say) is not the defect."""
+    bad = []
+    for i, line in enumerate(lines):
+        if not DETACHED_VERSION.match(line):
+            continue
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j].lstrip().startswith("#")):
+            j += 1
+        if j < len(lines) and USES.match(lines[j]):
+            bad.append(f"{i + 1}: {line.strip()}")
+    return bad
+
+
 @pytest.mark.parametrize("path", FILES, ids=IDS)
 def test_no_version_comment_on_a_line_of_its_own(path: Path):
-    bad = [f"{n}: {line.strip()}" for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-           if DETACHED_VERSION.match(line)]
+    bad = detached_version_comments(path.read_text(encoding="utf-8").splitlines())
     assert bad == [], "a version comment above a pin goes stale on the first Dependabot bump:\n" + "\n".join(bad)
 
 

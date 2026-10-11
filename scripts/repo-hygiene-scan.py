@@ -31,6 +31,15 @@ Findings (severity-tagged):
     MEDIUM  duplicate clones of one origin; loose files at a root;
             clean+merged worktree under D:/Worktrees; orphan folder there
     LOW     non-git orphan folder; D:/Scratch entry older than 30 days
+    Application independence floor (STANDARDS.md §13), per repo, mode from
+    release-config.yml `independence:` (full | tooling | harness; default
+    full):
+    HIGH    no committed release runbook (RELEASE.md or docs/RELEASE.md)
+            — a release that only an agent's memory can reproduce (AI-4)
+    HIGH    no release workflow under .github/workflows/ (AI-5)
+    MEDIUM  an AI-vendor host literal in non-test runtime source of a
+            `full` repo with no ADR naming that host (AI-1)
+    MEDIUM  release-config.yml `independence:` holds an unknown value
 
 Output:
     JSON      <output-dir>/hygiene-scan-<YYYY-MM-DD>.json
@@ -104,6 +113,63 @@ SUBMODULE_LS_REMOTE_TIMEOUT = 20  # seconds; a hung remote must not stall the sc
 # bare semver); complements the version-field diff check on package/version.json.
 VERSION_BUMP_SUBJECT_RE = re.compile(r"\bbump\b|\bv?\d+\.\d+\.\d+\b", re.IGNORECASE)
 VERSION_FILES = ("package.json", "version.json")
+
+# --- Application independence floor (STANDARDS.md §13) -------------------
+# Ratified 2026-10-11 after AIBrowser 2.36.9: the shipped app ran and updated
+# with no AI on the path, but every release since 2.25.1 had been cut by an AI
+# session from a runbook that existed only as a shared-brain memory. The floor
+# makes the DELIVERY path a committed, human-runnable artefact and keeps AI
+# vendors off the runtime path. The scan is advisory (IMPL-34); the warn-mode
+# release-gate job `independence-note` is its CI twin.
+INDEPENDENCE_MODES = ("full", "tooling", "harness")
+INDEPENDENCE_MODE_RE = re.compile(r"^independence:\s*([A-Za-z_-]+)\s*(?:#.*)?$", re.MULTILINE)
+INDEPENDENCE_RUNBOOKS = ("RELEASE.md", "docs/RELEASE.md")
+# A release workflow: named for it, or consuming the dev-standards release
+# workflows, or triggered by a v* tag push.
+RELEASE_WORKFLOW_NAME_RE = re.compile(r"release", re.IGNORECASE)
+RELEASE_WORKFLOW_BODY_RE = re.compile(
+    r"release-gates\.yml@|docker-release\.yml@|tags:\s*\n\s*-\s*['\"]?v\*", re.MULTILINE
+)
+# Hosts that identify an AI vendor on the wire. Matching is on the literal, so a
+# provider abstraction that reads the host from owner config is not flagged.
+AI_VENDOR_HOSTS = (
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "api.mistral.ai",
+    "api.cohere.com",
+    "api.groq.com",
+    "localhost:11434",
+    "127.0.0.1:11434",
+)
+# Runtime source: code and config that ships. Docs are prose, not a call path.
+RUNTIME_SOURCE_SUFFIXES = {
+    ".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs",
+    ".java", ".kt", ".swift", ".rb", ".php", ".ps1", ".psm1", ".sh", ".xaml",
+    ".json", ".yml", ".yaml", ".toml", ".ini", ".env.example",
+}
+# Path segments that mark test code, which §13 AI-1 does not govern.
+TEST_PATH_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "fixtures", "mocks", "testdata"}
+# A line that is only a comment is not a call. Crude by design: a host inside a
+# string literal on a code line is still flagged. Which prefixes count as a
+# comment depends on the language: `;` is a comment only in .ini, and JSON has
+# no comments at all, so a `;`- or `#`-led JSON line is data and stays flagged.
+_HASH_COMMENT = ("#",)
+_C_FAMILY_COMMENT = ("///", "//", "/*", "*")
+COMMENT_PREFIXES_BY_SUFFIX: dict[str, tuple[str, ...]] = {
+    ".py": _HASH_COMMENT, ".sh": _HASH_COMMENT, ".ps1": _HASH_COMMENT, ".psm1": _HASH_COMMENT,
+    ".yml": _HASH_COMMENT, ".yaml": _HASH_COMMENT, ".toml": _HASH_COMMENT, ".rb": _HASH_COMMENT,
+    ".env.example": _HASH_COMMENT,
+    ".ini": ("#", ";"),
+    ".cs": _C_FAMILY_COMMENT, ".ts": _C_FAMILY_COMMENT, ".tsx": _C_FAMILY_COMMENT,
+    ".js": _C_FAMILY_COMMENT, ".jsx": _C_FAMILY_COMMENT, ".mjs": _C_FAMILY_COMMENT, ".cjs": _C_FAMILY_COMMENT,
+    ".go": _C_FAMILY_COMMENT, ".rs": _C_FAMILY_COMMENT, ".java": _C_FAMILY_COMMENT, ".kt": _C_FAMILY_COMMENT,
+    ".swift": _C_FAMILY_COMMENT, ".php": _C_FAMILY_COMMENT + _HASH_COMMENT,
+    ".xaml": ("<!--",),
+    ".json": (),
+}
+ADR_PATH_RE = re.compile(r"(^|/)(docs/)?adr[s]?/|(^|/)adr-\d+|(^|/)ADR", re.IGNORECASE)
+MAX_RUNTIME_SOURCE_BYTES = 1024 * 1024  # skip anything bigger; not hand-written code
 
 # Drift detection constants
 NEXUS_HOST = "ohio_@100.98.48.63"
@@ -485,6 +551,170 @@ def scan_hook_drift(repo: Path, canonical_dir: Path = CANONICAL_HOOKS_DIR) -> li
     return findings
 
 
+def read_independence_mode(repo: Path) -> tuple[str, str | None]:
+    """Return (mode, error). Mode is the release-config.yml `independence:`
+    value, `full` when the file or key is absent (STANDARDS.md §13.2). An
+    unknown value is reported as `full` plus an error string, so a typo never
+    widens the exemption."""
+    cfg = repo / "release-config.yml"
+    if not cfg.is_file():
+        return "full", None
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "full", None
+    m = INDEPENDENCE_MODE_RE.search(text)
+    if not m:
+        return "full", None
+    value = m.group(1).strip().lower()
+    if value not in INDEPENDENCE_MODES:
+        return "full", f"release-config.yml independence: '{value}' is not one of {', '.join(INDEPENDENCE_MODES)}"
+    return value, None
+
+
+def _is_test_path(rel: str) -> bool:
+    parts = rel.replace("\\", "/").lower().split("/")
+    if any(seg in TEST_PATH_SEGMENTS for seg in parts[:-1]):
+        return True
+    name = parts[-1]
+    return ".test." in name or ".spec." in name or name.endswith(("_test.go", "_test.py", "tests.cs", "test.cs"))
+
+
+def _is_comment_line(rel: str, line: str) -> bool:
+    """True when `line` is a comment in the language `rel`'s suffix implies.
+    Unknown suffixes have no comment syntax here, so every line is a call site."""
+    lower = rel.lower()
+    for suf in sorted(COMMENT_PREFIXES_BY_SUFFIX, key=len, reverse=True):
+        if lower.endswith(suf):
+            return line.lstrip().startswith(COMMENT_PREFIXES_BY_SUFFIX[suf])
+    return False
+
+
+def _read_text_capped(path: Path) -> tuple[str | None, str | None]:
+    """(text, None) when the file was read; (None, reason) when it was NOT
+    examined. Callers must surface the second shape: a file the scan skipped is
+    unexamined, never clean."""
+    try:
+        size = path.stat().st_size
+        if size > MAX_RUNTIME_SOURCE_BYTES:
+            return None, f"size {size} bytes exceeds {MAX_RUNTIME_SOURCE_BYTES}-byte cap"
+        return path.read_text(encoding="utf-8", errors="replace"), None
+    except OSError as e:
+        return None, f"unreadable: {e.__class__.__name__}"
+
+
+def _adr_mentions(repo: Path, tracked: list[str], skipped: list[dict[str, str]]) -> set[str]:
+    """Hosts named in any tracked ADR document. §13.3 item 3: a runtime AI-vendor
+    dependency is admissible only with an ADR that names the provider."""
+    hosts: set[str] = set()
+    for rel in tracked:
+        if not rel.lower().endswith(".md") or not ADR_PATH_RE.search(rel):
+            continue
+        text, skip = _read_text_capped(repo / rel)
+        if skip:
+            skipped.append({"path": rel, "kind": "adr", "reason": skip})
+        if not text:
+            continue
+        for host in AI_VENDOR_HOSTS:
+            if host in text:
+                hosts.add(host)
+    return hosts
+
+
+def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
+    """STANDARDS.md §13 Application Independence Floor, advisory (IMPL-34).
+
+    Every mode owes a committed runbook (AI-4) and a release workflow (AI-5);
+    only `full` repos are scanned for AI-vendor host literals on the runtime
+    path (AI-1). The tag-without-workflow-run check named in §13.4 needs the
+    GitHub API and is not part of this pass."""
+    findings: list[dict[str, Any]] = []
+    # Files this pass could not read. "Unknown is never clean": they are reported,
+    # not silently treated as conforming.
+    skipped: list[dict[str, str]] = []
+    mode, mode_error = read_independence_mode(repo)
+    if mode_error:
+        findings.append({
+            "severity": "MEDIUM",
+            "code": "independence-mode-invalid",
+            "note": mode_error + "; scanned as 'full'",
+        })
+
+    tracked_set = set(t.replace("\\", "/") for t in tracked)
+    if not any(rb in tracked_set for rb in INDEPENDENCE_RUNBOOKS):
+        findings.append({
+            "severity": "HIGH",
+            "code": "independence-runbook-missing",
+            "mode": mode,
+            "note": "no RELEASE.md or docs/RELEASE.md is tracked; a release only an agent's memory can "
+                    "reproduce is non-conforming (STANDARDS §13 AI-4)",
+        })
+
+    workflows = sorted(t for t in tracked_set if t.startswith(".github/workflows/") and t.endswith((".yml", ".yaml")))
+    has_release_wf = False
+    for wf in workflows:
+        if RELEASE_WORKFLOW_NAME_RE.search(Path(wf).name):
+            has_release_wf = True
+            break
+        body, skip = _read_text_capped(repo / wf)
+        if skip:
+            skipped.append({"path": wf, "kind": "workflow", "reason": skip})
+        if body and RELEASE_WORKFLOW_BODY_RE.search(body):
+            has_release_wf = True
+            break
+    if not has_release_wf:
+        findings.append({
+            "severity": "HIGH",
+            "code": "independence-no-release-workflow",
+            "mode": mode,
+            "workflows_present": len(workflows),
+            "note": "no release workflow under .github/workflows/ (STANDARDS §13 AI-5); if CI is blocked, "
+                    "the blocker must be a tracked IMPL item",
+        })
+
+    if mode == "full":
+        exempt = _adr_mentions(repo, tracked, skipped)
+        hits: list[dict[str, str]] = []
+        for rel in sorted(tracked_set):
+            lower = rel.lower()
+            if not any(lower.endswith(suf) for suf in RUNTIME_SOURCE_SUFFIXES):
+                continue
+            if _is_test_path(rel) or lower.startswith(".github/"):
+                continue
+            text, skip = _read_text_capped(repo / rel)
+            if skip:
+                skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
+            if not text:
+                continue
+            for host in AI_VENDOR_HOSTS:
+                if host in exempt or host not in text:
+                    continue
+                for n, line in enumerate(text.splitlines(), 1):
+                    if host in line and not _is_comment_line(rel, line):
+                        hits.append({"path": rel, "line": n, "host": host})
+                        break
+        if hits:
+            findings.append({
+                "severity": "MEDIUM",
+                "code": "independence-ai-vendor-runtime",
+                "count": len(hits),
+                "items": hits[:20],
+                "exempt_by_adr": sorted(exempt),
+                "note": "AI-vendor host literal on a runtime path with no ADR naming it (STANDARDS §13 AI-1 / §13.3 item 3)",
+            })
+    if skipped:
+        findings.append({
+            "severity": "LOW",
+            "code": "independence-unexamined",
+            "mode": mode,
+            "count": len(skipped),
+            "items": skipped[:20],
+            "note": "files this pass could not read (oversized or unreadable): not examined, not clean; "
+                    "the §13 verdicts above exclude them",
+        })
+    return findings
+
+
 def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
     name = repo.name
     findings: list[dict[str, Any]] = []
@@ -577,6 +807,9 @@ def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
 
     # MEDIUM/LOW: superproject submodule pointer lag (ADR 0012)
     findings.extend(scan_submodule_pointer_lag(repo))
+
+    # HIGH/MEDIUM: application independence floor (STANDARDS §13, IMPL-34)
+    findings.extend(scan_independence(repo, tracked))
 
     # LOW: noise
     noise = noise_files(repo, tracked)
