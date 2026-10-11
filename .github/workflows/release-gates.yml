@@ -36,6 +36,7 @@ jobs:
       size_guard_enabled: ${{ steps.parse.outputs.size_guard_enabled }}
       npm_audit_severity: ${{ steps.parse.outputs.npm_audit_severity }}
       conventional_commits_enabled: ${{ steps.parse.outputs.conventional_commits_enabled }}
+      independence: ${{ steps.parse.outputs.independence }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +73,13 @@ jobs:
           size_guard_enabled=$(read_with_default '.gates.size_guard' 'true')
           npm_audit_severity=$(read_with_default '.gates.npm_audit' 'high')
           conventional_commits_enabled=$(read_with_default '.gates.conventional_commits' 'false')
+          # STANDARDS §13.2: full | tooling | harness. Absent means full. An
+          # unknown value is an error, never a wider exemption.
+          independence=$(read_with_default '.independence' 'full')
+          case "$independence" in
+            full|tooling|harness) ;;
+            *) echo "::error::release-config.yml independence: '$independence' is not one of full, tooling, harness"; exit 1 ;;
+          esac
 
           if [ -z "$surface" ]; then
             echo "::error::release-config.yml missing required field: surface"
@@ -87,6 +95,7 @@ jobs:
             echo "size_guard_enabled=$size_guard_enabled"
             echo "npm_audit_severity=$npm_audit_severity"
             echo "conventional_commits_enabled=$conventional_commits_enabled"
+            echo "independence=$independence"
           } >> "$GITHUB_OUTPUT"
 
       - name: Summary
@@ -104,6 +113,7 @@ jobs:
             echo "| size_guard | ${{ steps.parse.outputs.size_guard_enabled }} |"
             echo "| npm_audit | ${{ steps.parse.outputs.npm_audit_severity }} |"
             echo "| conventional_commits | ${{ steps.parse.outputs.conventional_commits_enabled }} |"
+            echo "| independence | ${{ steps.parse.outputs.independence }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   tests:
@@ -269,6 +279,66 @@ jobs:
           fi
           echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
           echo "✓ tag v$TAG_VERSION matches $SOURCE version $PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+  # STANDARDS §13 Application Independence Floor (IMPL-34). A release carries a
+  # committed, human-runnable runbook (AI-4) and its notes state where it stands
+  # against AI-1..AI-8. The notes are the CHANGELOG section for the version.
+  # WARN-MODE SOAK per §4's rollout pattern: continue-on-error until the first
+  # month of enrolled releases is clean, then delete the line below to block.
+  # Promotion candidates (v1-rcN) are dev-standards' own ref under test and
+  # have no consumer release notes, so they are skipped.
+  independence-note:
+    needs: [read-config, tag-matches-version]
+    if: needs.read-config.outputs.independence != 'harness' && !contains(github.ref, '-rc')
+    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runbook committed and release notes carry the independence line
+        shell: bash
+        env:
+          VERSION: ${{ needs.tag-matches-version.outputs.version }}
+          MODE: ${{ needs.read-config.outputs.independence }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if [ -f RELEASE.md ] || [ -f docs/RELEASE.md ]; then
+            echo "✓ release runbook committed (independence: $MODE)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::No RELEASE.md or docs/RELEASE.md. A release only an agent's memory can reproduce is non-conforming (STANDARDS §13 AI-4)."
+            fail=1
+          fi
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::No CHANGELOG.md: the release notes for v$VERSION must state 'independence: AI-1..AI-8 pass' or list the failing items (STANDARDS §13.3 item 4)."
+            exit 1
+          fi
+
+          # The section for this version: from its '## [<version>]' heading to
+          # the next '## [' heading. Keep a Changelog shape, which §3 requires.
+          section=$(awk -v v="$VERSION" '
+            /^## \[/ { inside = (index($0, "[" v "]") > 0) }
+            inside { print }
+          ' CHANGELOG.md)
+          if [ -z "$section" ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section; the release notes must exist to carry the independence line."
+            fail=1
+          elif printf '%s\n' "$section" | grep -qiE '^[[:space:]]*[-*]?[[:space:]]*\**independence\**[[:space:]]*:'; then
+            line=$(printf '%s\n' "$section" | grep -iE '^[[:space:]]*[-*]?[[:space:]]*\**independence\**[[:space:]]*:' | head -1 | sed 's/^[[:space:]]*//')
+            echo "✓ release notes: $line" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::CHANGELOG.md section [$VERSION] has no 'independence:' line. Add 'independence: AI-1..AI-8 pass' or list the failing items with their IMPL numbers (STANDARDS §13.3 item 4)."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::warning::independence-note is in warn-mode soak (STANDARDS §13.4, IMPL-34); this will block once the soak ends."
+            exit 1
+          fi
 
   conventional-commits-lint:
     needs: read-config
