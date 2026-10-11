@@ -165,6 +165,13 @@ dev-standards exposes gates in two layers:
 
 **Layer B — `dep-auto-apply.yml` (weekly cron, opt-in):** Sunday 06:00 UTC via repo-side `schedule:` trigger. Per-repo opt-in via `.github/auto-apply-enabled` file. Auto-applies safe (patch / minor for non-breaking) bumps across npm / go / python / docker / gh-actions. Notifies ntfy + shared-brain. Two jobs: `apply` (read-only token, no secrets) runs every install, fix and test, and hands over a patch of allow-listed manifests/lockfiles as an artifact; `publish` (write token, no secrets) runs no dependency code, validates the patch fail-closed and commits only those files; `notify` (the two notification secrets, `run:` steps only, no third-party action) posts ntfy and shared-brain. Untrusted code and credentials never share a job. `publish` and `notify` declare environment `auto-apply-publish`; consumers create it with a default-branch-only deployment policy and keep `DEP_AUTO_APPLY_NTFY_TOKEN` / `SHARED_BRAIN_TOKEN` there as environment secrets.
 
+**CI runner policy (decided from the OpenSSF Scorecard / GitHub Actions hardening guidance, ratified 2026-10-11):**
+
+- A `pull_request` job runs only on GitHub-hosted runners, never on a self-hosted or `nexus-ci` runner, and never sees a secret. Fork pull requests use `pull_request`, never `pull_request_target`; first-time contributors need approval before any workflow runs (repository setting "Require approval for all outside collaborators").
+- Variables may select a runner (`runs-on: ${{ vars.CI_RUNNER }}`) only on `push` to a protected branch, `schedule`, `workflow_dispatch` and `workflow_call` reached from those events (register SC-37). The `nexus-ci` registrar additionally refuses public repositories, so a template that reaches a public repo must carry the hosted literal.
+- Production promotion keeps a required reviewer on its environment (separation of duties, NIST SSDF PO.3). With a single maintainer the reviewer is that maintainer plus the immutable deployment log; the control is batched, never dropped.
+- Release signing material is scoped to the signing job alone: an environment secret on a job that runs no build or dependency code, on an ephemeral runner (SLSA Build L3 isolation, NIST SSDF PS.1). A build job never holds a signing key.
+
 **Release-time gates (`release-gates.yml`, called by every surface workflow):**
 
 | Gate | Catches | Correctly passes | **Blind spot** |
