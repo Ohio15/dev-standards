@@ -56,8 +56,18 @@ def test_every_action_is_sha_pinned_with_a_same_line_version(path: Path):
 
 @pytest.mark.parametrize("path", FILES, ids=IDS)
 def test_no_version_comment_on_a_line_of_its_own(path: Path):
-    bad = [f"{n}: {line.strip()}" for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-           if DETACHED_VERSION.match(line)]
+    """Flags a version comment whose next non-blank line is a `uses:` pin - the
+    shape Dependabot never rewrites. A version mentioned in ordinary prose (a
+    govulncheck compatibility note, say) sits above more prose, not above a pin,
+    and is not the defect this test exists to keep out."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    bad = []
+    for i, line in enumerate(lines):
+        if not DETACHED_VERSION.match(line):
+            continue
+        following = next((l for l in lines[i + 1:] if l.strip()), "")
+        if USES.match(following):
+            bad.append(f"{i + 1}: {line.strip()}")
     assert bad == [], "a version comment above a pin goes stale on the first Dependabot bump:\n" + "\n".join(bad)
 
 
