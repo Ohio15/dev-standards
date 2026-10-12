@@ -2,7 +2,7 @@ name: Shell Lint
 on:
   pull_request:
   push:
-    branches: [main, master, ci/shellcheck-hooks]
+    branches: [main, master]
 
 permissions:
   contents: read
