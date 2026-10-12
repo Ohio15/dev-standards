@@ -10,6 +10,7 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 | `hooks/pre-commit` | Chained dispatcher. Runs every `pre-commit-*.sh` sub-hook in sorted order; first failure aborts the commit. |
 | `hooks/pre-commit-size-guard.sh` | Rejects staged files >10 MB unless allowlisted. |
 | `hooks/pre-commit-secret-scan.sh` | Runs `gitleaks protect --staged` to block commits introducing secrets. |
+| `scripts/lint-shell.sh` + `.github/workflows/shell-lint.yml` | `bash -n` + pinned ShellCheck 0.11.0 over every tracked shell script, `hooks/` and `.githooks/` included. Consumers skip their synced `.githooks/` copies, so every hook exception lives here as an inline `# shellcheck disable=` with its reason. |
 | `workflows/size-guard.yml` | GitHub Actions workflow that rejects tracked files >10 MB. Not skippable. |
 | `templates/.github/workflows/security-audit.yml` | Layer A: always-on dependency-vulnerability gate. Fails PRs on high/critical findings across npm, Go, Python. |
 | `templates/.github/workflows/dep-auto-apply.yml` | Layer B: weekly cron that auto-applies safe dep fixes, runs tests, opens a PR labeled `auto-apply`. Per-repo opt-in. |
