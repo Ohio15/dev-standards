@@ -1,0 +1,45 @@
+name: Shell Lint
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  # Every tracked shell script, the shipped hooks included: bash -n +
+  # shellcheck (scripts/lint-shell.sh derives the list from the tree).
+  # Consumer repos skip their synced .githooks/ copies, so this is the only
+  # lint those hooks get. ShellCheck is a pinned, SHA-256-verified release
+  # binary (same version and digest as Ohio15/infra script-lint.yml), so CI
+  # and a local run use the same version.
+  shell-lint:
+    # Hosted on pull_request; vars.CI_RUNNER only on a default-branch push
+    # (STANDARDS.md section 4 runner policy, register SC-37).
+    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      # SHA-pinned, same ref as size-guard.yml (mutable tags are a
+      # supply-chain vector).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck v0.11.0 (pinned)
+        shell: bash
+        env:
+          SC_VERSION: v0.11.0
+          SC_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/shellcheck"
+          mkdir -p "$d"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$d/sc.tar.gz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SC_VERSION}/shellcheck-${SC_VERSION}.linux.x86_64.tar.gz"
+          echo "${SC_SHA256}  $d/sc.tar.gz" | sha256sum -c -
+          tar -xzf "$d/sc.tar.gz" -C "$d"
+          echo "$d/shellcheck-${SC_VERSION}" >>"$GITHUB_PATH"
+
+      - name: bash -n + shellcheck over every tracked shell script
+        shell: bash
+        run: scripts/lint-shell.sh
