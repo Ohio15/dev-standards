@@ -52,7 +52,7 @@ The shared-brain at `https://shared-brain.us` is the system of record for cross-
 - T1.6 Sub-agent dispatch: supervisor recalls, hands findings to agent as context — agents do NOT recall independently unless their mission is research
 - T1.7 Session end: supervisor synthesizes, writes `[REMEMBER]:` markers — never the agents
 
-**Sub-agent vs supervisor save responsibility.** Sub-agents return findings to the supervisor. Only the supervisor writes `[REMEMBER]:` markers, after synthesis. This prevents three agents writing three contradictory memories about the same finding.
+**Sub-agent vs supervisor save responsibility.** Sub-agents return findings to the supervisor. Only the supervisor writes `[REMEMBER]:` markers, after synthesis. This prevents three agents writing three contradictory memories about the same finding. One exception: a discovered-issue agent stores its own outcome (§14.2).
 
 **Conflict resolution.** When `recall` returns contradictory memories: newest wins by default, but always surface the conflict to Ron explicitly. Never silently overwrite. Old memory gets a `superseded_by:<new_id>` tag, never deleted (per `feedback_data_preservation`).
 
@@ -561,6 +561,45 @@ Findings are advisory until the gate flips; Ron triages weekly with the rest of 
 | all other repos | not yet assessed | | | | | | |
 
 First actions: AIWebBrowser `docs/RELEASE.md` from the runbook; confirm the signing key's 1Password item; restore Actions billing or move the release workflow to the self-hosted `nexus-ci` runner. Assess the remaining repos in the first weekly hygiene scan after IMPL-34 lands.
+
+## 14. Discovered-Issue Delegation
+
+**Ratified 2026-10-16 (Ron):** "Make this flow standard across all sessions: discovered issues are assigned an agent to resolve and logged to shared-brain independently." Decision memory `7f366ca7`.
+
+**Motivating case (AIBrowser MCP, 2026-10-16):** during an Apple Business store task, AIBrowser's MCP could not read a cross-origin iframe. Fixing the browser inline would have derailed the purchase task. Noting the gap and moving on would have left a capability gap as a wall, against the build-option rule. The right move was to record the gap, assign an agent to fix it, and carry on.
+
+**Rule:** a **discovered issue** is a defect, tooling or capability gap, or blocker found while working on something else, outside the primary task's own diff. In the same turn it is found, the discovering session logs it to shared-brain and launches a dedicated background agent to resolve it. Then it continues the primary task without fixing the issue inline or waiting for permission, and tells Ron one line: issue, agent assigned.
+
+### 14.1 The discovery (discovering session)
+
+1. `brain_recall` the issue. If an open discovery or an assigned agent already exists, `reinforce` it with the new evidence and stop there. One agent per issue.
+2. `brain_store` (remember): the issue, the evidence (error text, file:line, repro), where it was found, an explicit `domain`, the tag `discovered-issue` and the owning project.
+3. Launch a background agent with full context, scope, constraints, acceptance criteria and the discovery memory id. Implementation goes to `lead-engineer` (Opus); investigation, diagnosis or review goes to a Sonnet agent.
+
+### 14.2 The resolution (resolving agent)
+
+- The agent `brain_store`s its own outcome (fixed, build proposal, or blocked on Ron) in the **same domain** as the discovery and cites the discovery id. That is the "independently" in the rule: two writes by two writers, at discovery time and at resolution time. Neither waits for the other or for the end of the session. The supervisor references the outcome and doesn't store a second copy. This is the one exception to the §1 rule that only the supervisor writes. A discovered-issue agent owns a distinct finding, linked by id and domain, so it can't produce competing memories about one finding.
+- **Scope is the issue only.** The agent doesn't widen the primary task. It stops and surfaces anything outward-facing (email, posts, purchases, third-party changes), destructive, or needing Ron's decision. If the fix needs a new service, new infra or an architecture call, the deliverable is a Rigor-format build proposal stored to the brain, not the build.
+- **Every other floor binds the agent:** §2 workspace layout (worktrees in `D:\Worktrees`), branch + version bump + commit/push (never to a default branch, never forced), the Ohio15 default and PatriotCompanies allow-list, the security review model (`/security-gate` for auth, credential and mutation surfaces; the audit before a flag flip), §11 rotation for a leaked secret, and UAC for elevation.
+
+### 14.3 Interaction with other rules
+
+| Rule | How §14 applies it |
+|------|--------------------|
+| Capability gap = build option | The build option becomes the default action, run by an agent. |
+| Resolve unknowns as they arise | Resolution still happens now, moved off the main thread rather than deferred. |
+| Don't over-extend scope | The boundary in §14.2: agent fixes the issue, never the primary task's scope. |
+| Deferred follow-up (reminder + notification) | If the agent can't finish in-session or its fix needs a later re-check: `brain_commitments`, a scheduled trigger, and an n3xus-notify. An open discovery at session end goes into the handoff brief by memory id. |
+| Fan-out is warn-only | No cap. Each agent still has to earn its cost. |
+| SPEND line | When the issue feeds a recommendation or plan, the agent's cost goes in its `SPEND:`. |
+| Blocking issues | Still delegated. The main session works the unblocked parts, then waits on the agent's result. |
+
+### 14.4 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Session rule in global `CLAUDE.md` + framework `feedback_discovered-issue-agents.md` | every AI session | ACTIVE 2026-10-16 |
+| cortex-hooks decision register row DR-032, tier `norm` (whether something counts as a discovered issue is a judgement of intent; no tool boundary carries it) | journal + routine audit | ACTIVE 2026-10-16 |
 
 ---
 
