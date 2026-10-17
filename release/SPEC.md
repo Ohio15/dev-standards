@@ -160,7 +160,7 @@ Runs in parallel jobs; any failure aborts the release.
 | `tests` | Runs `npm test` (or `test_command` override). Coverage threshold not enforced at this layer. | Per-repo by setting `gates.tests: false` (rare; usually done only for documentation-only repos). |
 | `gitleaks` | Re-runs the gitleaks scan on the full tagged commit (not just diff). The pre-commit hook scans staged diffs only; this is the belt-and-suspenders catch. | No. |
 | `size_guard` | Same logic as `workflows/size-guard.yml` but enforced at release time. | Per-file via `.large-files-allowlist`. |
-| `npm_audit` | Runs `npm audit --json` against `gates.npm_audit` severity floor. | Per-repo by setting `npm_audit: off` (discouraged). |
+| `npm_audit` | Runs `npm audit --package-lock-only --audit-level=<floor>` in every directory holding a tracked `package.json` (not only the root; `node_modules/` excluded), deduplicated to the npm lockfile that covers it: its own `package-lock.json`/`npm-shrinkwrap.json`, or an ancestor lockfile listing it as a workspace member. Fails closed: a manifest no lockfile covers fails, and a *declared* `gates.npm_audit` that finds no tracked `package.json` fails. Only the implicit default (key absent) with no manifests passes, reported as NOT EXAMINED. | Per-repo by setting `npm_audit: off` (discouraged). |
 | `tag_matches_version` | Asserts pushed tag matches `package.json:version`. Catches the "I forgot to bump" case. | No. |
 | `conventional_commits_lint` | Lints commit messages since previous tag. | Per-repo via `gates.conventional_commits: false`. |
 
