@@ -902,15 +902,32 @@ def post_to_brain(summary: str, scan_date: str) -> tuple[bool, str]:
         "domain": "implementation",
         "project": "dev-standards",
     }
+    if "\r" in api_key or "\n" in api_key:
+        return False, "api-key contains a line break; refusing to build the header"
     body = json.dumps(payload)
+    # The bearer reaches curl on STDIN (`-H @-`), never on argv, where any
+    # local uid could read it from /proc/<pid>/cmdline or ps (SC-11).
     cmd = [
         "curl", "-sS", "-X", "POST",
-        "-H", f"Authorization: Bearer {api_key}",
+        "-H", "@-",
         "-H", "Content-Type: application/json",
         "-d", body,
         "https://shared-brain.us/api/memory/ingest",
     ]
-    rc, out, err = run(cmd)
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=f"Authorization: Bearer {api_key}\n",
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        rc, out, err = 124, "", "curl timed out after 60s"
+    except OSError as exc:
+        rc, out, err = 127, "", f"curl could not be run: {exc}"
     if rc != 0:
         return False, f"curl rc={rc}: {err.strip()}"
     # The endpoint returns JSON on success; HTML on 404. Reject HTML.
