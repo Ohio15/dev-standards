@@ -214,9 +214,13 @@ if [[ "$BRAIN_STORE" == "true" && "$DRY_RUN" != "true" ]]; then
       --arg t "npm-audit-$SCAN_DATE" \
       '{type:"observation",tags:[$t,"automation","npm-audit"],content:$c,importance:0.65,domain:"security",project:"dev-standards"}' \
       2>/dev/null || echo '{}')
-    if [[ "$body" != "{}" ]]; then
-      resp=$(curl -sS -X POST \
-        -H "Authorization: Bearer $api_key" \
+    if [[ "$api_key" == *$'\n'* || "$api_key" == *$'\r'* ]]; then
+      echo "[brain-store skipped — api-key at $KEY_FILE contains a line break]" >&2
+    elif [[ "$body" != "{}" ]]; then
+      # The bearer header reaches curl on stdin (-H @-), never argv: argv is
+      # world-readable via /proc/<pid>/cmdline and ps on a host without hidepid.
+      resp=$(printf 'Authorization: Bearer %s\n' "$api_key" | curl -sS -X POST \
+        -H @- \
         -H "Content-Type: application/json" \
         -d "$body" \
         https://shared-brain.us/api/memory/ingest 2>&1)
