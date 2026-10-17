@@ -126,19 +126,22 @@ OpenClaw or shared-brain.
 
 ```bash
 docker exec shared-brain-mcp sh -c '
-  printf "%s" "{\"tool\":\"message\",\"args\":{
+  body="{\"tool\":\"message\",\"args\":{
     \"action\":\"send\",
     \"to\":\"+17408197558\",
     \"message\":\"openclaw plumbing test\",
     \"channel\":\"signal\",
     \"accountId\":\"primary\"
-  }}" | curl -sS -X POST \
+  }}"
+  printf "Authorization: Bearer %s\n" "$OPENCLAW_GATEWAY_TOKEN" | curl -sS -X POST \
     http://openclaw-openclaw-gateway-1:18789/tools/invoke \
-    -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN" \
+    -H @- \
     -H "Content-Type: application/json" \
-    --data-binary @- \
+    --data-binary "$body" \
     -w "\nHTTP %{http_code}\n"
 '
+# The token reaches curl on stdin (-H @-), never argv: container processes
+# are visible in the host /proc, which has no hidepid on NEXUS.
 # Expect: 200 with {"ok":true,"result":{"details":{"result":{"messageId":"..."}}}}
 ```
 
