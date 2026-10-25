@@ -52,10 +52,24 @@ name: Dependency Auto-Apply (Layer B)
 # publish and notify declare environment `auto-apply-publish`, which the
 # repo owner gives a default-branch-only deployment policy; the secrets are
 # environment secrets there.
+# Plan limit (SC-29): GitHub Free offers no deployment-branch policy (and
+# Free/Pro/Team no required reviewer) on a PRIVATE repo, so there the
+# environment protects nothing and any secret is reachable from a
+# workflow_dispatch of any branch. On a private repo notify therefore refuses
+# both secrets and FAILS the run unless the owner sets the variable
+# DEP_AUTO_APPLY_ENV_PROTECTED=true, attesting that auto-apply-publish carries
+# a default-branch-only policy (needs Pro, Team or Enterprise). That check
+# lives in this file, which a branch can edit: it cannot stop another
+# branch, it only refuses to make an unsafe configuration work quietly. The
+# control is not setting the secrets on such a repo at all.
 # Every job refuses any ref but the default branch (job if: and a first step).
-# Both jobs run on vars.CI_RUNNER when set: that runner (nexus-ci) is an
-# ephemeral VM per job. A persistent runner would carry the apply job's
-# compromise into publish and void this boundary; never point CI_RUNNER at one.
+# Runner: the literal `nexus-ci` when the repo is private AND vars.CI_RUNNER
+# is exactly 'nexus-ci', else the literal `ubuntu-latest`. The variable can
+# only toggle between those two labels, never name another runner (SC-37
+# form; the nexus-ci registrar refuses public repos, so a public repo always
+# gets the hosted literal). nexus-ci is an ephemeral VM per job. A persistent
+# runner would carry the apply job's compromise into publish and notify and
+# void this boundary; never register one under that label.
 #
 # Detection matches security-audit.yml (Layer A): every tracked manifest
 # ANYWHERE in the tree (from `git ls-files`, never node_modules) selects an
@@ -94,12 +108,11 @@ name: Dependency Auto-Apply (Layer B)
 #
 # Notifications (notify job only):
 #   ntfy: OFF unless the repo/org variable DEP_AUTO_APPLY_NTFY_URL is set
-#   (full topic URL). That URL is an operator-owned sink: whoever can set the
-#   variable receives the post AND the DEP_AUTO_APPLY_NTFY_TOKEN bearer (sent
-#   when that secret is set), so only the token's owner may set it. The post
-#   carries the repo name and PR URL, so never point it at a public
-#   unauthenticated topic for a private repo. Bearer headers reach curl on
-#   stdin (-K -), never argv.
+#   (full topic URL). The URL must be exactly https://ntfy.nexus/<topic>
+#   (SC-11: the host is an allow-listed literal in the step, not taken from
+#   the variable); anything else fails the notify job and nothing is posted.
+#   ntfy.nexus is on the NEXUS LAN, reachable from nexus-ci, not from hosted
+#   runners. Bearer headers reach curl on stdin (-K -), never argv.
 #   shared-brain ingest on PR open (Bearer SHARED_BRAIN_TOKEN; gracefully
 #   skipped if the secret isn't set).
 #
@@ -136,7 +149,7 @@ jobs:
     # Default branch only: a workflow_dispatch of another branch's copy of
     # this file does not even start (publish refuses it as well).
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}
     # Untrusted-code job: read-only token, no secrets.* anywhere in it.
     permissions:
       contents: read
@@ -293,6 +306,11 @@ jobs:
             if [ -z "${seen[$r]+x}" ]; then seen[$r]=1; roots+=("$r"); fi
           done
 
+          # Installs run lifecycle scripts on purpose (no --ignore-scripts):
+          # native builds and the test suites below need them, and this job
+          # holds a read-only token and no secret, so a hostile script reaches
+          # nothing it could not already read. publish and notify install
+          # nothing; keep it that way rather than adding scripts there.
           for r in "${roots[@]}"; do
             if [ -f "$r/pnpm-lock.yaml" ]; then
               corepack enable
@@ -827,7 +845,7 @@ jobs:
     # creates the environment unprotected on first use if it is missing; the
     # policy is the operator's step, never this workflow's.
     environment: auto-apply-publish
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
@@ -1369,9 +1387,11 @@ jobs:
           || needs.publish.outputs.pr_ok_url != '' || needs.publish.outputs.pr_broken_url != '')
     # The secrets live in this environment (default-branch-only deployment
     # policy, README Layer B). publish declares it too: the policy then also
-    # gates the job that holds the write token.
+    # gates the job that holds the write token. On a private repo without
+    # that policy (GitHub Free) both secret steps refuse their secret and
+    # fail; see the header.
     environment: auto-apply-publish
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}
     permissions: {}
     steps:
       - name: Refuse to run from any ref but the default branch
@@ -1389,7 +1409,9 @@ jobs:
 
       # Opt-in: the post names the repo and the PR, so it goes only to a
       # topic the repo owner configured (DEP_AUTO_APPLY_NTFY_URL), never to a
-      # built-in public one.
+      # built-in public one. The variable picks the topic only; the host is
+      # the literal below (SC-11), so whoever can set a variable cannot move
+      # the bearer to a host of their choosing.
       - name: Notify ntfy (PR opened, tests failed, or run failed)
         id: notify
         if: vars.DEP_AUTO_APPLY_NTFY_URL != ''
@@ -1397,6 +1419,8 @@ jobs:
         env:
           NTFY_URL: ${{ vars.DEP_AUTO_APPLY_NTFY_URL }}
           NTFY_TOKEN: ${{ secrets.DEP_AUTO_APPLY_NTFY_TOKEN }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          ENV_PROTECTED: ${{ vars.DEP_AUTO_APPLY_ENV_PROTECTED }}
           APPLY_RESULT: ${{ needs.apply.result }}
           PUBLISH_RESULT: ${{ needs.publish.result }}
           PR_OK_URL: ${{ needs.publish.outputs.pr_ok_url }}
@@ -1406,10 +1430,21 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          case "$NTFY_URL" in
-            https://*) ;;
-            *) echo "::warning::DEP_AUTO_APPLY_NTFY_URL is not an https:// URL; not posting"; exit 0 ;;
-          esac
+          # Exactly https://ntfy.nexus/<topic>: no other host, no port,
+          # userinfo, query, fragment or further path.
+          if ! [[ "$NTFY_URL" =~ ^https://ntfy\.nexus/[A-Za-z0-9_-]{1,64}$ ]]; then
+            echo "::error::DEP_AUTO_APPLY_NTFY_URL must be https://ntfy.nexus/<topic>; not posting"
+            exit 1
+          fi
+          # SC-29 plan limit (header): a private repo without the owner's
+          # attestation has no branch policy behind the secret. Refuse it,
+          # post without a bearer, and fail the job so the secret is removed.
+          scope_rc=0
+          if [ -n "${NTFY_TOKEN:-}" ] && [ "${REPO_PRIVATE:-}" != "false" ] && [ "${ENV_PROTECTED:-}" != "true" ]; then
+            echo "::error::DEP_AUTO_APPLY_NTFY_TOKEN is set on a private repo without DEP_AUTO_APPLY_ENV_PROTECTED=true; on this plan it is reachable from any branch. Not sending it. Delete the secret, or give environment auto-apply-publish a default-branch-only policy and set that variable."
+            NTFY_TOKEN=""
+            scope_rc=1
+          fi
           # A PR URL from publish is accepted only as this repo's own PR URL.
           pr_url_ok() { local p="$SERVER_URL/$REPO/pull/"; [[ "$1" == "$p"* ]] && [[ "${1#"$p"}" =~ ^[0-9]+$ ]]; }
           ok_url=""; broken_url=""
@@ -1442,7 +1477,7 @@ jobs:
             prio="default"
           else
             echo "::warning::nothing valid to notify about"
-            exit 0
+            exit "$scope_rc"
           fi
           # The bearer header goes to curl as a config on stdin (-K -), never
           # in argv, which any process on the runner can read.
@@ -1461,6 +1496,7 @@ jobs:
             -d "${body}" \
             "$NTFY_URL" || \
             echo "::warning::ntfy publish failed (non-fatal)"
+          exit "$scope_rc"
 
       - name: Brain ingest (PR opened only)
         id: brain
@@ -1468,6 +1504,8 @@ jobs:
         shell: bash
         env:
           BRAIN_TOKEN: ${{ secrets.SHARED_BRAIN_TOKEN }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          ENV_PROTECTED: ${{ vars.DEP_AUTO_APPLY_ENV_PROTECTED }}
           PR_OK_URL: ${{ needs.publish.outputs.pr_ok_url }}
           PR_BROKEN_URL: ${{ needs.publish.outputs.pr_broken_url }}
           DATE_STR: ${{ needs.publish.outputs.date_str }}
@@ -1478,6 +1516,11 @@ jobs:
           if [ -z "${BRAIN_TOKEN:-}" ]; then
             echo "::notice::SHARED_BRAIN_TOKEN secret not set — skipping brain ingest"
             exit 0
+          fi
+          # SC-29 plan limit (header): see the ntfy step.
+          if [ "${REPO_PRIVATE:-}" != "false" ] && [ "${ENV_PROTECTED:-}" != "true" ]; then
+            echo "::error::SHARED_BRAIN_TOKEN is set on a private repo without DEP_AUTO_APPLY_ENV_PROTECTED=true; on this plan it is reachable from any branch. Not sending it. Delete the secret, or give environment auto-apply-publish a default-branch-only policy and set that variable."
+            exit 1
           fi
           if [ -n "${PR_BROKEN_URL:-}" ]; then
             kind="auto-apply-broken"
