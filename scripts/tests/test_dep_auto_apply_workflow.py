@@ -20,6 +20,7 @@ Run:  python -m pytest scripts/tests -q
 """
 from __future__ import annotations
 
+import importlib.util
 import hashlib
 import json
 import os
@@ -942,8 +943,8 @@ RUN_SHA256 = {
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "notify": "dac4e53d86d42985dfee24e29f219d0c06f554e76c1b81ba73c016c381a93cf6",
-        "brain": "77e973a7709ddc0a807805543e3c2b6c14971d37ffb7dc64c0dd99606b7a205b",
+        "notify": "8b71d3da86776f0e4551e7379618011acc7e2af5d58ef114a9a0a631f54bdcbb",
+        "brain": "41baad8a408cec76b3652fea4e6a7a84ae4a75feb09c5988d423bfd3c1ec897e",
     },
 }
 
@@ -1194,11 +1195,11 @@ def run_with_curl_spy(tmp_path, shim_path, step_id, **env):
     return proc, argv, stdin
 
 
-NOTIFY_ENV = dict(NTFY_URL="https://ntfy.example/t", APPLY_RESULT="success", PUBLISH_RESULT="success",
+NOTIFY_ENV = dict(NTFY_URL="https://ntfy.nexus/t", APPLY_RESULT="success", PUBLISH_RESULT="success",
                   PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
-                  SERVER_URL="https://github.com", RUN_ID="1")
+                  SERVER_URL="https://github.com", RUN_ID="1", REPO_PRIVATE="false", ENV_PROTECTED="")
 BRAIN_ENV = dict(PR_OK_URL="https://github.com/o/r/pull/1", PR_BROKEN_URL="", REPO="o/r",
-                 SERVER_URL="https://github.com", DATE_STR="2026-10-10")
+                 SERVER_URL="https://github.com", DATE_STR="2026-10-10", REPO_PRIVATE="false", ENV_PROTECTED="")
 
 
 def test_ntfy_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
@@ -1314,3 +1315,113 @@ def test_pnpm_specifier_allow_list_accepts(tmp_path, shim_path, spec):
     write(repo, "pnpm-lock.yaml", PNPM.replace("specifier: ^1.0.0", "specifier: " + spec))
     v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
     assert v.returncode == 0, v.stdout + v.stderr
+
+
+# ─── discovery 80017686 (OpenOBD gate 2026-10-25): SC-11, SC-29 plan limit, SC-37 ──
+
+# SC-11: the bearer goes only to the literal host; the variable picks a topic.
+@pytest.mark.parametrize("url", [
+    "https://evil.example/t", "https://ntfy.nexus.evil.example/t", "https://evil.example/ntfy.nexus/t",
+    "https://ntfy.nexus:8443/t", "https://user@ntfy.nexus/t", "https://ntfy.nexus@evil.example/t",
+    "https://ntfy.nexus/t?x=1", "https://ntfy.nexus/t#f", "https://ntfy.nexus/t/extra", "https://ntfy.nexus/",
+    "http://ntfy.nexus/t", "https://NTFY.nexus/t", "https://ntfy.nexus/t\nhttps://evil.example/t",
+    "https://ntfy.nexus/" + "a" * 65, r"https://ntfy\.nexus/t",
+])
+def test_ntfy_posts_only_to_the_allow_listed_host(tmp_path, shim_path, url):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET,
+                                          **{**NOTIFY_ENV, "NTFY_URL": url})
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert argv is None and stdin is None, "nothing may be posted to a host off the allow-list"
+    assert "must be https://ntfy.nexus/<topic>" in proc.stdout
+
+
+def test_ntfy_allow_list_is_a_literal_in_the_step():
+    [s] = [x for x in JOBS["notify"]["steps"] if x.get("id") == "notify"]
+    assert r"^https://ntfy\.nexus/[A-Za-z0-9_-]{1,64}$" in s["run"]
+    assert "${{" not in s["run"]
+
+
+# SC-29 on a plan without environment branch policies for private repos: the
+# default-branch run refuses the secret and fails, so the misconfiguration
+# cannot work quietly. REPO_PRIVATE other than "false" counts as private.
+@pytest.mark.parametrize("private,protected,rc,sent", [
+    ("false", "", 0, True),
+    ("true", "", 1, False),
+    ("", "", 1, False),
+    ("true", "yes", 1, False),
+    ("true", "true", 0, True),
+])
+def test_ntfy_token_scope_on_private_repos(tmp_path, shim_path, private, protected, rc, sent):
+    env = {**NOTIFY_ENV, "REPO_PRIVATE": private, "ENV_PROTECTED": protected}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **env)
+    assert proc.returncode == rc, proc.stdout + proc.stderr
+    assert argv is not None, "the post itself still goes out, without a bearer"
+    assert "tk_s3cret" not in argv
+    assert ("tk_s3cret" in stdin) is sent
+    if not sent:
+        assert "Authorization" not in stdin
+        assert "DEP_AUTO_APPLY_ENV_PROTECTED=true" in proc.stdout
+
+
+def test_ntfy_without_token_on_a_private_repo_is_fine(tmp_path, shim_path):
+    env = {**NOTIFY_ENV, "REPO_PRIVATE": "true"}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="", **env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert argv is not None and "Authorization" not in stdin
+
+
+def test_scope_failure_survives_a_forged_pr_url(tmp_path, shim_path):
+    env = {**NOTIFY_ENV, "REPO_PRIVATE": "true", "PR_OK_URL": "https://evil.example/o/r/pull/1"}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert argv is None
+
+
+@pytest.mark.parametrize("private,protected,rc,sent", [
+    ("false", "", 0, True),
+    ("true", "", 1, False),
+    ("", "", 1, False),
+    ("true", "true", 0, True),
+])
+def test_brain_token_scope_on_private_repos(tmp_path, shim_path, private, protected, rc, sent):
+    env = {**BRAIN_ENV, "REPO_PRIVATE": private, "ENV_PROTECTED": protected}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "brain", BRAIN_TOKEN=SECRET, **env)
+    assert proc.returncode == rc, proc.stdout + proc.stderr
+    if sent:
+        assert "tk_s3cret" in stdin and "tk_s3cret" not in argv
+    else:
+        assert argv is None and stdin is None
+
+
+def test_secret_scope_inputs_come_from_the_repo_and_an_owner_variable():
+    for sid in ("notify", "brain"):
+        [s] = [x for x in JOBS["notify"]["steps"] if x.get("id") == sid]
+        assert s["env"]["REPO_PRIVATE"] == "${{ github.event.repository.private }}"
+        assert s["env"]["ENV_PROTECTED"] == "${{ vars.DEP_AUTO_APPLY_ENV_PROTECTED }}"
+
+
+# SC-37 form, tightened: the variable toggles between two literal labels and
+# can never name another runner; a public repo always gets the hosted label.
+_SA_SPEC = importlib.util.spec_from_file_location(
+    "security_audit_tests", Path(__file__).resolve().parent / "test_security_audit_workflow.py")
+
+
+def _eval_expr():
+    mod = importlib.util.module_from_spec(_SA_SPEC)
+    _SA_SPEC.loader.exec_module(mod)
+    return mod.eval_expr
+
+
+RUNNER_EXPR = "${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
+
+
+@pytest.mark.parametrize("name", ["apply", "publish", "notify"])
+def test_runner_variable_selects_only_literal_labels(name):
+    assert JOBS[name]["runs-on"] == RUNNER_EXPR
+    ev = _eval_expr()
+    body = re.fullmatch(r"\$\{\{(.*)\}\}", RUNNER_EXPR).group(1)
+    for private in (True, False):
+        for var in ("nexus-ci", "", "evil-persistent", "self-hosted", "NEXUS-CI-x"):
+            got = ev(body, {"github.event.repository.private": private, "vars.CI_RUNNER": var})
+            want = "nexus-ci" if private and var == "nexus-ci" else "ubuntu-latest"
+            assert got == want, (private, var, got)
