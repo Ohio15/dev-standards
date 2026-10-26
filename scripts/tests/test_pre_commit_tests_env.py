@@ -123,3 +123,87 @@ def test_failing_suite_still_fails_after_the_strip(tmp_path: Path) -> None:
 def test_githooks_copy_matches_canonical() -> None:
     root = HOOK.parent.parent
     assert (root / ".githooks" / "pre-commit-tests.sh").read_bytes() == HOOK.read_bytes()
+
+
+# --- CRLF / BOM tolerance ---------------------------------------------------
+# Windows-authored configs (ai-console, craft-tools, infra,
+# patriot-browser-policy-reconciler, PDFManager; shared-brain a0649d94) carry
+# CRLF, which used to leave a trailing CR on TEST_CMD.
+
+BOM = b"\xef\xbb\xbf"
+
+
+def make_repo_raw(tmp_path: Path, config_bytes: bytes) -> Path:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=clean_env(), check=True)
+    (repo / ".pre-commit-tests").write_bytes(config_bytes)
+    return repo
+
+
+def strict_cmd() -> str:
+    # Fails (exit 9) unless the final argument is exactly "ok" - a trailing CR
+    # on TEST_CMD makes it "ok\r".
+    code = "import sys; sys.exit(0 if sys.argv[-1]=='ok' else 9)"
+    return f'"{PY}" -c "{code}" ok'
+
+
+def test_crlf_config_behaves_like_lf(tmp_path: Path) -> None:
+    cfg = f"# gate\r\nTEST_CMD={strict_cmd()}\r\nTEST_TIMEOUT=60\r\nTEST_PATHS=*\r\n\r\n"
+    repo = make_repo_raw(tmp_path, cfg.encode())
+    (repo / "a.txt").write_text("x")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, env=clean_env(), check=True)
+    proc = run_hook(repo, {})
+    assert "pre-commit-tests: running" in proc.stderr, proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    # text=True folds CR into LF, so the echoed command is checked as bytes.
+    # (Git for Windows bash drops a trailing CR when it executes the command,
+    # so the exit code alone cannot prove the fix there; the echo can.)
+    raw = subprocess.run(
+        [BASH, HOOK.as_posix()], cwd=repo, env=clean_env(),
+        capture_output=True, timeout=120, check=False,
+    )
+    assert b"\r" not in raw.stderr, raw.stderr
+
+
+def test_crlf_failing_command_still_fails(tmp_path: Path) -> None:
+    cfg = f'TEST_CMD="{PY}" -c "import sys; sys.exit(5)"\r\n'
+    repo = make_repo_raw(tmp_path, cfg.encode())
+    proc = run_hook(repo, {})
+    assert proc.returncode == 5, proc.stderr
+
+
+def test_utf8_bom_on_first_line_is_tolerated(tmp_path: Path) -> None:
+    for eol in ("\n", "\r\n"):
+        sub = tmp_path / ("crlf" if eol == "\r\n" else "lf")
+        sub.mkdir()
+        repo = make_repo_raw(sub, BOM + f"TEST_CMD={strict_cmd()}{eol}".encode())
+        proc = run_hook(repo, {})
+        assert "ignoring unknown key" not in proc.stderr, proc.stderr
+        assert "pre-commit-tests: running" in proc.stderr, proc.stderr
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_bom_only_stripped_on_first_line(tmp_path: Path) -> None:
+    """A BOM mid-file is data, not a marker: that key stays unknown."""
+    cfg = f"TEST_CMD={strict_cmd()}\n".encode() + BOM + b"TEST_TIMEOUT=60\n"
+    repo = make_repo_raw(tmp_path, cfg)
+    proc = run_hook(repo, {})
+    assert "ignoring unknown key" in proc.stderr, proc.stderr
+
+
+def test_lf_config_unchanged_including_value_spacing(tmp_path: Path) -> None:
+    # Internal spacing of the command stays significant; TEST_PATHS skip works.
+    repo = make_repo_raw(
+        tmp_path,
+        f"TEST_CMD={strict_cmd()}\nTEST_TIMEOUT=60\nTEST_PATHS=src/**\n".encode(),
+    )
+    (repo / "a.txt").write_text("x")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, env=clean_env(), check=True)
+    proc = run_hook(repo, {})
+    assert "suite skipped" in proc.stderr, proc.stderr
+    assert proc.returncode == 0
+    (repo / ".pre-commit-tests").write_bytes(
+        f"TEST_CMD={strict_cmd()}\n".encode()
+    )
+    proc = run_hook(repo, {})
+    assert "pre-commit-tests: running" in proc.stderr and proc.returncode == 0, proc.stderr

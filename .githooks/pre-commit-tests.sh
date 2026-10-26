@@ -28,6 +28,8 @@
 #                                           # when set, the suite runs only if a
 #                                           # staged path matches one of them
 #
+# CRLF line endings and a leading UTF-8 BOM are tolerated and ignored.
+#
 # The file is PARSED, never sourced. Sourcing would execute everything in it at
 # read time; parsing means the only thing that runs is the declared TEST_CMD,
 # at the moment this hook chooses to run it.
@@ -71,7 +73,18 @@ test_cmd=""
 test_timeout="300"
 test_paths=""
 
+first_line=1
 while IFS= read -r line || [ -n "$line" ]; do
+  # A config saved on Windows can carry CRLF line endings and a UTF-8 BOM.
+  # `read -r` strips only the LF, so without this a CR stays on every value
+  # (TEST_CMD ends in a carriage return and its last argument is silently
+  # wrong) and the BOM glues itself to the first key, turning TEST_CMD into an
+  # "unknown key". Normalise here so a CRLF config behaves like an LF one.
+  if [ "$first_line" -eq 1 ]; then
+    line="${line#$'\xef\xbb\xbf'}"
+    first_line=0
+  fi
+  line="${line%$'\r'}"
   case "$line" in
     ''|'#'*) continue ;;
   esac
