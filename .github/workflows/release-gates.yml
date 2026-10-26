@@ -35,6 +35,7 @@ jobs:
       gitleaks_enabled: ${{ steps.parse.outputs.gitleaks_enabled }}
       size_guard_enabled: ${{ steps.parse.outputs.size_guard_enabled }}
       npm_audit_severity: ${{ steps.parse.outputs.npm_audit_severity }}
+      npm_audit_declared: ${{ steps.parse.outputs.npm_audit_declared }}
       conventional_commits_enabled: ${{ steps.parse.outputs.conventional_commits_enabled }}
       independence: ${{ steps.parse.outputs.independence }}
     steps:
@@ -72,6 +73,10 @@ jobs:
           gitleaks_enabled=$(read_with_default '.gates.gitleaks' 'true')
           size_guard_enabled=$(read_with_default '.gates.size_guard' 'true')
           npm_audit_severity=$(read_with_default '.gates.npm_audit' 'high')
+          # Declared means the repo asked for the gate. A declared gate that
+          # finds nothing to audit fails; only the implicit default may report
+          # "not examined" and pass (repos with no npm code at all).
+          npm_audit_declared=$(yq '.gates.npm_audit != null' release-config.yml)
           conventional_commits_enabled=$(read_with_default '.gates.conventional_commits' 'false')
           # STANDARDS §13.2: full | tooling | harness. Absent means full. An
           # unknown value is an error, never a wider exemption.
@@ -94,6 +99,7 @@ jobs:
             echo "gitleaks_enabled=$gitleaks_enabled"
             echo "size_guard_enabled=$size_guard_enabled"
             echo "npm_audit_severity=$npm_audit_severity"
+            echo "npm_audit_declared=$npm_audit_declared"
             echo "conventional_commits_enabled=$conventional_commits_enabled"
             echo "independence=$independence"
           } >> "$GITHUB_OUTPUT"
@@ -204,6 +210,9 @@ jobs:
     needs: read-config
     if: needs.read-config.outputs.npm_audit_severity != 'off'
     runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
+    env:
+      SEVERITY: ${{ needs.read-config.outputs.npm_audit_severity }}
+      DECLARED: ${{ needs.read-config.outputs.npm_audit_declared }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -213,14 +222,113 @@ jobs:
           package-manager-cache: false
           node-version: ${{ inputs.node_version }}
       - name: Run npm audit
+        id: audit
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f package.json ]; then
-            echo "no package.json — skipping (set gates.npm_audit: off in release-config.yml to silence)"
+          # Every tracked package.json is examined, not only the root one. The
+          # root-only check skipped when there was no root manifest, so repos
+          # that keep their code in backend/ and frontend/ passed this gate
+          # having audited nothing (ToolVault, APM; brain cb5d82c9). Same
+          # defect shape as SC-26 in security-audit.yml, fixed the same way.
+          summary() { printf -- '%s\n' "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          case "$SEVERITY" in
+            low|moderate|high|critical) ;;
+            *) echo "::error::gates.npm_audit: '$SEVERITY' is not one of low, moderate, high, critical, off"; exit 1 ;;
+          esac
+          # Lines: "ROOT <dir>" (an npm lockfile to audit) or "UNCOVERED <dir>"
+          # (a manifest no lockfile covers). A manifest is covered by its own
+          # package-lock.json / npm-shrinkwrap.json, or by an ancestor's lockfile
+          # that lists it as a workspace member; an ancestor lockfile that does
+          # not list it audits a different tree, so it does not count.
+          plan=$(git ls-files -z -- 'package.json' '**/package.json' | python3 -I -c '
+          import json, os, posixpath, sys
+          paths = [p for p in sys.stdin.buffer.read().decode().split("\0") if p]
+          # A path is repo content. A control character (a newline above all)
+          # could forge a workflow command when echoed, so refuse it.
+          hostile = [p for p in paths if any(ord(c) < 0x20 or ord(c) == 0x7f for c in p)]
+          if hostile:
+              sys.exit("control character in manifest path(s): " + ", ".join(repr(p) for p in hostile))
+          dirs = sorted({posixpath.dirname(p) or "." for p in paths
+                         if "node_modules" not in p.split("/")})
+          def lockfile(d):
+              for name in ("npm-shrinkwrap.json", "package-lock.json"):
+                  f = posixpath.join(d, name)
+                  if os.path.isfile(f):
+                      return f
+              return None
+          def ancestors(d):
+              while d != ".":
+                  d = posixpath.dirname(d) or "."
+                  yield d
+          roots, uncovered = [], []
+          for d in dirs:
+              if lockfile(d):
+                  roots.append(d)
+                  continue
+              owner = None
+              for a in ancestors(d):
+                  lf = lockfile(a)
+                  if not lf:
+                      continue
+                  try:
+                      members = json.load(open(lf, encoding="utf-8")).get("packages") or {}
+                  except (OSError, ValueError):
+                      members = {}
+                  rel = d if a == "." else posixpath.relpath(d, a)
+                  if rel in members:
+                      owner = a
+                  break
+              if owner is None:
+                  uncovered.append(d)
+              elif owner not in roots:
+                  roots.append(owner)
+          for d in sorted(set(roots)):
+              print("ROOT " + d)
+          for d in uncovered:
+              print("UNCOVERED " + d)
+          ')
+          roots=()
+          uncovered=()
+          while IFS= read -r line; do
+            # A Windows python3 (self-hosted runners, local tests) ends lines
+            # with CRLF; paths with a CR were already refused above.
+            line=${line%$'\r'}
+            case "$line" in
+              "ROOT "*) roots+=("${line#ROOT }") ;;
+              "UNCOVERED "*) uncovered+=("${line#UNCOVERED }") ;;
+            esac
+          done <<<"$plan"
+
+          if [ "${#roots[@]}" -eq 0 ] && [ "${#uncovered[@]}" -eq 0 ]; then
+            if [ "$DECLARED" = "true" ]; then
+              echo "::error::gates.npm_audit is declared ($SEVERITY) but the tree has no tracked package.json, so nothing would be audited. Set gates.npm_audit: off if this repo has no npm dependencies."
+              summary "- npm_audit: **FAIL**: declared, but no tracked package.json"
+              exit 1
+            fi
+            echo "::notice::npm_audit not examined: no tracked package.json (gate not declared in release-config.yml)"
+            summary "- npm_audit: NOT EXAMINED: no tracked package.json; gate not declared"
             exit 0
           fi
-          npm audit --audit-level=${{ needs.read-config.outputs.npm_audit_severity }}
+
+          fail=0
+          for d in ${uncovered[@]+"${uncovered[@]}"}; do
+            echo "::error::$d/package.json has no package-lock.json or npm-shrinkwrap.json covering it, so npm audit cannot examine it"
+            summary "- npm_audit ($d): **NOT EXAMINED**: no npm lockfile covers this manifest"
+            fail=1
+          done
+          for d in ${roots[@]+"${roots[@]}"}; do
+            echo "::group::npm audit ($d, --audit-level=$SEVERITY)"
+            if (cd -- "$d" && npm audit --package-lock-only --audit-level="$SEVERITY"); then
+              summary "- npm_audit ($d): pass at $SEVERITY"
+            else
+              echo "::error::npm audit failed in $d at --audit-level=$SEVERITY"
+              summary "- npm_audit ($d): **FAIL** at $SEVERITY"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
 
   tag-matches-version:
     needs: read-config
