@@ -697,6 +697,75 @@ fleet.
 **Since.** 2026-10-10.
 **Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
 
+### SC-43 · A credential issued or rotated on a path authenticated only by a weaker shared credential
+**Shape.** A per-principal secret (device secret, client certificate, session
+key) is minted, or an existing one overwritten, on a code path whose caller
+proved only possession of a shared or weaker credential. The strong credential
+then launders the weak one, and an existing holder can be displaced. sentinel
+2026-10-26: a token-only WebSocket reconnect issued a client certificate and a
+fresh device secret for any existing `agent_id`, overwriting the stored
+`ws_secret_hash` (HIGH).
+**Check.** Grep every call that writes a per-principal credential
+(`issueDeviceSecret`, `IssueClientCertificate`,
+`UPDATE .* (ws_secret_hash|client_cert_serial)`) and trace the auth branch that
+reaches it. Mechanical test: a connection authenticated only by the shared
+token against a row that already holds a credential must leave the stored
+credential unchanged and must not receive a new one.
+**Fix form.** Issue a credential only on true enrollment or on proof of the
+previous credential; never overwrite an existing credential from a weaker
+path; admin-only reset.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
+### SC-44 · Identity canonicalised at one reader but stored or compared raw elsewhere
+**Shape.** An identifier is normalised (TrimSpace, ToLower, Unicode folding) at
+one consumer but stored, unique-indexed or compared byte-for-byte at others,
+so two distinct stored identities map to one at the normalising reader.
+sentinel 2026-10-26: gRPC auth trimmed the certificate CN while enrollment
+stored `agent_id` raw, so `"<victim> "` wrote Data Plane data as `<victim>`
+(HIGH).
+**Check.** Grep `TrimSpace|ToLower|EqualFold|NFC|NFKC` applied to identity
+fields (cert CN, agent_id, username, hostname) in auth and lookup paths; for
+each hit, grep the writer and the unique index for the same normalisation.
+Mechanical test: enrol `"<id> "` and `"<id>"`; every reader must resolve them
+to different principals or refuse the first.
+**Fix form.** Validate the identifier format once at first acceptance; compare
+byte-for-byte everywhere after that.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
+### SC-45 · A process-local mutex held across database I/O on a path where another path takes a row lock before that mutex
+**Shape.** Code holds an in-process lock while issuing a database statement
+that can block on a row lock, while another path acquires that row lock
+(`SELECT ... FOR UPDATE` / `UPDATE` in a transaction) and then the same
+in-process lock. The database cannot see the mutex, so the deadlock is never
+detected. sentinel 2026-10-26: the PKI mutex held across `UPDATE devices`
+versus `RotateCertificateTx` row-locking first (MEDIUM; hangs issuance for
+every agent).
+**Check.** Grep `\.Lock\(\)` followed by `Exec|Query|QueryRow` before the
+matching `Unlock`; for each, grep callers that enter it from inside a
+transaction holding a row lock. Mechanical test: run both paths concurrently
+for the same row under a timeout.
+**Fix form.** One lock order everywhere, or never hold the mutex across
+database I/O.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (MEDIUM; approved by Ron 2026-10-26).
+
+### SC-46 · A public repository with a registered self-hosted runner
+**Shape.** A repository whose visibility is public has one or more self-hosted
+runners registered (directly or via an unrestricted runner group), so any
+approved fork pull request can run its own workflow on that host regardless of
+the repo's own `runs-on` guards. sentinel 2026-10-26: public repo with runner
+`nexus-sentinel` online on the production host (HIGH; closed by making the
+repo private).
+**Check.** Mechanical: `gh api repos/<o>/<r> --jq .visibility` == `public` AND
+`gh api repos/<o>/<r>/actions/runners --jq .total_count` > 0 (or the repo is
+in a runner group without `restricted_to_workflows`) is a finding.
+**Fix form.** Private repository, or a runner group restricted to named
+workflows and refs, or no self-hosted runner on the repo.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -710,5 +779,6 @@ SC-22..SC-24 (audit-cortex-hooks-2026-09-15, approved 2026-09-16), SC-29..SC-31
 SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
 and renumbered because those numbers were already graduated), approved
 2026-10-09. SC-39..SC-42 (audit-patriot-provisioning-2026-10-10), approved
-2026-10-10. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
+2026-10-10. SC-43..SC-46 (audit-sentinel-2026-10-26), approved
+2026-10-26. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
 written as proposals; the numbers stay reserved.
