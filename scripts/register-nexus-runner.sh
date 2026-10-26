@@ -103,8 +103,12 @@ fi
 # never appears in argv (visible in `ps`).
 echo ">> provisioning on ${NEXUS_HOST} (dir: actions-runner-${REPO_LOWER})"
 
-# Build the remote script with values substituted on this side. The token
-# travels over the encrypted ssh stdin only and never appears in argv.
+# Build the remote script with values substituted on this side. The tokens
+# travel over the encrypted ssh stdin only and never appear in argv: on NEXUS
+# they reach config.sh through ACTIONS_RUNNER_INPUT_TOKEN, never --token
+# (/proc has no hidepid there, so any local uid can read a cmdline). The
+# runner reads that variable as the `token` arg, masks it in _diag and
+# unsets it (actions/runner src/Runner.Listener/CommandSettings.cs).
 # The heredoc is unquoted so local "$VAR" expand; remote-only vars (HOME,
 # bash internals) are escaped with \$.
 REMOTE_SCRIPT="$(cat <<REMOTE_EOF
@@ -155,14 +159,15 @@ fi
 # during a fresh local config pass. The remove path uses a separate "remove
 # token" minted by the caller.
 if [[ -f .runner ]]; then
-    ./config.sh remove --token "\$REMOVE_TOKEN" >/dev/null 2>&1 || true
+    # </dev/null: \`remove\` has no --unattended, and a prompt must never read
+    # the rest of this script from the ssh stdin.
+    ACTIONS_RUNNER_INPUT_TOKEN="\$REMOVE_TOKEN" ./config.sh remove </dev/null >/dev/null 2>&1 || true
 fi
 
-./config.sh \\
+ACTIONS_RUNNER_INPUT_TOKEN="\$REG_TOKEN" ./config.sh \\
     --unattended \\
     --replace \\
     --url "https://github.com/\${OWNER}/\${REPO}" \\
-    --token "\$REG_TOKEN" \\
     --name "\$RUNNER_NAME" \\
     --work _work \\
     --labels "\$LABELS"
