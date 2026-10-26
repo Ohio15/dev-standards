@@ -16,11 +16,14 @@ Run:  python -m pytest scripts/tests -q
 """
 from __future__ import annotations
 
+import json
+import atexit
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -44,6 +47,19 @@ def bash_exe() -> str:
 
 
 BASH = bash_exe()
+
+
+def bash_argv(script: str) -> list[str]:
+    """Run a step body the way Actions does: from a file (`bash {0}`), not
+    `bash -c`. Git-bash on Windows truncates a -c argument near 8 KiB, which
+    cut the detect script mid-heredoc."""
+    fd, path = tempfile.mkstemp(suffix=".sh", prefix="step-")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(script)
+    atexit.register(lambda: os.path.exists(path) and os.remove(path))
+    return [BASH, "--noprofile", "--norc", path]
+
+
 WORKFLOW = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
 JOBS = WORKFLOW["jobs"]
 
@@ -96,7 +112,7 @@ def run_detect(tmp_path: Path, shim_path: str, files: dict[str, str]):
     out = tmp_path / "github_output"
     out.write_text("", encoding="utf-8")
     env = {**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()}
-    proc = subprocess.run([BASH, "-c", step_run("detect", "detect")], cwd=repo, env=env,
+    proc = subprocess.run(bash_argv(step_run("detect", "detect")), cwd=repo, env=env,
                           capture_output=True, text=True)
     outputs = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line)
     return proc, outputs
@@ -141,7 +157,7 @@ def test_untracked_manifests_do_not_count(tmp_path, shim_path):
     (repo / "package.json").write_text("{}", encoding="utf-8")
     out = tmp_path / "o"
     out.write_text("", encoding="utf-8")
-    proc = subprocess.run([BASH, "-c", step_run("detect", "detect")], cwd=repo,
+    proc = subprocess.run(bash_argv(step_run("detect", "detect")), cwd=repo,
                           env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()},
                           capture_output=True, text=True)
     # Assert the REASON too: exit 1 alone is also what a missing git gives.
@@ -177,7 +193,7 @@ EXPR = re.compile(r"^\$\{\{\s*([^}]+?)\s*\}\}$")
 
 def run_summary(tmp_path: Path, shim_path: str, *, detect: str = "success",
                 npm=("false", "skipped"), go=("false", "skipped"), py=("false", "skipped"),
-                dirs=("[]", "[]", "[]")):
+                dirs=("[]", "[]", "[]"), covered: str = "{}"):
     """Run the summary step the way Actions does: each `env:` entry's
     expression is evaluated, and the script sees only environment variables."""
     values = {
@@ -187,6 +203,7 @@ def run_summary(tmp_path: Path, shim_path: str, *, detect: str = "success",
         "needs.detect.outputs.has_python": py[0], "needs.pip-audit.result": py[1],
         "needs.detect.outputs.npm_dirs": dirs[0], "needs.detect.outputs.go_dirs": dirs[1],
         "needs.detect.outputs.python_dirs": dirs[2],
+        "needs.detect.outputs.npm_covered": covered,
     }
     [step] = [s for s in JOBS["summary"]["steps"] if "run" in s]
     env = {}
@@ -195,7 +212,7 @@ def run_summary(tmp_path: Path, shim_path: str, *, detect: str = "success",
         assert m and m.group(1) in values, f"summary env {name} uses an expression this test does not model: {expr}"
         env[name] = values[m.group(1)]
     summ = tmp_path / "summary.md"
-    proc = subprocess.run([BASH, "-c", step["run"]], cwd=tmp_path,
+    proc = subprocess.run(bash_argv(step["run"]), cwd=tmp_path,
                           env={**os.environ, **env, "PATH": shim_path, "GITHUB_STEP_SUMMARY": summ.as_posix()},
                           capture_output=True, text=True)
     proc.summary = summ.read_text(encoding="utf-8") if summ.exists() else ""
@@ -225,6 +242,225 @@ def test_an_undetected_ecosystem_that_ran_is_a_disagreement(tmp_path, shim_path)
     proc = run_summary(tmp_path, shim_path, npm=("true", "success"), go=("false", "success"))
     assert proc.returncode == 1
     assert "go was not detected but its audit ran" in proc.stdout
+
+
+# ─── workspace members ───────────────────────────────────────────────────────
+# openclaw-1 (shared-brain discovery 54c58aa3): 36 pnpm workspace members had
+# no lockfile of their own, so each got its own job, ran `npm install` and
+# failed on `workspace:*`. A member is audited once, by the root whose lockfile
+# resolves it, and only when that is provable from tracked files.
+
+PNPM_LOCK = """lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+  extensions/slack:
+    dependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../..
+
+  'packages/core':
+    dependencies: {}
+
+  ui: {}
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-x}
+"""
+
+
+def workspace_repo(extra: dict[str, str] | None = None, workspace: str | None = None,
+                   lock: str = PNPM_LOCK) -> dict[str, str]:
+    files = {
+        "package.json": '{"name": "root"}',
+        "pnpm-lock.yaml": lock,
+        "pnpm-workspace.yaml": workspace if workspace is not None else
+            "packages:\n  - .\n  - 'packages/*'   # quoted\n  - \"ui\"\n  - extensions/*\n\nonlyBuiltDependencies:\n  - esbuild\n",
+        "extensions/slack/package.json": "{}",
+        "packages/core/package.json": "{}",
+        "ui/package.json": "{}",
+    }
+    files.update(extra or {})
+    return files
+
+
+def test_pnpm_workspace_members_fold_into_the_root(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo({
+        # Vendored code with its own lockfile is its own job.
+        "vendor/lib/package.json": "{}", "vendor/lib/package-lock.json": '{"packages": {}}',
+        # Not a workspace member at all: keeps its job (and fails loudly there).
+        "tools/script/package.json": "{}",
+    }))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert o["npm_dirs"] == '[".", "tools/script", "vendor/lib"]'
+    assert json.loads(o["npm_covered"]) == {"extensions/slack": ".", "packages/core": ".", "ui": "."}
+    assert "::warning::" not in proc.stdout, proc.stdout
+
+
+def test_a_member_the_lockfile_does_not_name_keeps_its_own_job(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo({"extensions/new/package.json": "{}"}))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "extensions/new" in json.loads(o["npm_dirs"])
+    assert "extensions/new" not in json.loads(o["npm_covered"])
+    assert "extensions/new matches the workspace globs of . but that lockfile has no entry" in proc.stdout
+
+
+def test_a_negated_glob_excludes(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo(
+        workspace="packages:\n  - 'packages/*'\n  - ui\n  - 'extensions/**'\n  - '!**/slack'\n"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_dirs"]) == [".", "extensions/slack"]
+    assert json.loads(o["npm_covered"]) == {"packages/core": ".", "ui": "."}
+
+
+def test_flow_sequence_globs_are_read(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo(workspace="packages: [ui, 'extensions/*']\n"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {"extensions/slack": ".", "ui": "."}
+    assert "packages/core" in json.loads(o["npm_dirs"])
+
+
+@pytest.mark.parametrize("workspace", [
+    "packages:\n  key: value\n",                 # a map, not a sequence
+    "packages: 'ui'\n",                          # a scalar
+    "packages:\n  - ui\n  - '!{a,b}/**'\n",      # an exclusion this parser cannot read
+])
+def test_unreadable_workspace_folds_nothing(tmp_path, shim_path, workspace):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo(workspace=workspace))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {}
+    assert json.loads(o["npm_dirs"]) == [".", "extensions/slack", "packages/core", "ui"]
+    assert "::warning::workspace: pnpm-workspace.yaml could not be read" in proc.stdout
+
+
+def test_a_settings_only_workspace_file_declares_no_members(tmp_path, shim_path):
+    # vendor/a2ui eval dirs: pnpm-workspace.yaml holding only
+    # onlyBuiltDependencies. Nothing to fold, and nothing to warn about.
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo(workspace="onlyBuiltDependencies:\n  - esbuild\n"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {}
+    assert json.loads(o["npm_dirs"]) == [".", "extensions/slack", "packages/core", "ui"]
+    assert "::warning::" not in proc.stdout
+
+
+def test_pnpm_ignores_package_json_workspaces(tmp_path, shim_path):
+    # pnpm reads only pnpm-workspace.yaml; a `workspaces` field beside a
+    # pnpm-lock.yaml declares nothing pnpm installs.
+    files = workspace_repo()
+    del files["pnpm-workspace.yaml"]
+    files["package.json"] = '{"name": "root", "workspaces": ["ui", "extensions/*", "packages/*"]}'
+    proc, o = run_detect(tmp_path, shim_path, files)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {}
+
+
+def test_a_member_with_its_own_lockfile_is_its_own_job(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo({"ui/package-lock.json": '{"packages": {}}'}))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ui" in json.loads(o["npm_dirs"]) and "ui" not in json.loads(o["npm_covered"])
+
+
+def test_untracked_workspace_file_declares_nothing(tmp_path, shim_path):
+    files = workspace_repo()
+    body = files.pop("pnpm-workspace.yaml")
+    repo = git_repo(tmp_path, files)
+    (repo / "pnpm-workspace.yaml").write_text(body, encoding="utf-8")
+    out = tmp_path / "o"
+    out.write_text("", encoding="utf-8")
+    proc = subprocess.run(bash_argv(step_run("detect", "detect")), cwd=repo,
+                          env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()},
+                          capture_output=True, text=True)
+    o = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {}
+
+
+def test_npm_workspaces_fold_through_package_lock(tmp_path, shim_path):
+    lock = json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"workspaces": ["apps/*"]}, "apps/web": {"name": "web"}, "node_modules/web": {"link": True}}})
+    proc, o = run_detect(tmp_path, shim_path, {
+        "package.json": '{"workspaces": {"packages": ["apps/*"]}}', "package-lock.json": lock,
+        "apps/web/package.json": "{}", "apps/cli/package.json": "{}",
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {"apps/web": "."}
+    assert json.loads(o["npm_dirs"]) == [".", "apps/cli"]
+    assert "apps/cli matches the workspace globs of . but that lockfile has no entry" in proc.stdout
+
+
+def test_yarn_berry_workspaces_need_a_workspace_locator(tmp_path, shim_path):
+    lock = BERRY_LOCK + '\n"web@workspace:apps/web":\n  version: 0.0.0-use.local\n'
+    proc, o = run_detect(tmp_path, shim_path, {
+        "package.json": '{"workspaces": ["apps/*"]}', "yarn.lock": lock,
+        "apps/web/package.json": "{}", "apps/webx/package.json": "{}",
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {"apps/web": "."}
+    assert json.loads(o["npm_dirs"]) == [".", "apps/webx"]
+
+
+def test_the_nearest_declaring_root_covers_a_member(tmp_path, shim_path):
+    inner_lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  pkg/a: {}\n"
+    proc, o = run_detect(tmp_path, shim_path, workspace_repo({
+        "extensions/slack/pnpm-workspace.yaml": "packages:\n  - 'pkg/*'\n",
+        "extensions/slack/pnpm-lock.yaml": inner_lock,
+        "extensions/slack/pkg/a/package.json": "{}",
+    }, workspace="packages:\n  - 'extensions/**'\n"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    covered = json.loads(o["npm_covered"])
+    assert covered["extensions/slack/pkg/a"] == "extensions/slack"
+    assert "extensions/slack" in json.loads(o["npm_dirs"])  # it has its own lockfile
+
+
+def test_summary_lists_each_member_and_its_root(tmp_path, shim_path):
+    proc = run_summary(tmp_path, shim_path, npm=("true", "success"), dirs=('[".", "vendor/lib"]', "[]", "[]"),
+                       covered='{"extensions/slack": ".", "ui": "."}')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "| extensions/slack | . | success |" in proc.summary
+    assert "| ui | . | success |" in proc.summary
+    assert "npm workspace members covered through a root: 2" in proc.stdout
+
+
+@pytest.mark.parametrize("result", ["failure", "skipped", "cancelled"])
+def test_a_member_whose_root_did_not_succeed_fails(tmp_path, shim_path, result):
+    proc = run_summary(tmp_path, shim_path, npm=("true", result), dirs=('["."]', "[]", "[]"),
+                       covered='{"ui": "."}')
+    assert proc.returncode == 1
+    assert f'npm workspace member "ui" is covered by ".", whose audit result is "{result}"' in proc.stdout
+    assert f"| ui | . | {result} |" in proc.summary
+
+
+def test_a_member_credited_to_an_unaudited_root_is_not_examined(tmp_path, shim_path):
+    proc = run_summary(tmp_path, shim_path, npm=("true", "success"), dirs=('["vendor/lib"]', "[]", "[]"),
+                       covered='{"ui": "."}')
+    assert proc.returncode == 1
+    assert "which no npm audit job ran for" in proc.stdout
+    assert "| ui | . | NOT EXAMINED |" in proc.summary
+
+
+@pytest.mark.parametrize("covered", ["not json", '["ui"]'])
+def test_a_malformed_coverage_list_fails(tmp_path, shim_path, covered):
+    proc = run_summary(tmp_path, shim_path, npm=("true", "success"), dirs=('["."]', "[]", "[]"), covered=covered)
+    assert proc.returncode == 1
+    assert "workspace coverage list from detect" in proc.stdout
+
+
+def test_detect_publishes_the_coverage_list_to_the_summary():
+    assert JOBS["detect"]["outputs"]["npm_covered"] == "${{ steps.detect.outputs.npm_covered }}"
+    [step] = [s for s in JOBS["summary"]["steps"] if "run" in s]
+    assert step["env"]["NPM_COVERED"] == "${{ needs.detect.outputs.npm_covered }}"
 
 
 # ─── injection ───────────────────────────────────────────────────────────────
@@ -260,7 +496,7 @@ def test_a_control_character_in_a_manifest_path_fails_detection(tmp_path, shim_p
                     f"100644,{blob},evil\n::error::forged/pyproject.toml"], check=True)
     out = tmp_path / "o"
     out.write_text("", encoding="utf-8")
-    proc = subprocess.run([BASH, "-c", step_run("detect", "detect")], cwd=repo,
+    proc = subprocess.run(bash_argv(step_run("detect", "detect")), cwd=repo,
                           env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()},
                           capture_output=True, text=True)
     assert proc.returncode != 0
@@ -339,7 +575,7 @@ def run_yarn(tmp_path: Path, shim_path: str, lock: str, out: str, rc: int, step:
         p.chmod(0o755)
     # Trusted: these cases are about which yarn runs and how its report is
     # read; the untrusted (pull_request) install has its own tests below.
-    proc = subprocess.run([BASH, "-c", npm_step(step)], cwd=work, capture_output=True, text=True,
+    proc = subprocess.run(bash_argv(npm_step(step)), cwd=work, capture_output=True, text=True,
                           env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "true"})
     proc.calls = (tmp_path / "yarn-calls").read_text(encoding="utf-8") if (tmp_path / "yarn-calls").exists() else ""
     proc.corepack = (tmp_path / "corepack-calls").read_text(encoding="utf-8") if (tmp_path / "corepack-calls").exists() else ""
@@ -622,7 +858,7 @@ def run_install(tmp_path: Path, shim_path: str, files: dict[str, str], trusted: 
         p.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
         p.chmod(0o755)
     genv = tmp_path / "github_env"
-    proc = subprocess.run([BASH, "-c", npm_step("Install")], cwd=work, capture_output=True, text=True,
+    proc = subprocess.run(bash_argv(npm_step("Install")), cwd=work, capture_output=True, text=True,
                           env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": trusted, "DIR": ".",
                                "GITHUB_ENV": genv.as_posix(), "GITHUB_WORKSPACE": work.as_posix()})
     proc.calls = Path(log).read_text(encoding="utf-8") if Path(log).exists() else ""
@@ -715,7 +951,7 @@ def test_planted_packaging_in_the_checkout_is_not_imported(tmp_path, shim_path):
     for f in ("python", "pip-audit"):
         (bindir / f).chmod(0o755)
     [run] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
-    proc = subprocess.run([BASH, "-c", run], cwd=work, capture_output=True, text=True,
+    proc = subprocess.run(bash_argv(run), cwd=work, capture_output=True, text=True,
                           env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "false", "DIR": "."})
     out = proc.stdout + proc.stderr
     assert "PLANTED" not in out, out

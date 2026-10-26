@@ -132,6 +132,8 @@ Drop-in CI gate that runs on every pull request, every push to `main`/`master`, 
 
 A repo with no manifest at all fails too, unless it says why in `.github/security-audit-no-manifests`, which must not be empty. Until 2026-09-28 detection looked only at the repo root, and `skipped` counted as a pass. ai-console, whose manifests live in `console/`, was green on every PR having examined nothing (audit-ai-console-2026-09-28, proposed SC-26). `scripts/tests/test_security_audit_workflow.py` runs the shipped `detect` and `summary` scripts against throwaway repos, so that regression cannot return silently.
 
+**Workspace members are audited once, through their root.** A directory with no lockfile of its own that a tracked ancestor lockfile's workspace declares (pnpm-workspace.yaml `packages:` beside pnpm-lock.yaml, else package.json `workspaces`; `!` globs exclude) and that the lockfile actually names (pnpm importer, package-lock.json `packages` key, yarn berry `@workspace:` locator) gets no job of its own: the root's frozen install checks it and the root's audit reads the whole lockfile (verified for `npm audit` on a workspace root, 2026-10-26). The summary lists each member with the root that covered it, and a member fails unless the npm audit result is `success`; a member credited to a root no job ran for is NOT EXAMINED. Anything not provably covered keeps its own job. Before this, openclaw-1's 37 pnpm members each ran `npm install` and failed on `workspace:*` (discovery 54c58aa3).
+
 Moderate / low findings are logged to the workflow summary but don't fail the build. Layer A is **not** opt-in — it runs unconditionally on every repo `install.sh` touches.
 
 ### Layer B — `dep-auto-apply.yml` (opt-in, weekly)
