@@ -39,6 +39,22 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
+# Visibility is resolved before anything is written. GitHub's own answer,
+# when gh can give one, wins: a flag that contradicts it is an error, never
+# an override, so --visibility=private cannot put the nexus-ci toggle into a
+# repo GitHub says is public.
+gh_visibility=""
+if command -v gh >/dev/null 2>&1; then
+  if v="$(cd "$target" && gh repo view --json isPrivate --jq .isPrivate 2>/dev/null)"; then
+    case "$v" in true) gh_visibility=private ;; false) gh_visibility=public ;; esac
+  fi
+fi
+if [ -n "$visibility" ] && [ -n "$gh_visibility" ] && [ "$visibility" != "$gh_visibility" ]; then
+  echo "ERROR: --visibility=$visibility contradicts GitHub, which reports this repo as $gh_visibility" >&2
+  exit 2
+fi
+[ -n "$visibility" ] || visibility="$gh_visibility"
+
 mkdir -p "$target/.githooks" "$target/.github/workflows"
 
 # Chained dispatcher + sub-hooks. Each sub-hook is independently executable so
@@ -74,11 +90,6 @@ cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
 cp "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
 cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
-if [ -z "$visibility" ] && command -v gh >/dev/null 2>&1; then
-  if v="$(cd "$target" && gh repo view --json isPrivate --jq .isPrivate 2>/dev/null)"; then
-    case "$v" in true) visibility=private ;; false) visibility=public ;; esac
-  fi
-fi
 runner_note="nexus-ci in this private repo when vars.CI_RUNNER == 'nexus-ci', else ubuntu-latest"
 if [ "$visibility" != "private" ]; then
   # Public or unconfirmed: hosted literal only (SC-37 makes any

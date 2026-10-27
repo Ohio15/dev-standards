@@ -1212,3 +1212,18 @@ def _glob_re():
 def test_glob_re_follows_dot_false(pat, path, want):
     rx = _glob_re()(pat)
     assert bool(rx and rx.match(path)) is want, (pat, path)
+
+
+# Gate pass 2 on #62 (SC-19/SC-04): a pnpm-workspace.yaml whose top-level
+# mapping is indented (valid YAML) used to skip every key check.
+@pytest.mark.parametrize("body", [
+    " registry: https://attacker.example/\n packages:\n   - a\n",
+    "\tregistry: https://attacker.example/\n",
+    "- registry\n",
+    "# c\n\n   auditConfig:\n     ignoreCves: [CVE-1]\n",
+])
+def test_untrusted_indented_workspace_document_is_not_examined(tmp_path, shim_path, body):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "package-lock.json": "{}",
+                                             "pnpm-workspace.yaml": body}, "false")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not examined" in proc.stdout and "cannot be read safely" in proc.stdout, proc.stdout

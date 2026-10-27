@@ -24,9 +24,13 @@ name: Security Audit (Layer A)
 # - Trusted events are schedule, and push or workflow_dispatch ON THE DEFAULT
 #   BRANCH (github.ref == refs/heads/<default_branch>): code that is already
 #   merged. Every other event or ref, pull_request above all, is untrusted.
-# - Runner (SC-37 allow-list, audit-dev-standards-2026-10-27): every job says
+# - Runner (SC-37 allow-list, audit-dev-standards-2026-10-27): in the fleet
+#   TEMPLATE (templates/.github/workflows/) every job says
 #     runs-on: <SC-37 event allow-list> && github.event.repository.private
 #              && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'
+#   A copy install.sh writes into a repo it cannot confirm is private, and
+#   dev-standards' own copy (a public repo), instead carries the literal
+#   `runs-on: ubuntu-latest` on every job; the rest of the file is identical.
 #   The allow-list admits push, schedule, workflow_dispatch, release,
 #   merge_group and a SAME-repo pull_request; a fork PR never matches. The
 #   variable only toggles between two literals (it can never name another
@@ -493,9 +497,19 @@ jobs:
                           bad.append(f"{f!r}: {s.split()[0][:60]!r}")
               f = os.path.join(d, "pnpm-workspace.yaml")
               if os.path.isfile(f):
+                  seen_top = False
                   for ln in text(f).splitlines():
-                      if not ln.strip() or ln.lstrip().startswith("#") or ln[0] in " \t-" or ln.strip() == "---":
+                      if not ln.strip() or ln.lstrip().startswith("#") or ln.strip() in ("---", "..."):
                           continue
+                      if ln[0] in " \t-":
+                          # Nested under a top-level key, unless no key came
+                          # first: then the whole mapping is indented (valid
+                          # YAML) and these ARE the top-level keys. Unreadable.
+                          if not seen_top:
+                              bad.append(f"{f!r}: indented or non-mapping top level; cannot be read safely")
+                              break
+                          continue
+                      seen_top = True
                       m = re.match(r"(['\"]?)([A-Za-z][A-Za-z0-9]*)\1\s*:", ln)
                       if not m or m.group(2) not in PNPM_WS_OK:
                           bad.append(f"{f!r}: {ln.split(':', 1)[0][:60]!r}")

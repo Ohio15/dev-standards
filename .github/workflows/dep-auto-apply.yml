@@ -1360,65 +1360,153 @@ jobs:
                   out[k] = unquote(v)
               return out
 
-          def pnpm_doc(path, text):
-              """The parts of a pnpm-lock.yaml the binding rules need, read by
-              indentation (no YAML library in an isolated interpreter):
-              records {key: {field: value}} from packages:/snapshots: (the
-              flow or block `resolution` is flattened to resolution.<k>), and
-              importers {(importer, section): {dep names}}, where a v5/v6
-              single-project lockfile's top-level dependency sections are
-              importer '.'."""
-              records, importers = {}, collections.defaultdict(set)
-              top = rec = field = importer = section = None
-              for raw in (text or "").splitlines():
-                  if not raw.strip() or raw.lstrip().startswith("#"):
+          def yaml_blocks(path, text):
+              """The block-mapping structure of a YAML document, nesting
+              read from RELATIVE indentation (a stack), as YAML does: any
+              consistent indent is understood, and every line is either
+              placed or refused (gate pass 2 on #62, SC-19). Modelled: block
+              mappings `key: value` / `key:`, block sequences of plain items,
+              one-line flow values (kept as raw text). Refused, fail-closed:
+              tabs in indentation, a line deeper than its parent allows, an
+              indent matching no open level, block scalars, anchors, aliases,
+              tags, complex keys, `- key: value` items, duplicate keys,
+              multi-document streams."""
+              root = {}
+              # [indent of the parent line, indent of the children (None
+              # until the first child), container (None until typed)]
+              stack = [[-1, None, root]]
+              for no, raw in enumerate((text or "").splitlines(), 1):
+                  body = raw.rstrip()
+                  if not body.strip() or body.lstrip().startswith("#"):
                       continue
-                  if "\t" in raw[:len(raw) - len(raw.lstrip())]:
-                      die(f"{path}: tab indentation; cannot be read")
-                  ind = len(raw) - len(raw.lstrip(" "))
-                  line = raw.strip()
-                  if ind == 0:
-                      top = line.split(":", 1)[0].strip("'\"")
-                      rec = field = importer = section = None
+                  lead = body[:len(body) - len(body.lstrip())]
+                  if lead.strip(" "):
+                      die(f"{path}:{no}: tab in indentation; cannot be read safely")
+                  if body.strip() in ("---", "..."):
+                      if no == 1 or not root:
+                          continue
+                      die(f"{path}:{no}: a second YAML document; cannot be read safely")
+                  ind, line = len(lead), body.strip()
+                  while True:
+                      parent_ind, child_ind = stack[-1][0], stack[-1][1]
+                      if child_ind is None:
+                          if ind > parent_ind:
+                              stack[-1][1] = ind
+                              break
+                          if len(stack) == 1:
+                              die(f"{path}:{no}: unreadable indentation")
+                          stack.pop()
+                          continue
+                      if ind == child_ind:
+                          break
+                      if ind < child_ind and len(stack) > 1:
+                          stack.pop()
+                          continue
+                      die(f"{path}:{no}: indentation {ind} matches no open level; cannot be read safely")
+                  entry = stack[-1]
+                  if line == "-" or line.startswith("- "):
+                      item = line[1:].strip()
+                      if entry[2] is None:
+                          entry[2] = []
+                          entry[3][entry[4]] = entry[2]
+                      if not isinstance(entry[2], list) or PNPM_KV.fullmatch(item) or item[:1] in "&*!|>?-{[":
+                          die(f"{path}:{no}: unmodelled sequence item {line[:80]!r}")
+                      entry[2].append(unquote(item))
                       continue
                   m = PNPM_KV.fullmatch(line)
-                  if top in ("packages", "snapshots"):
-                      if ind == 2:
-                          if not m:
-                              die(f"{path}: unreadable {top} key {line!r}")
-                          rec = (top, unquote(m.group(1)))
-                          if rec in records:
-                              die(f"{path}: duplicate {top} key {rec[1]!r}")
-                          records[rec] = {}
-                          field = None
-                      elif rec is not None and ind == 4 and m:
-                          field = unquote(m.group(1))
-                          value = (m.group(2) or "").strip()
-                          if field in records[rec]:
-                              die(f"{path}: {rec[1]!r} repeats {field!r}")
-                          records[rec][field] = value
-                          if field == "resolution" and value:
-                              for k, v in flow_map(path, rec[1], value).items():
-                                  records[rec][f"resolution.{k}"] = v
-                      elif rec is not None and ind == 6 and field == "resolution" and m:
-                          k = f"resolution.{unquote(m.group(1))}"
-                          if k in records[rec]:
-                              die(f"{path}: {rec[1]!r} repeats {k!r}")
-                          records[rec][k] = unquote(m.group(2) or "")
-                  elif top == "importers":
-                      if ind == 2 and m:
-                          importer, section = m.group(1).strip("'\""), None
-                      elif ind == 4 and m and importer is not None:
-                          section = m.group(1)
-                      elif ind == 6 and m and importer is not None and section in DEP_SECTIONS:
-                          importers[(importer, section)].add(m.group(1).strip("'\""))
-                  elif top in DEP_SECTIONS and ind == 2 and m:
-                      importers[(".", top)].add(m.group(1).strip("'\""))
-              return records, importers
+                  if not m or line[:1] in "?&*!|>-[{":
+                      die(f"{path}:{no}: unreadable line {line[:80]!r}")
+                  key, value = unquote(m.group(1)), (m.group(2) or "").strip()
+                  if value[:1] in ("&", "*", "!", "|", ">"):
+                      die(f"{path}:{no}: anchor, alias, tag or block scalar at {key!r}; cannot be read safely")
+                  if entry[2] is None:
+                      entry[2] = {}
+                      entry[3][entry[4]] = entry[2]
+                  if not isinstance(entry[2], dict):
+                      die(f"{path}:{no}: a mapping key inside a sequence ({key!r})")
+                  if key in entry[2]:
+                      die(f"{path}:{no}: duplicate key {key!r}")
+                  if value:
+                      entry[2][key] = value
+                  else:
+                      entry[2][key] = None
+                      stack.append([ind, None, None, entry[2], key])
+              return root
+
+          def pnpm_doc(path, text):
+              """The parts of a pnpm-lock.yaml the binding rules need, from
+              yaml_blocks: records {(section, key): {field: value}} from
+              packages:/snapshots: (resolution flattened to resolution.<k>,
+              flow or block), importer dependency names
+              {(importer, section): {names}} and their versions
+              {(importer, section, name): version}; a v5/v6 single-project
+              lockfile's top-level dependency sections are importer '.'."""
+              doc = yaml_blocks(path, text)
+              records, importers, versions = {}, collections.defaultdict(set), {}
+              for sec in ("packages", "snapshots"):
+                  part = doc.get(sec)
+                  if part is None:
+                      continue
+                  if not isinstance(part, dict):
+                      die(f"{path}: {sec} is not a block mapping")
+                  for key, rec in part.items():
+                      fields = {}
+                      if isinstance(rec, str):
+                          # `a@1.0.0: {}` (v9 snapshots). A packages record
+                          # written inline could carry a resolution unseen.
+                          if rec != "{}" and sec == "packages":
+                              die(f"{path}: packages record {key!r} is written inline; cannot be read safely")
+                      elif isinstance(rec, dict):
+                          for field, value in rec.items():
+                              if field == "resolution":
+                                  if isinstance(value, str):
+                                      sub = flow_map(path, key, value)
+                                  elif isinstance(value, dict) and all(isinstance(v, str) for v in value.values()):
+                                      sub = {k: unquote(v) for k, v in value.items()}
+                                  else:
+                                      die(f"{path}: {key!r} resolution has an unmodelled shape")
+                                  fields["resolution"] = value if isinstance(value, str) else "<block>"
+                                  for k, v in sub.items():
+                                      fields[f"resolution.{k}"] = v
+                              elif isinstance(value, str):
+                                  fields[field] = unquote(value)
+                              else:
+                                  fields[field] = "<nested>"
+                      elif rec is not None:
+                          die(f"{path}: {sec} record {key!r} has an unmodelled shape")
+                      records[(sec, key)] = fields
+              def deps(importer, block):
+                  if not isinstance(block, dict):
+                      die(f"{path}: importer {importer!r} is not a block mapping")
+                  for section, entries in block.items():
+                      if section not in DEP_SECTIONS:
+                          continue
+                      if not isinstance(entries, dict):
+                          die(f"{path}: importer {importer!r} {section} is not a block mapping")
+                      for name, spec in entries.items():
+                          importers[(importer, section)].add(name)
+                          if isinstance(spec, dict):
+                              ver = spec.get("version")
+                          else:
+                              ver = spec
+                          if ver is not None and not isinstance(ver, str):
+                              die(f"{path}: importer {importer!r} {section}.{name} version is not a scalar")
+                          versions[(importer, section, name)] = unquote(ver) if ver else None
+              imps = doc.get("importers")
+              if imps is not None:
+                  if not isinstance(imps, dict):
+                      die(f"{path}: importers is not a block mapping")
+                  for importer, block in imps.items():
+                      if block is not None:
+                          deps(importer, block)
+              top = {k: v for k, v in doc.items() if k in DEP_SECTIONS}
+              if top:
+                  deps(".", top)
+              return records, importers, versions
 
           def check_pnpm_lock(path, old, new):
-              o_recs, o_imps = pnpm_doc(path, old)
-              n_recs, n_imps = pnpm_doc(path, new)
+              o_recs, o_imps, o_vers = pnpm_doc(path, old)
+              n_recs, n_imps, n_vers = pnpm_doc(path, new)
               roots = {DEFAULT_ROOT}
               base_scripts = set()
               for (sec, key), rec in o_recs.items():
@@ -1461,6 +1549,18 @@ jobs:
               same_names(path, "the set of importer dependency sections", set(o_imps), set(n_imps))
               for k in n_imps:
                   same_names(path, f"importer {k[0]!r} {k[1]}", o_imps[k], n_imps[k])
+              # A changed importer version must name a package record of this
+              # lockfile (dep@version, or an npm: alias target name@version).
+              targets = {pnpm_key(k) for s, k in n_recs if s == "packages"}
+              for (imp, section, dep), ver in n_vers.items():
+                  if ver == o_vers.get((imp, section, dep)):
+                      continue
+                  plain = re.split(r"[(_]", ver or "", maxsplit=1)[0]
+                  if PLAIN_VERSION.fullmatch(plain or "-") and (dep, plain) in targets:
+                      continue
+                  if plain and pnpm_key(plain) in targets and pnpm_key(plain)[1] is not None:
+                      continue
+                  die(f"{path}: importer {imp!r} {section}.{dep} version {ver!r} names no package record")
 
           def go_mod_directives(path, text):
               """(verb, args) for every directive, single-line and block form."""

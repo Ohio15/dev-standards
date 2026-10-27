@@ -650,12 +650,13 @@ def test_no_workflow_restores_an_actions_cache(path):
     # 2026-10-27, R-C; gate pass 1 on #62): no job anywhere reads a cache
     # apply could have written. Every setup-* step has caching explicitly off.
     text = path.read_text(encoding="utf-8")
-    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    # Case-insensitive: Actions resolves `Actions/Cache@` and `TYPE=GHA` too.
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#")).lower()
     assert "type=gha" not in code
     assert "actions/cache@" not in code and "actions/cache/" not in code
     for name, job in yaml.safe_load(text)["jobs"].items():
         for st in job.get("steps", []):
-            uses = str(st.get("uses", ""))
+            uses = str(st.get("uses", "")).lower()
             if not uses.startswith("actions/setup-"):
                 continue
             w = st.get("with") or {}
@@ -994,7 +995,7 @@ NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
 RUN_SHA256 = {
     "publish": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "verify": "13f2af043c05b83ec8d479fb69124bc9fad5d7ffeee76be59e658395859219d1",
+        "verify": "54a50f5a2d821932c2c17d7c51c0c9c55aa6cd83bd3cfa6d28ce0697d61eb562",
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
@@ -1363,7 +1364,7 @@ def test_pnpm_specifier_allow_list_refuses(tmp_path, shim_path, spec):
 
 
 @pytest.mark.parametrize("spec", ["^1.2.0", "'~1.2.3'", '">=1.0.0 <2.0.0"', "1.2.3", "npm:@scope/pkg@^1.2.0", "latest",
-                                  "1.x", "*", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "1.0.0-beta.1", "npm:pkg@~2.1.0"])
+                                  "1.x", "'*'", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "1.0.0-beta.1", "npm:pkg@~2.1.0"])
 def test_pnpm_specifier_allow_list_accepts(tmp_path, shim_path, spec):
     repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
     checkout = fresh_checkout(tmp_path, repo)
@@ -1785,3 +1786,76 @@ def test_pnpm_resolution_tricks_fail_closed(tmp_path, shim_path, new, expect):
 ])
 def test_tarball_root(name, version, url, want):
     assert _validator_namespace()["tarball_root"](name, version, url) == want
+
+
+# ─── security gate pass 2 on #62 (SC-19): nesting is read from RELATIVE ──────
+# indentation, and a line the reader cannot place fails closed ───────────────
+
+def pnpm_bumped_with_packages(block: str) -> str:
+    """PNPM bumped to a@1.0.1 (importer too), with the packages section replaced."""
+    head = PNPM.replace("1.0.0", "1.0.1").split("\npackages:", 1)[0]
+    return head + "\npackages:\n\n" + block
+
+
+ODD_INDENT_EVIL = {
+    "fields-at-5": "  a@1.0.1:\n     resolution: {integrity: %s, tarball: %s}\n" % (INTEG, EVIL_TB),
+    "fields-at-8": "  a@1.0.1:\n        resolution: {integrity: %s, tarball: %s}\n" % (INTEG, EVIL_TB),
+    "subkeys-at-8": "  a@1.0.1:\n    resolution:\n        integrity: %s\n        tarball: %s\n" % (INTEG, EVIL_TB),
+    "subkeys-at-10": "  a@1.0.1:\n      resolution:\n          tarball: %s\n          integrity: %s\n" % (EVIL_TB, INTEG),
+    "keys-at-4": "    a@1.0.1:\n      resolution: {integrity: %s, tarball: %s}\n" % (INTEG, EVIL_TB),
+    "keys-at-1": " a@1.0.1:\n  resolution:\n   tarball: %s\n" % EVIL_TB,
+}
+
+
+@pytest.mark.parametrize("spelling", ODD_INDENT_EVIL)
+def test_pnpm_odd_but_consistent_indent_is_read_and_bound(tmp_path, shim_path, spelling):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", pnpm_bumped_with_packages(ODD_INDENT_EVIL[spelling])),
+            expect="is not the registry tarball of a@1.0.1")
+
+
+def test_pnpm_requires_build_at_an_odd_indent_is_seen(tmp_path, shim_path):
+    block = "  a@1.0.1:\n       resolution: {integrity: %s, tarball: %s}\n       requiresBuild: true\n" % (INTEG, GOOD_TB)
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", pnpm_bumped_with_packages(block)), expect="gains requiresBuild")
+
+
+@pytest.mark.parametrize("block,expect", [
+    ("  a@1.0.1:\n\tresolution: {integrity: %s, tarball: %s}\n" % (INTEG, GOOD_TB), "tab in indentation"),
+    ("  a@1.0.1:\n    resolution:\n      integrity: %s\n        tarball: %s\n" % (INTEG, EVIL_TB), "matches no open level"),
+    ("  a@1.0.1:\n    resolution:\n        integrity: %s\n      tarball: %s\n" % (INTEG, EVIL_TB), "matches no open level"),
+    ("  a@1.0.1:\n     engines: {}\n    resolution: {integrity: %s, tarball: %s}\n" % (INTEG, EVIL_TB),
+     "matches no open level"),
+    ("  a@1.0.1: {resolution: {integrity: %s, tarball: %s}}\n" % (INTEG, EVIL_TB), "written inline"),
+    ("  a@1.0.1:\n    resolution: &r {integrity: %s, tarball: %s}\n" % (INTEG, EVIL_TB), "anchor, alias, tag"),
+    ("  a@1.0.1:\n    resolution: |\n      tarball: %s\n" % EVIL_TB, "anchor, alias, tag or block scalar"),
+    ("  ? a@1.0.1\n  : {}\n", "unreadable line"),
+    ("  a@1.0.1:\n    resolution:\n      - %s\n" % EVIL_TB, "unmodelled shape"),
+])
+def test_pnpm_unplaceable_lines_fail_closed(tmp_path, shim_path, block, expect):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", pnpm_bumped_with_packages(block)), expect=expect)
+
+
+def test_pnpm_odd_but_consistent_indent_accepts_a_real_bump(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", pnpm_bumped_with_packages(
+        "   a@1.0.1:\n         resolution:\n            integrity: %s\n            tarball: %s\n" % (INTEG, GOOD_TB)))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+@pytest.mark.parametrize("version", ["9.9.9", "evil@1.0.1"])
+def test_pnpm_importer_version_must_name_a_package_record(tmp_path, shim_path, version):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml",
+                            PNPM.replace("        version: 1.0.0\n", "        version: %s\n" % version)),
+            expect="names no package record")
+
+
+def test_yaml_blocks_reads_relative_nesting():
+    ns = _validator_namespace()
+    ns["die"] = lambda msg: (_ for _ in ()).throw(AssertionError(msg))
+    doc = ns["yaml_blocks"]("x", "a:\n   b: 1\n   c:\n         - x\n         - 'y'\nd: {}\n")
+    assert doc == {"a": {"b": "1", "c": ["x", "y"]}, "d": "{}"}

@@ -176,3 +176,32 @@ def test_private_repo_keeps_the_guarded_toggle(tmp_path):
 def test_bad_visibility_flag_is_refused(tmp_path):
     proc = install_with(target_repo(tmp_path), "--visibility=internal")
     assert proc.returncode == 2 and "must be private or public" in proc.stderr
+
+
+def install_with_gh(tmp_path: Path, repo: Path, answer: str, *flags: str) -> subprocess.CompletedProcess[str]:
+    """install.sh with a `gh` on PATH that reports isPrivate=<answer>."""
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(f"#!/usr/bin/env bash\necho {answer}\n", encoding="utf-8", newline="\n")
+    gh.chmod(0o755)
+    git_dir = Path(shutil.which("git")).resolve().parent
+    env = {**os.environ, "PATH": f"{bash_path(bindir)}:{bash_path(git_dir)}:/usr/bin:/bin"}
+    return subprocess.run([BASH, INSTALL.as_posix(), *flags, repo.as_posix()], capture_output=True, text=True, env=env)
+
+
+def test_private_flag_contradicting_github_is_an_error(tmp_path):
+    repo = target_repo(tmp_path)
+    proc = install_with_gh(tmp_path, repo, "false", "--visibility=private")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "contradicts GitHub" in proc.stderr
+    assert not (repo / ".github").exists(), "nothing may be written before visibility is settled"
+
+
+@pytest.mark.parametrize("answer,want_hosted", [("false", True), ("true", False)])
+def test_github_answer_decides_without_a_flag(tmp_path, answer, want_hosted):
+    repo = target_repo(tmp_path)
+    proc = install_with_gh(tmp_path, repo, answer)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    hosted = all(ln == "runs-on: ubuntu-latest" for ln in runs_on_lines(repo))
+    assert hosted is want_hosted

@@ -15,8 +15,9 @@ jobs:
   # binary (same version and digest as Ohio15/infra script-lint.yml), so CI
   # and a local run use the same version.
   shell-lint:
-    # Hosted on pull_request; vars.CI_RUNNER only on a default-branch push
-    # (STANDARDS.md section 4 runner policy, register SC-37).
+    # Always the GitHub-hosted literal: dev-standards is a public repo, and a
+    # public repo never selects a runner from a variable (STANDARDS.md
+    # section 4 runner policy, register SC-37).
     runs-on: ubuntu-latest
     steps:
       # SHA-pinned, same ref as size-guard.yml (mutable tags are a
