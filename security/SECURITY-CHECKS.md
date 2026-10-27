@@ -582,19 +582,65 @@ the rendered or re-extracted result), never only the input positions.
 ### SC-37 · A pull_request-reachable job whose runner is chosen by a
 repository variable
 **Shape.** `runs-on: ${{ vars.X || 'ubuntu-latest' }}` (or any expression over
-`vars.`/`inputs.`) on a job reachable from `pull_request` in a public
-repository. The default is hosted, so the shape is inert until the variable is
-set; then every fork PR's install-time code runs on whatever the variable
-names. pdfmanager 2026-10-08: 7 sites across 3 workflows (MEDIUM, latent).
-**Check.** `grep -n "runs-on:.*\${{" .github/workflows/*.yml` intersected with
-workflows that declare `pull_request:` or `pull_request_target:`; for each
-hit, the repo visibility and the fork-approval policy are part of the finding.
-Any hit in a public repo is a finding regardless of the variable's current
-value.
-**Fix form.** Literal GitHub-hosted labels on every PR-reachable job;
-variables may select runners only for `schedule`, `workflow_dispatch` and
-`push` on protected branches.
+`vars.`/`inputs.`), or a bare self-hosted label, on a job reachable from
+`pull_request`, `pull_request_target`, `workflow_run` or `issue_comment`
+(directly or through `workflow_call`). The variable form defaults to hosted,
+so it is inert until the variable is set; then the PR's install-time code runs
+on whatever the variable names. The `runs-on` predicate is evaluated client
+side and a fork PR runs the fork's copy of the workflow, so no predicate is a
+control on its own. pdfmanager 2026-10-08: 7 sites across 3 workflows
+(MEDIUM, latent).
+**Check.** `grep -n "runs-on:.*\${{" .github/workflows/*.yml` plus
+`grep -nE "runs-on:.*(self-hosted|nexus-ci)" .github/workflows/*.yml`,
+intersected with workflows that declare `pull_request:`,
+`pull_request_target:`, `workflow_run:` or `issue_comment:` (and reusable
+workflows called from them). Every hit is a FINDING unless all three of these
+hold, in which case it is CLEAR and the verdict names the exception:
+1. The expression is the canonical allow-list predicate, token for token
+   (whitespace aside). Linux:
+   `(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest'`.
+   Windows: the same allow-list, then
+   `&& vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci-windows' || 'windows-latest'`.
+   The reviewer does not judge equivalence. A reordered, extended or
+   shortened variant is a FINDING, and the fix is the canonical text.
+2. The repository is private (`gh api repos/<o>/<r> --jq .private` is
+   `true`).
+3. The runner the variable can name is served by ci-registrar >= 0.4.1
+   (Ohio15/infra #113, `fa739af`). This is the named compensating control. It
+   serves private repositories only. It refuses any run whose event is not
+   push, pull_request, workflow_dispatch, schedule, release or merge_group,
+   and any run whose `repository` or `head_repository` is not the repo
+   itself. It fails closed when it cannot see every run, and it destroys any
+   VM an untrusted job could be handed.
+If the bundle or a probe cannot establish 2 and 3, the verdict is NOT
+EXAMINED, never CLEAR.
+
+These stay FINDINGs whatever 1 to 3 say:
+- Any hit in a public repository, whatever the variable's current value (the
+  runner-registration side is SC-46).
+- Any job reachable from `pull_request_target`, `workflow_run` or
+  `issue_comment` that can resolve to a self-hosted runner, by any form.
+- The short form
+  `(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest'`,
+  or any negated event test (`!=`, `!(...)`). It is also true for
+  `pull_request_target`, `workflow_run` and `issue_comment`.
+- A bare self-hosted label on a PR-reachable job, outside the canonical
+  predicate: a literal `self-hosted`, `nexus-ci` or `nexus-ci-windows`, or a
+  label array containing `self-hosted`. A literal ignores the event, so a
+  fork PR asks for it too.
+**Fix form.** Every PR-reachable job carries either a literal GitHub-hosted
+label or the canonical predicate. In public repositories, `vars.CI_RUNNER`
+stays unset and PR-reachable jobs keep a predicate under which no
+`pull_request` event can select the variable. In private repositories served
+by ci-registrar >= 0.4.1, variables may select runners only for `push`,
+`schedule`, `workflow_dispatch`, `release`, `merge_group` and a same-repo
+`pull_request` (`github.event.pull_request.head.repo.full_name ==
+github.repository`), which is exactly what the canonical predicate admits.
 **Since.** 2026-10-09.
+**Amended.** 2026-10-27, approved by Ron (shared-brain `288e5d95`; runner
+policy `68d983a4`). Before this, any variable-selected runner on a
+PR-reachable job was a finding. A same-repo `pull_request` in a private,
+registrar-served repository is now CLEAR under conditions 1 to 3 above.
 **Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-34
 (MEDIUM, latent; approved by Ron 2026-10-09).
 
@@ -780,5 +826,7 @@ SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
 and renumbered because those numbers were already graduated), approved
 2026-10-09. SC-39..SC-42 (audit-patriot-provisioning-2026-10-10), approved
 2026-10-10. SC-43..SC-46 (audit-sentinel-2026-10-26), approved
-2026-10-26. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
-written as proposals; the numbers stay reserved.
+2026-10-26. SC-37 amended 2026-10-27 (same-repo pull requests on
+nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
+audit-openos-2026-09-16 but never written as proposals; the numbers stay
+reserved.
