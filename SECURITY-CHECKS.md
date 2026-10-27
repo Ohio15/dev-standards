@@ -582,19 +582,63 @@ the rendered or re-extracted result), never only the input positions.
 ### SC-37 · A pull_request-reachable job whose runner is chosen by a
 repository variable
 **Shape.** `runs-on: ${{ vars.X || 'ubuntu-latest' }}` (or any expression over
-`vars.`/`inputs.`) on a job reachable from `pull_request` in a public
-repository. The default is hosted, so the shape is inert until the variable is
-set; then every fork PR's install-time code runs on whatever the variable
-names. pdfmanager 2026-10-08: 7 sites across 3 workflows (MEDIUM, latent).
-**Check.** `grep -n "runs-on:.*\${{" .github/workflows/*.yml` intersected with
-workflows that declare `pull_request:` or `pull_request_target:`; for each
-hit, the repo visibility and the fork-approval policy are part of the finding.
-Any hit in a public repo is a finding regardless of the variable's current
-value.
-**Fix form.** Literal GitHub-hosted labels on every PR-reachable job;
-variables may select runners only for `schedule`, `workflow_dispatch` and
-`push` on protected branches.
+`vars.`/`inputs.`), or a bare self-hosted label, on a job reachable from
+`pull_request`, `pull_request_target`, `workflow_run` or `issue_comment`
+(directly or through `workflow_call`). The variable form defaults to hosted,
+so it is inert until the variable is set; then the PR's install-time code runs
+on whatever the variable names. The `runs-on` predicate is evaluated client
+side and a fork PR runs the fork's copy of the workflow, so no predicate is a
+control on its own. pdfmanager 2026-10-08: 7 sites across 3 workflows
+(MEDIUM, latent).
+**Check.** `grep -n "runs-on:.*\${{" .github/workflows/*.yml` plus
+`grep -nE "runs-on:.*(self-hosted|nexus-ci)" .github/workflows/*.yml`,
+intersected with workflows that declare `pull_request:`,
+`pull_request_target:`, `workflow_run:` or `issue_comment:` (and reusable
+workflows called from them). Every hit is a FINDING unless all three of these
+hold, in which case it is CLEAR and the verdict names the exception:
+1. The expression is the canonical allow-list predicate, token for token
+   (whitespace aside). Linux:
+   `(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest'`.
+   Windows: the same allow-list, then
+   `&& vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci-windows' || 'windows-latest'`.
+   The reviewer does not judge equivalence. A reordered, extended or
+   shortened variant is a FINDING, and the fix is the canonical text.
+2. The repository is private (`gh api repos/<o>/<r> --jq .private` is
+   `true`).
+3. The runner the variable can name is served by ci-registrar >= 0.4.1
+   (Ohio15/infra #113, `fa739af`). This is the named compensating control. It
+   serves private repositories only. It refuses any run whose event is not
+   push, pull_request, workflow_dispatch, schedule, release or merge_group,
+   and any run whose `repository` or `head_repository` is not the repo
+   itself. It fails closed when it cannot see every run, and it destroys any
+   VM an untrusted job could be handed.
+If the bundle or a probe cannot establish 2 and 3, the verdict is NOT
+EXAMINED, never CLEAR.
+
+These stay FINDINGs whatever 1 to 3 say:
+- Any hit in a public repository, whatever the variable's current value (the
+  runner-registration side is SC-46).
+- Any job reachable from `pull_request_target`, `workflow_run` or
+  `issue_comment` that can resolve to a self-hosted runner, by any form.
+- The short form
+  `(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest'`,
+  or any negated event test (`!=`, `!(...)`). It is also true for
+  `pull_request_target`, `workflow_run` and `issue_comment`.
+- A bare self-hosted label on a PR-reachable job, outside the canonical
+  predicate: a literal `self-hosted`, `nexus-ci` or `nexus-ci-windows`, or a
+  label array containing `self-hosted`. A literal ignores the event, so a
+  fork PR asks for it too.
+**Fix form.** Every PR-reachable job carries either a literal GitHub-hosted
+label or the canonical predicate. In public repositories, `vars.CI_RUNNER`
+stays unset and PR-reachable jobs keep a predicate under which no
+`pull_request` event can select the variable. Elsewhere, variables may select
+runners only for `push`, `schedule`, `workflow_dispatch`, `release` and
+`merge_group`.
 **Since.** 2026-10-09.
+**Amended.** 2026-10-27, approved by Ron (shared-brain `288e5d95`; runner
+policy `68d983a4`). Before this, any variable-selected runner on a
+PR-reachable job was a finding. A same-repo `pull_request` in a private,
+registrar-served repository is now CLEAR under conditions 1 to 3 above.
 **Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-34
 (MEDIUM, latent; approved by Ron 2026-10-09).
 
@@ -697,6 +741,75 @@ fleet.
 **Since.** 2026-10-10.
 **Origin.** audit-patriot-provisioning-2026-10-10 (HIGH; approved by Ron 2026-10-10).
 
+### SC-43 · A credential issued or rotated on a path authenticated only by a weaker shared credential
+**Shape.** A per-principal secret (device secret, client certificate, session
+key) is minted, or an existing one overwritten, on a code path whose caller
+proved only possession of a shared or weaker credential. The strong credential
+then launders the weak one, and an existing holder can be displaced. sentinel
+2026-10-26: a token-only WebSocket reconnect issued a client certificate and a
+fresh device secret for any existing `agent_id`, overwriting the stored
+`ws_secret_hash` (HIGH).
+**Check.** Grep every call that writes a per-principal credential
+(`issueDeviceSecret`, `IssueClientCertificate`,
+`UPDATE .* (ws_secret_hash|client_cert_serial)`) and trace the auth branch that
+reaches it. Mechanical test: a connection authenticated only by the shared
+token against a row that already holds a credential must leave the stored
+credential unchanged and must not receive a new one.
+**Fix form.** Issue a credential only on true enrollment or on proof of the
+previous credential; never overwrite an existing credential from a weaker
+path; admin-only reset.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
+### SC-44 · Identity canonicalised at one reader but stored or compared raw elsewhere
+**Shape.** An identifier is normalised (TrimSpace, ToLower, Unicode folding) at
+one consumer but stored, unique-indexed or compared byte-for-byte at others,
+so two distinct stored identities map to one at the normalising reader.
+sentinel 2026-10-26: gRPC auth trimmed the certificate CN while enrollment
+stored `agent_id` raw, so `"<victim> "` wrote Data Plane data as `<victim>`
+(HIGH).
+**Check.** Grep `TrimSpace|ToLower|EqualFold|NFC|NFKC` applied to identity
+fields (cert CN, agent_id, username, hostname) in auth and lookup paths; for
+each hit, grep the writer and the unique index for the same normalisation.
+Mechanical test: enrol `"<id> "` and `"<id>"`; every reader must resolve them
+to different principals or refuse the first.
+**Fix form.** Validate the identifier format once at first acceptance; compare
+byte-for-byte everywhere after that.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
+### SC-45 · A process-local mutex held across database I/O on a path where another path takes a row lock before that mutex
+**Shape.** Code holds an in-process lock while issuing a database statement
+that can block on a row lock, while another path acquires that row lock
+(`SELECT ... FOR UPDATE` / `UPDATE` in a transaction) and then the same
+in-process lock. The database cannot see the mutex, so the deadlock is never
+detected. sentinel 2026-10-26: the PKI mutex held across `UPDATE devices`
+versus `RotateCertificateTx` row-locking first (MEDIUM; hangs issuance for
+every agent).
+**Check.** Grep `\.Lock\(\)` followed by `Exec|Query|QueryRow` before the
+matching `Unlock`; for each, grep callers that enter it from inside a
+transaction holding a row lock. Mechanical test: run both paths concurrently
+for the same row under a timeout.
+**Fix form.** One lock order everywhere, or never hold the mutex across
+database I/O.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (MEDIUM; approved by Ron 2026-10-26).
+
+### SC-46 · A public repository with a registered self-hosted runner
+**Shape.** A repository whose visibility is public has one or more self-hosted
+runners registered (directly or via an unrestricted runner group), so any
+approved fork pull request can run its own workflow on that host regardless of
+the repo's own `runs-on` guards. sentinel 2026-10-26: public repo with runner
+`nexus-sentinel` online on the production host (HIGH; closed by making the
+repo private).
+**Check.** Mechanical: `gh api repos/<o>/<r> --jq .visibility` == `public` AND
+`gh api repos/<o>/<r>/actions/runners --jq .total_count` > 0 (or the repo is
+in a runner group without `restricted_to_workflows`) is a finding.
+**Fix form.** Private repository, or a runner group restricted to named
+workflows and refs, or no self-hosted runner on the repo.
+**Since.** 2026-10-26.
+**Origin.** audit-sentinel-2026-10-26 (HIGH; approved by Ron 2026-10-26).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -710,5 +823,8 @@ SC-22..SC-24 (audit-cortex-hooks-2026-09-15, approved 2026-09-16), SC-29..SC-31
 SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
 and renumbered because those numbers were already graduated), approved
 2026-10-09. SC-39..SC-42 (audit-patriot-provisioning-2026-10-10), approved
-2026-10-10. SC-26..SC-28 were numbered by audit-openos-2026-09-16 but never
-written as proposals; the numbers stay reserved.
+2026-10-10. SC-43..SC-46 (audit-sentinel-2026-10-26), approved
+2026-10-26. SC-37 amended 2026-10-27 (same-repo pull requests on
+nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
+audit-openos-2026-09-16 but never written as proposals; the numbers stay
+reserved.
