@@ -531,8 +531,48 @@ def test_no_run_step_exits_zero_on_a_skip():
             assert not re.search(r"skipping\"?\s*\n\s*exit 0", body), f"{name}: a skip exits 0"
 
 
+OLD_RUNNER_PRED = ("(github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == "
+                   "'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))")
+NEW_RUNNER_PRED = ("(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == "
+                   "'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || "
+                   "github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == "
+                   "github.repository)")
+
+
+def _own_copy_as_template(own: bytes) -> bytes:
+    """This repository is PUBLIC (SC-37): its own copies keep the 2026-10-11
+    runner predicate (hosted on every pull request) and the matching header
+    comment; consumers get the amended one. Nothing else may differ."""
+    text = own.decode()
+    out = []
+    for line in text.split("\n"):
+        if "runs-on:" in line and OLD_RUNNER_PRED in line:
+            line = line.replace(OLD_RUNNER_PRED, NEW_RUNNER_PRED)
+        out.append(line)
+    return "\n".join(out).encode()
+
+
+def _strip_runner_comment(text: bytes) -> bytes:
+    lines = text.decode().split("\n")
+    start = next(i for i, l in enumerate(lines) if l.startswith("# Runner and trust"))
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("# - On an untrusted event"))
+    return "\n".join(lines[:start] + lines[end:]).encode()
+
+
 def test_dev_standards_own_copy_matches_the_template():
-    assert OWN_COPY.read_bytes() == TEMPLATE.read_bytes()
+    assert _strip_runner_comment(_own_copy_as_template(OWN_COPY.read_bytes())) ==         _strip_runner_comment(TEMPLATE.read_bytes())
+    assert NEW_RUNNER_PRED not in OWN_COPY.read_text(encoding="utf-8")
+
+
+def test_public_own_workflows_never_take_a_variable_runner_on_a_pull_request():
+    for f in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        wf = yaml.safe_load(f.read_text(encoding="utf-8"))
+        if "pull_request" not in triggers(wf):
+            continue
+        for name, job in wf["jobs"].items():
+            for head in ("Ohio15/app", "mallory/app"):
+                got = resolve(job.get("runs-on"), "pull_request", "refs/pull/7/merge", head=head)
+                assert got == "ubuntu-latest", f"{f.name}:{name} same/fork PR runs on {got!r}"
 
 
 # ─── yarn ────────────────────────────────────────────────────────────────────
@@ -797,6 +837,12 @@ def test_the_pull_request_workflow_list_is_derived_not_listed():
 def test_no_fork_pull_request_job_resolves_its_runner_from_a_variable(path):
     wf = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert wf["jobs"], "no jobs parsed"
+    if path.parent == ROOT / ".github" / "workflows":
+        for name, job in wf["jobs"].items():
+            for event, ref in UNTRUSTED + HOSTED_ONLY:
+                got = resolve(job["runs-on"], event, ref)
+                assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} runs on {got!r}"
+        return
     for name, job in wf["jobs"].items():
         for event, ref in RUNNER_EVENTS + HOSTED_ONLY:
             got = resolve(job["runs-on"], event, ref, head="mallory/app")
@@ -857,8 +903,8 @@ def test_no_execute_switches_are_present():
 
 
 def test_size_guard_copies_agree():
-    a, b = (p.read_bytes() for p in SIZE_GUARD_COPIES)
-    assert a == b
+    template, own = (p.read_bytes() for p in SIZE_GUARD_COPIES)
+    assert _own_copy_as_template(own) == template
 
 
 # ─── untrusted install paths, executed ───────────────────────────────────────

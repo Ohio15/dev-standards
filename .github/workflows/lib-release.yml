@@ -41,8 +41,7 @@ jobs:
 
   read-lib-config:
     needs: gates
-    # Caller's CI_RUNNER (tag pushes only; SPEC.md "Runner selection").
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     outputs:
       project: ${{ steps.parse.outputs.project }}
       changelog_path: ${{ steps.parse.outputs.changelog_path }}
@@ -87,8 +86,7 @@ jobs:
   npm-publish:
     needs: [gates, read-lib-config]
     if: needs.read-lib-config.outputs.npm_publish == 'true'
-    # Caller's CI_RUNNER (tag pushes only; SPEC.md "Runner selection").
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -150,8 +148,7 @@ jobs:
       needs.gates.result == 'success' &&
       needs.read-lib-config.result == 'success' &&
       (needs.npm-publish.result == 'success' || needs.npm-publish.result == 'skipped')
-    # Caller's CI_RUNNER (tag pushes only; SPEC.md "Runner selection").
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
