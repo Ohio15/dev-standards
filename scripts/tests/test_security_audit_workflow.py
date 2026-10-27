@@ -756,7 +756,9 @@ def eval_expr(text: str, ctx: dict):
     return out
 
 
-def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
+def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci", head: str = "Ohio15/app"):
+    """`head` is the pull request's head repository (Ohio15/app is the base:
+    a same-repo PR; anything else is a fork)."""
     if not isinstance(expr, str) or "${{" not in expr:
         return expr
     m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
@@ -764,6 +766,7 @@ def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
     return eval_expr(m.group(1), {
         "github.event_name": event, "github.ref": ref,
         "github.event.repository.default_branch": "main", "vars.CI_RUNNER": ci_runner,
+        "github.repository": "Ohio15/app", "github.event.pull_request.head.repo.full_name": head,
     })
 
 
@@ -772,6 +775,15 @@ UNTRUSTED = [("pull_request", "refs/pull/7/merge"), ("pull_request_target", "ref
              ("push", "refs/heads/feature"), ("push", "refs/heads/master"), ("push", "refs/tags/v1"),
              ("workflow_dispatch", "refs/heads/feature")]
 TRUSTED = [("schedule", "refs/heads/main"), ("push", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main")]
+# Runner policy amended 2026-10-27 (STANDARDS.md "CI runner policy"): these may
+# take the variable runner. TRUSTED_EVENT (what the audit itself executes) is
+# unchanged and stricter: a same-repo PR runs on nexus-ci yet stays untrusted.
+RUNNER_EVENTS = TRUSTED + [("pull_request", "refs/pull/7/merge"), ("push", "refs/heads/feature"),
+                           ("push", "refs/tags/v1"), ("workflow_dispatch", "refs/heads/feature"),
+                           ("release", "refs/tags/v1"), ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7")]
+# Never the variable runner, whatever CI_RUNNER holds.
+HOSTED_ONLY = [("pull_request_target", "refs/heads/main"), ("workflow_run", "refs/heads/main"),
+               ("issue_comment", "refs/heads/main"), ("pull_request_review", "refs/pull/7/merge")]
 
 
 def test_the_pull_request_workflow_list_is_derived_not_listed():
@@ -782,24 +794,32 @@ def test_the_pull_request_workflow_list_is_derived_not_listed():
 
 
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
-def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
+def test_no_fork_pull_request_job_resolves_its_runner_from_a_variable(path):
     wf = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert wf["jobs"], "no jobs parsed"
     for name, job in wf["jobs"].items():
-        for event, ref in UNTRUSTED:
+        for event, ref in RUNNER_EVENTS + HOSTED_ONLY:
+            got = resolve(job["runs-on"], event, ref, head="mallory/app")
+            fork_ok = event not in ("pull_request", "pull_request_target", "pull_request_review")
+            if not (fork_ok and (event, ref) in RUNNER_EVENTS and "${{" in str(job["runs-on"])):
+                assert got == "ubuntu-latest", f"{path.name}:{name} on fork {event} {ref} runs on {got!r}"
+        for event, ref in HOSTED_ONLY:
             got = resolve(job["runs-on"], event, ref)
             assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} runs on {got!r}"
         if "${{" in str(job["runs-on"]):
-            for event, ref in TRUSTED:
-                assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event)
+            for event, ref in RUNNER_EVENTS:
+                assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event, ref)
                 assert resolve(job["runs-on"], event, ref, ci_runner="") == "ubuntu-latest"
 
 
-def test_trusted_event_flag_is_the_runner_predicate():
+def test_trusted_event_flag_is_stricter_than_the_runner_predicate():
+    # Every event the audit trusts may use the variable runner; a same-repo
+    # PR may use the runner but is NOT trusted (no PR-controlled code runs).
     flag = WORKFLOW["env"]["TRUSTED_EVENT"]
-    pred = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", flag, re.S).group(1)
     for name, job in JOBS.items():
-        assert pred in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+        for event, ref in TRUSTED:
+            assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event)
+    assert resolve(flag, "pull_request", "refs/pull/7/merge") is False
     for event, ref in UNTRUSTED:
         assert resolve(flag, event, ref) is False, (event, ref)
     for event, ref in TRUSTED:
