@@ -128,3 +128,51 @@ def test_no_hook_resolves_an_executable_from_env_locations():
 def test_installed_hook_copies_match_canonical():
     for name in ("pre-commit-secret-scan.sh", "commit-msg", "pre-commit"):
         assert (ROOT / ".githooks" / name).read_bytes() == (ROOT / "hooks" / name).read_bytes(), name
+
+
+# ─── audit-dev-standards-2026-10-27 MEDIUM: runner choice by visibility ──────
+# STANDARDS.md section 4: a template that reaches a public repo carries the
+# hosted literal. Unconfirmed visibility counts as public.
+
+INSTALLED_WORKFLOWS = ("size-guard.yml", "security-audit.yml", "dep-auto-apply.yml")
+
+
+def install_with(repo: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    # PATH without gh: visibility comes only from the flag (or is unconfirmed).
+    git_dir = Path(shutil.which("git")).resolve().parent
+    env = {**os.environ, "PATH": f"{bash_path(git_dir)}:/usr/bin:/bin"}
+    return subprocess.run([BASH, INSTALL.as_posix(), *flags, repo.as_posix()], capture_output=True, text=True, env=env)
+
+
+def runs_on_lines(repo: Path) -> list[str]:
+    out = []
+    for wf in INSTALLED_WORKFLOWS:
+        text = (repo / ".github" / "workflows" / wf).read_text(encoding="utf-8")
+        out += [ln.strip() for ln in text.splitlines() if re.match(r"\s*runs-on:", ln)]
+    return out
+
+
+@pytest.mark.parametrize("flags", [(), ("--visibility=public",)])
+def test_public_or_unconfirmed_repo_gets_only_the_hosted_literal(tmp_path, flags):
+    repo = target_repo(tmp_path)
+    proc = install_with(repo, *flags)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = runs_on_lines(repo)
+    assert lines and all(ln == "runs-on: ubuntu-latest" for ln in lines), lines
+    assert "ubuntu-latest only" in proc.stdout
+
+
+def test_private_repo_keeps_the_guarded_toggle(tmp_path):
+    repo = target_repo(tmp_path)
+    proc = install_with(repo, "--visibility=private")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for wf in INSTALLED_WORKFLOWS:
+        src = ROOT / ("workflows" if wf == "size-guard.yml" else "templates/.github/workflows") / wf
+        assert (repo / ".github" / "workflows" / wf).read_bytes() == src.read_bytes(), wf
+    for ln in runs_on_lines(repo):
+        assert "github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'" in ln, ln
+
+
+def test_bad_visibility_flag_is_refused(tmp_path):
+    proc = install_with(target_repo(tmp_path), "--visibility=internal")
+    assert proc.returncode == 2 and "must be private or public" in proc.stderr

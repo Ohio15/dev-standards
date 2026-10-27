@@ -24,19 +24,34 @@ name: Security Audit (Layer A)
 # - Trusted events are schedule, and push or workflow_dispatch ON THE DEFAULT
 #   BRANCH (github.ref == refs/heads/<default_branch>): code that is already
 #   merged. Every other event or ref, pull_request above all, is untrusted.
-# - A repository variable may choose the runner ONLY on a trusted event.
-#   Every job says
-#     runs-on: <trusted> && vars.CI_RUNNER || 'ubuntu-latest'
-#   so an untrusted event resolves to the GitHub-hosted literal whatever
-#   CI_RUNNER holds (`&&`/`||` return an operand: false && x is false, and
-#   false || 'ubuntu-latest' is the literal). A self-hosted label never runs
-#   pull_request code from here. That does not stop a fork PR that EDITS this
-#   file; for that, no self-hosted runner may serve a public repository.
+# - Runner (SC-37 allow-list, audit-dev-standards-2026-10-27): every job says
+#     runs-on: <SC-37 event allow-list> && github.event.repository.private
+#              && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'
+#   The allow-list admits push, schedule, workflow_dispatch, release,
+#   merge_group and a SAME-repo pull_request; a fork PR never matches. The
+#   variable only toggles between two literals (it can never name another
+#   label, e.g. a persistent deploy runner), and a public repo always gets
+#   the hosted literal. nexus-ci is an ephemeral VM per job behind
+#   ci-registrar, which serves private repos only. That does not stop a fork
+#   PR that EDITS this file; for that, no self-hosted runner may serve a
+#   public repository, and install.sh installs a hosted-literal copy into any
+#   repo it cannot confirm is private.
+# - The runner choice is not the trust decision. TRUSTED_EVENT (below) is:
+#   a same-repo PR may run on nexus-ci, but its code is still untrusted.
 # - On an untrusted event no code the PR controls is executed. Lifecycle
 #   scripts, a .pnpmfile.cjs, a yarnPath, yarn plugins, a .corepack.env, a
 #   custom-URL packageManager and a Python build backend are all such code;
 #   each is shut off below where it would run. What cannot be audited
 #   without running it is reported NOT EXAMINED, which fails like a finding.
+# - On an untrusted event no package-manager CONFIG the PR controls may
+#   steer the audit (audit 2026-10-27, R-B: a PR .npmrc `registry=` sent the
+#   advisory query to a host that answered "no vulnerabilities"). The
+#   registry is pinned from the environment (env beats a project .npmrc),
+#   user/global npmrc point at an empty file, every .npmrc / .yarnrc /
+#   pnpm-workspace.yaml from the job directory up to the checkout root must
+#   hold only allow-listed keys, package.json may not carry
+#   pnpm.auditConfig, and a berry .yarnrc.yml loses every npm*, proxy and
+#   CA key in the rewrite. Anything else is NOT EXAMINED.
 #   On a trusted event the repo's own configuration is honoured.
 # - The token is contents: read and nothing else.
 #
@@ -56,6 +71,8 @@ env:
   # 'true' on a trusted event, 'false' otherwise: the same predicate as every
   # job's runs-on. Scripts treat anything but the exact string 'true' as
   # untrusted.
+  # Deliberately narrower than the runner predicate: a same-repo PR may run on
+  # nexus-ci but stays untrusted here.
   TRUSTED_EVENT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
 
 concurrency:
@@ -65,7 +82,7 @@ concurrency:
 jobs:
   detect:
     name: Detect ecosystems
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     outputs:
       has_npm: ${{ steps.detect.outputs.has_npm }}
       has_go: ${{ steps.detect.outputs.has_go }}
@@ -119,8 +136,13 @@ jobs:
           #   package.json `workspaces` (an array, or the `packages` key of an
           #   object), `!` patterns excluding;
           # - that lockfile names it (a pnpm importer, a package-lock.json
-          #   `packages` key, a yarn berry `@workspace:` locator; yarn classic
-          #   records no workspaces, so its globs alone decide).
+          #   `packages` key, a yarn berry `@workspace:` locator). yarn classic
+          #   records no workspaces in yarn.lock, so nothing proves membership
+          #   and its members are NEVER folded: each keeps its own job (audit
+          #   2026-10-27: a glob alone folded a dot-directory yarn never sees).
+          # Globs follow the package managers' own (minimatch / fast-glob,
+          # dot: false): `*`, `?` and `**` never match a path segment that
+          # starts with a dot; only a literal leading dot does.
           # The nearest such ancestor wins. Anything not provably covered keeps
           # its own job, which fails loudly rather than vanishing. The root's
           # frozen install checks every member manifest against the lockfile
@@ -192,21 +214,27 @@ jobs:
               return []
 
           def glob_re(pat):
-              out, i = [], 0
-              while i < len(pat):
-                  if pat.startswith("**/", i):
-                      out.append("(?:[^/]+/)*"); i += 3
-                  elif pat.startswith("**", i):
-                      out.append(".*"); i += 2
-                  elif pat[i] == "*":
-                      out.append("[^/]*"); i += 1
-                  elif pat[i] == "?":
-                      out.append("[^/]"); i += 1
-                  elif pat[i] in "[]{}()!+@":
+              # Per segment, so a wildcard can never match a dot segment.
+              segs, rx = pat.split("/"), ""
+              for n, seg in enumerate(segs):
+                  last = n == len(segs) - 1
+                  if seg == "**":
+                      rx += r"(?!\.)[^/]+(?:/(?!\.)[^/]+)*" if last else r"(?:(?!\.)[^/]+/)*"
+                      continue
+                  if seg in ("", ".", ".."):
                       return None
-                  else:
-                      out.append(re.escape(pat[i])); i += 1
-              return re.compile("".join(out) + r"\Z")
+                  part = "" if seg.startswith(".") else r"(?!\.)"
+                  for ch in seg:
+                      if ch == "*":
+                          part += "[^/]*"
+                      elif ch == "?":
+                          part += "[^/]"
+                      elif ch in "[]{}()!+@":
+                          return None
+                      else:
+                          part += re.escape(ch)
+                  rx += part + ("" if last else "/")
+              return re.compile(rx + r"\Z")
 
           def matcher(globs):
               pos, neg = [], []
@@ -245,7 +273,7 @@ jobs:
               if has(d, "yarn.lock"):
                   text = read(d, "yarn.lock")
                   if not re.search(r"^__metadata:", text, re.M):
-                      return lambda rel: True   # yarn classic records no workspaces
+                      return None   # yarn classic records no workspaces: never fold
                   return lambda rel: re.search("@workspace:" + re.escape(rel) + r'(?=[",:\s])', text) is not None
               for name in ("package-lock.json", "npm-shrinkwrap.json"):
                   if has(d, name):
@@ -343,7 +371,7 @@ jobs:
     name: npm audit (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_npm == 'true'
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     env:
       # A PR's .corepack.env can set COREPACK_ENABLE_UNSAFE_CUSTOM_URLS=1,
       # after which a `packageManager` URL to a .js file runs as the package
@@ -399,6 +427,95 @@ jobs:
             printf -- '- npm (%s): **NOT EXAMINED**: %s\n' "$DIR" "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             exit 1
           }
+          if [ "${TRUSTED_EVENT:-}" != "true" ]; then
+            # Untrusted event: the PR's package-manager config must not pick
+            # the registry, the advisory endpoint, a proxy or CA, or narrow
+            # what is audited (header, R-B). Env beats a project .npmrc for
+            # npm and pnpm; the files are also checked, because pnpm-workspace
+            # settings beat env and yarn 1 reads every rc up to /.
+            # Two files: npm refuses to load one file as both user and global.
+            empty_user_rc="$(mktemp)"; empty_global_rc="$(mktemp)"
+            export npm_config_registry=https://registry.npmjs.org/
+            export npm_config_userconfig="$empty_user_rc" npm_config_globalconfig="$empty_global_rc"
+            {
+              echo "npm_config_registry=https://registry.npmjs.org/"
+              echo "npm_config_userconfig=$empty_user_rc"
+              echo "npm_config_globalconfig=$empty_global_rc"
+            } >> "${GITHUB_ENV:-/dev/null}"
+            cfg_report="$(mktemp)"
+            python3 -I - "$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)" > "$cfg_report" <<'PY' || not_examined "$(cat "$cfg_report")"
+          import json, os, re, sys
+          top = os.path.realpath(sys.argv[1])
+          # Keys that change how packages are laid out or built, never where
+          # they or their advisories come from, or which ones are audited.
+          NPMRC_OK = {
+              "install-links", "allow-build-scripts", "legacy-peer-deps", "strict-peer-deps",
+              "strict-peer-dependencies", "auto-install-peers", "engine-strict", "save-exact",
+              "save-prefix", "fund", "update-notifier", "progress", "loglevel", "color",
+              "node-linker", "shamefully-hoist", "hoist", "hoist-pattern", "public-hoist-pattern",
+              "dedupe-peer-dependents", "link-workspace-packages", "prefer-workspace-packages",
+              "shared-workspace-lockfile", "package-import-method", "resolution-mode",
+              "enable-pre-post-scripts", "side-effects-cache", "ignore-scripts",
+          }
+          YARNRC_OK = {"yarn-path", "network-timeout", "disable-self-update-check", "save-prefix",
+                       "ignore-engines", "--ignore-engines", "--install.ignore-engines",
+                       "--install.frozen-lockfile", "--install.network-timeout"}
+          PNPM_WS_OK = {
+              "packages", "catalog", "catalogs", "onlyBuiltDependencies", "ignoredBuiltDependencies",
+              "neverBuiltDependencies", "overrides", "patchedDependencies", "peerDependencyRules",
+              "allowedDeprecatedVersions", "packageExtensions", "nodeLinker", "shamefullyHoist",
+              "hoist", "hoistPattern", "publicHoistPattern", "linkWorkspacePackages",
+              "preferWorkspacePackages", "injectWorkspacePackages", "dedupePeerDependents",
+              "autoInstallPeers", "strictPeerDependencies", "resolutionMode", "saveExact",
+              "savePrefix", "engineStrict", "sharedWorkspaceLockfile", "packageImportMethod",
+              "minimumReleaseAge", "minimumReleaseAgeExclude",
+          }
+          bad = []
+          def text(path):
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  return fh.read()
+          d = os.path.realpath(os.getcwd())
+          while True:
+              f = os.path.join(d, ".npmrc")
+              if os.path.isfile(f):
+                  for ln in text(f).splitlines():
+                      s = ln.strip()
+                      if not s or s[0] in "#;":
+                          continue
+                      m = re.match(r"([^=\s]+)\s*=", s)
+                      if not m or m.group(1) not in NPMRC_OK:
+                          bad.append(f"{f}: {s.split('=', 1)[0].strip()[:60]!r}")
+              f = os.path.join(d, ".yarnrc")
+              if os.path.isfile(f):
+                  for ln in text(f).splitlines():
+                      s = ln.strip()
+                      if s and not s.startswith("#") and s.split()[0].strip('"') not in YARNRC_OK:
+                          bad.append(f"{f}: {s.split()[0][:60]!r}")
+              f = os.path.join(d, "pnpm-workspace.yaml")
+              if os.path.isfile(f):
+                  for ln in text(f).splitlines():
+                      if not ln.strip() or ln.lstrip().startswith("#") or ln[0] in " \t-" or ln.strip() == "---":
+                          continue
+                      m = re.match(r"(['\"]?)([A-Za-z][A-Za-z0-9]*)\1\s*:", ln)
+                      if not m or m.group(2) not in PNPM_WS_OK:
+                          bad.append(f"{f}: {ln.split(':', 1)[0][:60]!r}")
+              f = os.path.join(d, "package.json")
+              if os.path.isfile(f):
+                  try:
+                      pnpm = json.loads(text(f)).get("pnpm")
+                  except (ValueError, AttributeError):
+                      pnpm = None
+                  if isinstance(pnpm, dict) and "auditConfig" in pnpm:
+                      bad.append(f"{f}: 'pnpm.auditConfig'")
+              if d == top or os.path.dirname(d) == d or not d.startswith(top + os.sep):
+                  break
+              d = os.path.dirname(d)
+          if bad:
+              print("package-manager config the pull request controls could redirect or narrow the audit; "
+                    "on an untrusted event only allow-listed keys are read: " + "; ".join(bad[:10]))
+              sys.exit(1)
+          PY
+          fi
           if [ -f pnpm-lock.yaml ]; then
             corepack enable
             corepack prepare pnpm@10.34.6 --activate
@@ -432,18 +549,20 @@ jobs:
                 # rc files under the name in YARN_RC_FILENAME, from here up
                 # to /, so each .yarnrc.yml from the checkout root down to
                 # here is rewritten under a name the PR cannot predict,
-                # without yarnPath or plugins and with scripts off. yq (on
-                # every GitHub-hosted image, which is where an untrusted
-                # event runs) parses it, so quoting, anchors and merge keys
-                # cannot carry a key past the rewrite: yarn reads only yq's
-                # JSON output.
+                # without yarnPath or plugins and with scripts off, and with
+                # every npm* key (registry, audit registry, ignored
+                # advisories, scopes, auth), proxy and CA key removed (R-B).
+                # yq parses it, so quoting, anchors and merge keys cannot
+                # carry a key past the rewrite: yarn reads only yq's JSON
+                # output. yq is on GitHub-hosted images; a runner without it
+                # (nexus-ci may lack it) stops here as NOT EXAMINED.
                 command -v yq > /dev/null || not_examined "yq is not on this runner, so the repo's .yarnrc.yml cannot be read without running the plugins it names"
                 rc_name=".yarnrc-audit-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n').yml"
                 top="$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)"
                 d="$(pwd -P)"
                 while :; do
                   if [ -f "$d/.yarnrc.yml" ]; then
-                    yq -o=json 'explode(.) | del(.yarnPath) | del(.plugins) | .enableScripts = false' "$d/.yarnrc.yml" > "$d/$rc_name"
+                    yq -o=json 'explode(.) | del(.yarnPath) | del(.plugins) | with_entries(select(.key | test("^(npm[A-Z].*|.*[Pp]roxy|.*[Cc]aFilePath|enableStrictSsl|unsafeHttpWhitelist|networkSettings|injectEnvironmentFiles)$") | not)) | .enableScripts = false' "$d/.yarnrc.yml" > "$d/$rc_name"
                   fi
                   if [ "$d" = "$top" ] || [ "$d" = "/" ]; then break; fi
                   d="$(dirname "$d")"
@@ -565,7 +684,7 @@ jobs:
     name: govulncheck (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_go == 'true'
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -583,8 +702,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ${{ matrix.dir }}/go.mod
-          cache: true
-          cache-dependency-path: ${{ matrix.dir }}/go.sum
+          # No module cache: a default-branch cache may hold modules written
+          # by dep-auto-apply's apply job (audit 2026-10-27, R-C), and go
+          # trusts GOMODCACHE contents on read.
+          cache: false
 
       - name: Install govulncheck if absent
         shell: bash
@@ -628,7 +749,7 @@ jobs:
     name: pip-audit (${{ matrix.dir }})
     needs: detect
     if: needs.detect.outputs.has_python == 'true'
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -771,7 +892,7 @@ jobs:
     name: Audit summary (always runs)
     if: always()
     needs: [detect, npm-audit, go-vulncheck, pip-audit]
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - shell: bash
         # Every value through env, never `${{ }}` inside run: the *_DIRS lists

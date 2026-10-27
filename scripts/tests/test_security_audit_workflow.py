@@ -531,8 +531,25 @@ def test_no_run_step_exits_zero_on_a_skip():
             assert not re.search(r"skipping\"?\s*\n\s*exit 0", body), f"{name}: a skip exits 0"
 
 
+RUNNER_PRED = ("${{ (github.event_name == 'push' || github.event_name == 'schedule' || "
+               "github.event_name == 'workflow_dispatch' || github.event_name == 'release' || "
+               "github.event_name == 'merge_group' || github.event_name == 'pull_request' && "
+               "github.event.pull_request.head.repo.full_name == github.repository) && "
+               "github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}")
+
+
+def hosted_variant(text: str) -> str:
+    """What install.sh writes into a public repo, and what dev-standards (a
+    public repo) runs itself: every runs-on the hosted literal."""
+    return text.replace("runs-on: " + RUNNER_PRED, "runs-on: ubuntu-latest")
+
+
 def test_dev_standards_own_copy_matches_the_template():
-    assert OWN_COPY.read_bytes() == TEMPLATE.read_bytes()
+    # This repo is public: its own copy is the template with the hosted literal
+    # (audit 2026-10-27 LOW, SC-37: no variable-selected runner in a public repo).
+    own = OWN_COPY.read_text(encoding="utf-8")
+    assert own == hosted_variant(TEMPLATE.read_text(encoding="utf-8"))
+    assert not re.search(r"runs-on:.*vars\.", own)
 
 
 # ─── yarn ────────────────────────────────────────────────────────────────────
@@ -756,7 +773,8 @@ def eval_expr(text: str, ctx: dict):
     return out
 
 
-def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
+def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci", private: bool = True,
+            head_repo: str = "o/r"):
     if not isinstance(expr, str) or "${{" not in expr:
         return expr
     m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
@@ -764,6 +782,8 @@ def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci"):
     return eval_expr(m.group(1), {
         "github.event_name": event, "github.ref": ref,
         "github.event.repository.default_branch": "main", "vars.CI_RUNNER": ci_runner,
+        "github.event.repository.private": private, "github.repository": "o/r",
+        "github.event.pull_request.head.repo.full_name": head_repo if event == "pull_request" else "",
     })
 
 
@@ -781,25 +801,43 @@ def test_the_pull_request_workflow_list_is_derived_not_listed():
             ".github/workflows/healthcheck-shape-lint.yml"} <= names, names
 
 
+# SC-37 allow-list (amended 2026-10-27) plus the visibility guard and literal
+# toggle (audit-dev-standards-2026-10-27 MEDIUM): nexus-ci only for an
+# allow-listed event in a PRIVATE repo with CI_RUNNER exactly 'nexus-ci'.
+ALLOWED_EVENTS = ["push", "schedule", "workflow_dispatch", "release", "merge_group", "pull_request"]
+NEVER = [("pull_request_target", "refs/heads/main"), ("workflow_run", "refs/heads/main"),
+         ("issue_comment", "refs/heads/main")]
+
+
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
 def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
     wf = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert wf["jobs"], "no jobs parsed"
     for name, job in wf["jobs"].items():
-        for event, ref in UNTRUSTED:
-            got = resolve(job["runs-on"], event, ref)
-            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} runs on {got!r}"
-        if "${{" in str(job["runs-on"]):
-            for event, ref in TRUSTED:
-                assert resolve(job["runs-on"], event, ref) == "nexus-ci", (name, event)
-                assert resolve(job["runs-on"], event, ref, ci_runner="") == "ubuntu-latest"
+        expr = job["runs-on"]
+        assert expr == "ubuntu-latest" or expr == RUNNER_PRED, f"{path.name}:{name}: non-canonical runs-on {expr!r}"
+        for event in ALLOWED_EVENTS + [e for e, _ in NEVER]:
+            for private in (True, False):
+                for var in ("nexus-ci", "", "nexus-deploy", "self-hosted"):
+                    for head in ("o/r", "fork/r"):
+                        got = resolve(expr, event, "refs/heads/main", ci_runner=var, private=private, head_repo=head)
+                        want = ("nexus-ci" if expr != "ubuntu-latest" and private and var == "nexus-ci"
+                                and event in ALLOWED_EVENTS and not (event == "pull_request" and head != "o/r")
+                                else "ubuntu-latest")
+                        assert got == want, (path.name, name, event, private, var, head, got)
 
 
-def test_trusted_event_flag_is_the_runner_predicate():
-    flag = WORKFLOW["env"]["TRUSTED_EVENT"]
-    pred = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", flag, re.S).group(1)
+def test_every_template_job_carries_the_guarded_predicate():
     for name, job in JOBS.items():
-        assert pred in job["runs-on"], f"{name}: runs-on and TRUSTED_EVENT disagree"
+        assert job["runs-on"] == RUNNER_PRED, name
+    sg = yaml.safe_load((ROOT / "workflows" / "size-guard.yml").read_text(encoding="utf-8"))
+    for name, job in sg["jobs"].items():
+        assert job["runs-on"] == RUNNER_PRED, name
+
+
+def test_trusted_event_flag_is_narrower_than_the_runner():
+    # A same-repo PR may run on nexus-ci, but its code stays untrusted.
+    flag = WORKFLOW["env"]["TRUSTED_EVENT"]
     for event, ref in UNTRUSTED:
         assert resolve(flag, event, ref) is False, (event, ref)
     for event, ref in TRUSTED:
@@ -827,7 +865,9 @@ def test_no_execute_switches_are_present():
     pnpm_audits = [l for l in audit.splitlines() if re.match(r"\s*pnpm audit", l)]
     assert pnpm_audits and all("--config.ignore-pnpmfile=true" in l for l in pnpm_audits), pnpm_audits
     assert "export YARN_IGNORE_PATH=1" in install and "YARN_RC_FILENAME" in install
-    assert "del(.yarnPath) | del(.plugins) | .enableScripts = false" in install
+    assert "del(.yarnPath) | del(.plugins) | with_entries(" in install and ".enableScripts = false" in install
+    for key in ("npm[A-Z]", "[Pp]roxy", "[Cc]aFilePath", "enableStrictSsl"):
+        assert key in install, key
     [pip] = [st["run"] for st in JOBS["pip-audit"]["steps"] if st.get("name", "").startswith("Run pip-audit")]
     untrusted = pip.split('if [ "${TRUSTED_EVENT:-}" = "true" ]; then', 1)[1].split("exit 0\n", 1)[1]
     calls = re.findall(r"^\s*pip-audit .*$", untrusted, re.M)
@@ -837,8 +877,8 @@ def test_no_execute_switches_are_present():
 
 
 def test_size_guard_copies_agree():
-    a, b = (p.read_bytes() for p in SIZE_GUARD_COPIES)
-    assert a == b
+    template, own = (p.read_text(encoding="utf-8") for p in SIZE_GUARD_COPIES)
+    assert own == hosted_variant(template) and not re.search(r"runs-on:.*vars\.", own)
 
 
 # ─── untrusted install paths, executed ───────────────────────────────────────
@@ -957,3 +997,180 @@ def test_planted_packaging_in_the_checkout_is_not_imported(tmp_path, shim_path):
     assert "PLANTED" not in out, out
     assert proc.returncode == 0, out
     assert "1 declared dependencies, each audited" in out
+
+
+# ─── audit-dev-standards-2026-10-27 MEDIUM (proposed R-B): PR-controlled ─────
+# package-manager config must not redirect or narrow the audit ───────────────
+
+@pytest.mark.parametrize("files,expect", [
+    ({".npmrc": "registry=https://attacker.example/\n"}, "'registry'"),
+    ({".npmrc": "@acme:registry=https://attacker.example/\n"}, "'@acme:registry'"),
+    ({".npmrc": "omit=dev\n"}, "'omit'"),
+    ({".npmrc": "https-proxy=http://attacker.example:8080\n"}, "'https-proxy'"),
+    ({".npmrc": "strict-ssl=false\n"}, "'strict-ssl'"),
+    ({".npmrc": "[section]\nx=1\n"}, "'[section]'"),
+    ({".yarnrc": 'registry "https://attacker.example/"\n'}, "'registry'"),
+    ({"pnpm-workspace.yaml": "packages:\n  - a\nauditConfig:\n  ignoreCves: [CVE-1]\n"}, "'auditConfig'"),
+    ({"pnpm-workspace.yaml": "registry: https://attacker.example/\n"}, "'registry'"),
+    ({"package.json": '{"pnpm": {"auditConfig": {"ignoreGhsas": ["GHSA-x"]}}}'}, "pnpm.auditConfig"),
+])
+def test_untrusted_config_that_steers_the_audit_is_not_examined(tmp_path, shim_path, files, expect):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "package-lock.json": "{}", **files}, "false")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not examined" in proc.stdout and expect in proc.stdout, proc.stdout
+    assert "npm ci" not in proc.calls
+
+
+def test_untrusted_config_is_checked_up_to_the_checkout_root(tmp_path, shim_path):
+    """A workspace member's job reads the root .npmrc too (npm's localPrefix)."""
+    work = tmp_path / "work"
+    (work / "pkg").mkdir(parents=True)
+    (work / ".npmrc").write_text("registry=https://attacker.example/\n", encoding="utf-8")
+    (work / "pkg" / "package.json").write_text("{}", encoding="utf-8")
+    (work / "pkg" / "package-lock.json").write_text("{}", encoding="utf-8")
+    proc = subprocess.run(bash_argv(npm_step("Install")), cwd=work / "pkg", capture_output=True, text=True,
+                          env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "false", "DIR": "pkg",
+                               "GITHUB_ENV": (tmp_path / "genv").as_posix(), "GITHUB_WORKSPACE": work.as_posix()})
+    assert proc.returncode == 1 and "'registry'" in proc.stdout, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("files", [
+    {".npmrc": "# comment\ninstall-links=true\nallow-build-scripts=esbuild,sharp\n"},
+    {"pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nonlyBuiltDependencies:\n  - esbuild\npatchedDependencies:\n  x: p.patch\n"},
+])
+def test_untrusted_benign_config_is_audited_with_the_registry_pinned(tmp_path, shim_path, files):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "package-lock.json": "{}", **files}, "false")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "npm_config_registry=https://registry.npmjs.org/" in proc.genv
+    user = re.search(r"^npm_config_userconfig=(.+)$", proc.genv, re.M).group(1)
+    glob = re.search(r"^npm_config_globalconfig=(.+)$", proc.genv, re.M).group(1)
+    assert user != glob, "npm aborts when one file is both user and global config"
+
+
+def test_trusted_event_honours_the_repo_config(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": "{}", "package-lock.json": "{}",
+                                             ".npmrc": "registry=https://npm.internal.example/\n"}, "true")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "npm_config_registry" not in proc.genv
+
+
+def _stub_registry():
+    import http.server
+    import threading
+    hits: list[str] = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _answer(self):
+            hits.append(f"{self.command} {self.path}")
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        do_GET = do_POST = _answer
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, hits
+
+
+@pytest.mark.skipif(shutil.which("npm") is None, reason="real npm not on PATH")
+def test_real_npm_env_registry_beats_the_project_npmrc(tmp_path):
+    """Probe of the real dependency, as reviewer 1 did (npm 11.7.0 at the
+    audit): a project .npmrc names the 'attacker' registry; with the pin the
+    workflow exports, the advisory POST goes to the pinned one instead.
+    Both registries are local stubs; no network."""
+    attacker, attacker_hits = _stub_registry()
+    pinned, pinned_hits = _stub_registry()
+    try:
+        work = tmp_path / "proj"
+        work.mkdir()
+        (work / "package.json").write_text('{"name":"p","version":"1.0.0","dependencies":{"lodash":"4.17.15"}}',
+                                           encoding="utf-8")
+        (work / "package-lock.json").write_text(json.dumps({
+            "name": "p", "version": "1.0.0", "lockfileVersion": 3, "requires": True,
+            "packages": {"": {"name": "p", "version": "1.0.0", "dependencies": {"lodash": "4.17.15"}},
+                         "node_modules/lodash": {"version": "4.17.15",
+                                                 "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz"}}}),
+            encoding="utf-8")
+        (work / ".npmrc").write_text(f"registry=http://127.0.0.1:{attacker.server_port}/\n", encoding="utf-8")
+        # Distinct files, as the workflow uses: npm 11 refuses one file as both.
+        empty, empty_g = tmp_path / "empty-user-npmrc", tmp_path / "empty-global-npmrc"
+        empty.write_text("", encoding="utf-8")
+        empty_g.write_text("", encoding="utf-8")
+        base_env = {k: v for k, v in os.environ.items() if not k.lower().startswith("npm_config_")}
+        npm = shutil.which("npm")
+
+        # Control: without the pin the project .npmrc wins (the audit's finding).
+        subprocess.run([npm, "audit", "--json"], cwd=work, capture_output=True, text=True, timeout=120,
+                       env={**base_env, "npm_config_userconfig": str(empty), "npm_config_globalconfig": str(empty_g)})
+        assert any("advisories/bulk" in h for h in attacker_hits), ("control did not reach the .npmrc registry",
+                                                                    attacker_hits)
+        attacker_hits.clear()
+
+        subprocess.run([npm, "audit", "--json"], cwd=work, capture_output=True, text=True, timeout=120,
+                       env={**base_env, "npm_config_registry": f"http://127.0.0.1:{pinned.server_port}/",
+                            "npm_config_userconfig": str(empty), "npm_config_globalconfig": str(empty_g)})
+        assert any("advisories/bulk" in h for h in pinned_hits), pinned_hits
+        assert attacker_hits == [], attacker_hits
+    finally:
+        attacker.shutdown()
+        pinned.shutdown()
+
+
+# ─── audit-dev-standards-2026-10-27 MEDIUM: workspace folding ────────────────
+
+CLASSIC_WS_LOCK = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n\n"
+
+
+def test_yarn_classic_never_folds_a_member(tmp_path, shim_path):
+    proc, o = run_detect(tmp_path, shim_path, {
+        "package.json": '{"workspaces": ["packages/*"]}', "yarn.lock": CLASSIC_WS_LOCK,
+        "packages/a/package.json": "{}", "packages/.x/package.json": '{"dependencies":{"lodash":"4.17.15"}}',
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(o["npm_covered"]) == {}
+    assert json.loads(o["npm_dirs"]) == [".", "packages/.x", "packages/a"]
+
+
+def test_a_dot_directory_is_never_a_glob_member(tmp_path, shim_path):
+    """npm/pnpm/yarn globs do not match dot segments; neither does detect."""
+    lock = json.dumps({"lockfileVersion": 3, "packages": {"": {}, "packages/a": {}, "packages/.x": {}}})
+    proc, o = run_detect(tmp_path, shim_path, {
+        "package.json": '{"workspaces": ["packages/*", "apps/**"]}', "package-lock.json": lock,
+        "packages/a/package.json": "{}", "packages/.x/package.json": "{}",
+        "apps/.hidden/b/package.json": "{}",
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    covered = json.loads(o["npm_covered"])
+    assert covered == {"packages/a": "."}, covered
+    assert "packages/.x" in json.loads(o["npm_dirs"]) and "apps/.hidden/b" in json.loads(o["npm_dirs"])
+
+
+def _glob_re():
+    body = step_run("detect", "detect").split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    import textwrap
+    src = textwrap.dedent(body)
+    fn = "def glob_re(pat):" + src.split("def glob_re(pat):", 1)[1].split("\ndef ", 1)[0]
+    ns: dict = {"re": re}
+    exec(fn, ns)
+    return ns["glob_re"]
+
+
+@pytest.mark.parametrize("pat,path,want", [
+    ("packages/*", "packages/a", True), ("packages/*", "packages/.x", False),
+    ("packages/.x", "packages/.x", True), ("packages/.*", "packages/.x", True),
+    ("**/pkg", "a/b/pkg", True), ("**/pkg", ".a/pkg", False), ("apps/**", "apps/a/b", True),
+    ("apps/**", "apps/.h/b", False), ("apps/**", "apps/a/.h", False), ("p?", "p1", True), ("p?", "p/x", False),
+    ("packages/*", "packages/a/b", False),
+])
+def test_glob_re_follows_dot_false(pat, path, want):
+    rx = _glob_re()(pat)
+    assert bool(rx and rx.match(path)) is want, (pat, path)

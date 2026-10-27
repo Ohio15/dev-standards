@@ -2,7 +2,16 @@
 # Install the dev-standards guards into a target repo.
 #
 # Usage:
-#   ./install.sh /path/to/target-repo
+#   ./install.sh [--visibility=private|public] /path/to/target-repo
+#
+# Runner choice (STANDARDS.md section 4, register SC-37; audit 2026-10-27):
+# the CI templates select the self-hosted `nexus-ci` runner only in a private
+# repo. A copy installed into a PUBLIC repo must carry the hosted literal, so
+# unless the target is confirmed private every variable-selected `runs-on:` in
+# the installed workflows is rewritten to `ubuntu-latest`. Visibility comes
+# from --visibility, else from `gh repo view` on the target's origin; anything
+# unconfirmed counts as public (hosted), the safe direction. Re-run this
+# installer after a repo changes visibility.
 #
 # Wires the chained pre-commit dispatcher plus the size-guard and secret-scan
 # sub-hooks into .githooks/, drops the CI workflow, and seeds default
@@ -11,8 +20,13 @@
 
 set -euo pipefail
 
+visibility=""
+case "${1:-}" in
+  --visibility=private|--visibility=public) visibility="${1#--visibility=}"; shift ;;
+  --visibility=*) echo "ERROR: --visibility must be private or public" >&2; exit 2 ;;
+esac
 if [ $# -ne 1 ]; then
-  echo "Usage: $0 /path/to/target-repo" >&2
+  echo "Usage: $0 [--visibility=private|public] /path/to/target-repo" >&2
   exit 2
 fi
 
@@ -60,6 +74,27 @@ cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
 cp "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
 cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
+if [ -z "$visibility" ] && command -v gh >/dev/null 2>&1; then
+  if v="$(cd "$target" && gh repo view --json isPrivate --jq .isPrivate 2>/dev/null)"; then
+    case "$v" in true) visibility=private ;; false) visibility=public ;; esac
+  fi
+fi
+runner_note="nexus-ci in this private repo when vars.CI_RUNNER == 'nexus-ci', else ubuntu-latest"
+if [ "$visibility" != "private" ]; then
+  # Public or unconfirmed: hosted literal only (SC-37 makes any
+  # variable-selected runner in a public repo a finding).
+  for wf in size-guard.yml security-audit.yml dep-auto-apply.yml; do
+    f="$target/.github/workflows/$wf"
+    sed -E 's/^([[:space:]]*runs-on:[[:space:]]*)\$\{\{.*vars\.CI_RUNNER.*\}\}[[:space:]]*$/\1ubuntu-latest/' "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
+    if grep -Eq '^[[:space:]]*runs-on:.*(vars\.|nexus-ci|self-hosted)' "$f"; then
+      echo "ERROR: $f still selects a runner from a variable after the hosted rewrite" >&2
+      exit 1
+    fi
+  done
+  runner_note="ubuntu-latest only (visibility: ${visibility:-unconfirmed, treated as public}; pass --visibility=private to allow nexus-ci)"
+fi
+
 # Security register (security/REVIEW-MODEL.md): the per-session gate reads
 # <repo>/SECURITY-CHECKS.md and falls back to the canonical copy, reporting
 # the fallback as a finding — so every repo gets its own copy. Always
@@ -101,6 +136,7 @@ echo "  .githooks/pre-commit                  (chained dispatcher)"
 echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
 echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
 echo "  .githooks/pre-commit-healthcheck-lint.sh  (release-config.yml shape)"
+echo "  runners: $runner_note"
 echo "  .github/workflows/size-guard.yml"
 echo "  .github/workflows/security-audit.yml  (Layer A — always on)"
 echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
