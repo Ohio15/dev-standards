@@ -631,9 +631,11 @@ These stay FINDINGs whatever 1 to 3 say:
 **Fix form.** Every PR-reachable job carries either a literal GitHub-hosted
 label or the canonical predicate. In public repositories, `vars.CI_RUNNER`
 stays unset and PR-reachable jobs keep a predicate under which no
-`pull_request` event can select the variable. Elsewhere, variables may select
-runners only for `push`, `schedule`, `workflow_dispatch`, `release` and
-`merge_group`.
+`pull_request` event can select the variable. In private repositories served
+by ci-registrar >= 0.4.1, variables may select runners only for `push`,
+`schedule`, `workflow_dispatch`, `release`, `merge_group` and a same-repo
+`pull_request` (`github.event.pull_request.head.repo.full_name ==
+github.repository`), which is exactly what the canonical predicate admits.
 **Since.** 2026-10-09.
 **Amended.** 2026-10-27, approved by Ron (shared-brain `288e5d95`; runner
 policy `68d983a4`). Before this, any variable-selected runner on a
