@@ -430,7 +430,8 @@ def test_detect_matches_security_audit(tmp_path, shim_path):
     detect = step("detect")["run"]
     audit = yaml.safe_load(AUDIT_TEMPLATE.read_text(encoding="utf-8"))
     [audit_detect] = [s["run"] for s in audit["jobs"]["detect"]["steps"] if s.get("id") == "detect"]
-    for spec in ("npm_dirs=$(dirs_of 'package.json' '**/package.json')",
+    # security-audit names its npm list npm_manifest_dirs (workspace folding, #57).
+    for spec in ("dirs_of 'package.json' '**/package.json')",
                  "go_dirs=$(dirs_of 'go.mod' '**/go.mod')",
                  "python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')"):
         assert spec in detect and spec in audit_detect
@@ -610,9 +611,43 @@ def test_apply_job_uploads_and_publish_downloads_outside_the_workspace():
 
 
 def test_apply_job_does_not_publish_a_cache():
+    # audit 2026-10-27 MEDIUM (proposed R-C): dependency code runs in apply on
+    # the default branch, so nothing there may save a default-branch cache.
+    seen = set()
     for s in STEPS:
-        if str(s.get("uses", "")).startswith("actions/setup-go@"):
-            assert s["with"]["cache"] is False
+        uses = str(s.get("uses", ""))
+        assert not uses.startswith("actions/cache"), s
+        w = s.get("with") or {}
+        if uses.startswith("actions/setup-go@"):
+            assert w["cache"] is False
+        elif uses.startswith("actions/setup-node@"):
+            assert w["package-manager-cache"] is False and "cache" not in w
+        elif uses.startswith("actions/setup-python@"):
+            assert w.get("cache", "") == ""  # setup-python caches only when asked
+        elif uses.startswith("actions/setup-"):
+            raise AssertionError(f"unreviewed setup action in apply: {uses}")
+        else:
+            continue
+        seen.add(uses.split("@")[0])
+    assert seen == {"actions/setup-go", "actions/setup-node", "actions/setup-python"}
+
+
+RELEASE_WORKFLOWS = ["docker-release.yml", "mcp-release.yml", "electron-release.yml", "lib-release.yml",
+                     "release-gates.yml"]
+
+
+@pytest.mark.parametrize("name", RELEASE_WORKFLOWS)
+def test_release_workflows_never_restore_an_actions_cache(name):
+    # The restore side of the same rule: a release or secret-holding job never
+    # reads a cache apply could have written (header of dep-auto-apply.yml).
+    text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    assert "type=gha" not in text
+    assert not re.search(r"^\s+cache:\s*(npm|pnpm|yarn|true)\b", text, re.M)
+    assert "actions/cache@" not in text
+    for job in yaml.safe_load(text)["jobs"].values():
+        for st in job.get("steps", []):
+            if str(st.get("uses", "")).startswith("actions/setup-node@"):
+                assert (st.get("with") or {}).get("package-manager-cache") is False, (name, st)
 
 
 @pytest.mark.parametrize("path", [TEMPLATE, OWN_COPY])
@@ -939,7 +974,7 @@ NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
 RUN_SHA256 = {
     "publish": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "verify": "f3827ed24ddddac7537703a451bd33b8ac2c28fcdd929aecb44eb3fbe01c4a56",
+        "verify": "da7078517fa31fe39256ec44305860d3285a242e5429dea95b7eb015fe9ae8c4",
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
@@ -1092,7 +1127,7 @@ def test_npm_lock_registry_bump_is_accepted(tmp_path, shim_path):
 
 PNPM = ("lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n"
         "        version: 1.0.0\n      local:\n        specifier: link:../local\n        version: link:../local\n"
-        "\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x, tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n")
+        "\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-" + "A" * 86 + "==, tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n")
 
 
 @pytest.mark.parametrize("added,expect", [
@@ -1425,3 +1460,254 @@ def test_runner_variable_selects_only_literal_labels(name):
             got = ev(body, {"github.event.repository.private": private, "vars.CI_RUNNER": var})
             want = "nexus-ci" if private and var == "nexus-ci" else "ubuntu-latest"
             assert got == want, (private, var, got)
+
+
+# ─── audit-dev-standards-2026-10-27 HIGH (proposed R-A): bind each download ──
+# to the record that names it, and keep the dependency name set.
+# Reviewer 2 extracted the publish validator and ran it with `python -I`
+# against a scratch repo whose apply step had (1) rewritten
+# packages["node_modules/a"].resolved to another package's tarball on the same
+# registry, with a matching integrity, and (2) added a new dependency. It
+# printed `verified 2 file(s): package-lock.json, package.json`, exit 0,
+# pr_kind=ok. Every refusal case below is that shape or a sibling.
+
+def sri(seed: str) -> str:
+    import base64
+    return "sha512-" + base64.b64encode(hashlib.sha512(seed.encode()).digest()).decode()
+
+
+def npm_lock(**packages) -> str:
+    doc = {"name": "t", "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": {
+        "": {"name": "t", "version": "1.0.0", "dependencies": {"a": "^1.0.0", "@s/b": "^2.0.0"}},
+        "node_modules/a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                           "integrity": sri("a-1.0.0")},
+        "node_modules/@s/b": {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@s/b/-/b-2.0.0.tgz",
+                              "integrity": sri("b-2.0.0")},
+    }}
+    for key, rec in packages.items():
+        if rec is None:
+            doc["packages"].pop(key, None)
+        else:
+            doc["packages"][key] = rec
+    return json.dumps(doc, indent=2) + "\n"
+
+
+NPM_PKG = '{\n  "name": "t",\n  "version": "1.0.0",\n  "dependencies": {"a": "^1.0.0", "@s/b": "^2.0.0"}\n}\n'
+A_101 = {"version": "1.0.1", "resolved": "https://registry.npmjs.org/a/-/a-1.0.1.tgz", "integrity": sri("a-1.0.1")}
+
+
+def test_reviewer_poc_rewritten_resolved_and_new_dependency_is_refused(tmp_path, shim_path):
+    """The exact 2026-10-27 proof of concept, end to end: the apply job's own
+    package step builds the artifact and publish verifies it. It exited 0."""
+    repo = base_repo(tmp_path, {"package.json": NPM_PKG, "package-lock.json": npm_lock()})
+    checkout = fresh_checkout(tmp_path, repo)
+    evil = {"version": "1.0.1", "resolved": "https://registry.npmjs.org/evil-pkg/-/evil-pkg-1.0.1.tgz",
+            "integrity": sri("evil-pkg-1.0.1")}
+    write(repo, "package-lock.json", npm_lock(**{
+        "node_modules/a": evil,
+        "node_modules/c": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/c/-/c-1.0.0.tgz",
+                           "integrity": sri("c-1.0.0")},
+    }))
+    write(repo, "package.json", NPM_PKG.replace('"^1.0.0",', '"^1.0.1", "c": "^1.0.0",'))
+    proc, art = run_package(tmp_path, shim_path, repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode != 0, "the 2026-10-27 PoC still passes: " + v.stdout
+    assert "::error::publish refused" in v.stdout
+    assert "verified 2 file(s)" not in v.stdout
+    assert "add_paths" not in v.outputs and "pr_kind" not in v.outputs
+
+
+@pytest.mark.parametrize("half", ["resolved", "new-dependency"])
+def test_each_half_of_the_reviewer_poc_is_refused_alone(tmp_path, shim_path, half):
+    if half == "resolved":
+        files = {"package-lock.json": npm_lock()}
+        mutate = lambda r: write(r, "package-lock.json", npm_lock(**{"node_modules/a": {
+            **A_101, "resolved": "https://registry.npmjs.org/evil-pkg/-/evil-pkg-1.0.1.tgz"}}))
+        expect = "is not the registry tarball of a@1.0.1"
+    else:
+        files = {"package.json": NPM_PKG}
+        mutate = lambda r: write(r, "package.json", NPM_PKG.replace('"^2.0.0"', '"^2.0.0", "c": "^1.0.0"'))
+        expect = "the dependencies names changed"
+    refused(tmp_path, shim_path, files, mutate, expect=expect)
+
+
+@pytest.mark.parametrize("record,expect", [
+    # Another package's tarball on the same trusted host.
+    ({**A_101, "resolved": "https://registry.npmjs.org/evil/-/evil-1.0.1.tgz"}, "is not the registry tarball of a@1.0.1"),
+    # The right package at another version than the record claims.
+    ({**A_101, "resolved": "https://registry.npmjs.org/a/-/a-9.9.9.tgz"}, "is not the registry tarball of a@1.0.1"),
+    # A scoped lookalike (same basename, other scope) reads as a path prefix.
+    ({**A_101, "resolved": "https://registry.npmjs.org/@evil/a/-/a-1.0.1.tgz"}, "registry root"),
+    # A path prefix the base never used on the same host.
+    ({**A_101, "resolved": "https://registry.npmjs.org/proxy/a/-/a-1.0.1.tgz"}, "registry root"),
+    ({**A_101, "resolved": "https://registry.npmjs.org/a/-/a-1.0.1.tgz?x=/evil/-/evil-1.0.1.tgz"}, "not the registry tarball"),
+    ({**A_101, "resolved": "https://registry.npmjs.org/a/-/a-1.0.1.tgz#frag"}, "not the registry tarball"),
+    ({**A_101, "resolved": "https://registry.npmjs.org/%61/-/a-1.0.1.tgz"}, "not the registry tarball"),
+    ({**A_101, "resolved": "https://registry.npmjs.org:8443/a/-/a-1.0.1.tgz"}, "registry root"),
+    ({**A_101, "hasInstallScript": True}, "gains hasInstallScript"),
+    ({**A_101, "name": "evil"}, "alias `name`"),
+    # Same version, different bytes.
+    ({"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz", "integrity": sri("evil")},
+     "integrity changes without a version change"),
+    ({**A_101, "integrity": "sha512-x"}, "is not an SRI hash"),
+])
+def test_npm_lock_binding_refuses(tmp_path, shim_path, record, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock()},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"node_modules/a": record})), expect=expect)
+
+
+@pytest.mark.parametrize("change,expect", [
+    # A new package whose URL binds perfectly: only the name set catches it.
+    ({"node_modules/c": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/c/-/c-1.0.0.tgz",
+                         "integrity": sri("c")}}, "set of installed package names changed"),
+    # A new name as a nested copy is still a new name.
+    ({"node_modules/a/node_modules/zz": {"version": "1.0.0",
+                                         "resolved": "https://registry.npmjs.org/zz/-/zz-1.0.0.tgz"}},
+     "set of installed package names changed"),
+    ({"node_modules/@s/b": None}, "set of installed package names changed"),
+    ({"": {"name": "t", "version": "1.0.0", "dependencies": {"a": "^1.0.0", "@s/b": "^2.0.0", "c": "^1.0.0"}}},
+     "'') dependencies changed"),
+    ({"packages/evil": {"name": "evil", "version": "1.0.0"}}, "set of root/workspace records changed"),
+])
+def test_npm_lock_name_set_is_the_base(tmp_path, shim_path, change, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock()},
+            lambda r: write(r, "package-lock.json", npm_lock(**change)), expect=expect)
+
+
+def test_npm_v1_nested_rewritten_resolved_is_refused(tmp_path, shim_path):
+    v1 = {"name": "t", "lockfileVersion": 1, "dependencies": {
+        "a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz", "integrity": sri("a"),
+              "dependencies": {"b": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/b/-/b-1.0.0.tgz",
+                                     "integrity": sri("b")}}}}}
+    bad = json.loads(json.dumps(v1))
+    bad["dependencies"]["a"]["dependencies"]["b"].update(
+        version="1.0.1", resolved="https://registry.npmjs.org/evil/-/evil-1.0.1.tgz", integrity=sri("evil"))
+    refused(tmp_path, shim_path, {"package-lock.json": json.dumps(v1, indent=2) + "\n"},
+            lambda r: write(r, "package-lock.json", json.dumps(bad, indent=2) + "\n"),
+            expect="is not the registry tarball of b@1.0.1")
+
+
+def test_go_mod_new_require_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"go.mod": GOMOD},
+            lambda r: write(r, "go.mod", GOMOD + "require github.com/evil/x v1.0.0\n"),
+            expect="set of required modules changed")
+
+
+def test_requirements_new_pin_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests==2.31.0\n"},
+            lambda r: write(r, "requirements.txt", "requests==2.33.0\nevil-pkg==1.0.0\n"),
+            expect="set of pinned projects changed")
+
+
+def test_requirements_name_spelling_is_one_project(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"requirements.txt": "Typing_Extensions==4.0.0\n"})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "requirements.txt", "typing-extensions==4.12.2\n")
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+@pytest.mark.parametrize("new,expect", [
+    (PNPM.replace("1.0.0", "1.0.1").replace("registry.npmjs.org/a/-/a-1.0.1", "registry.npmjs.org/evil/-/evil-1.0.1"),
+     "is not the registry tarball of a@1.0.1"),
+    (PNPM.replace("sha512-" + "A" * 86, "sha512-" + "B" * 86), "integrity changes without a version change"),
+    (PNPM + "\n  c@1.0.0:\n    resolution: {integrity: sha512-" + "C" * 86
+     + "==, tarball: https://registry.npmjs.org/c/-/c-1.0.0.tgz}\n", "set of package names in packages changed"),
+    (PNPM.replace("      local:\n", "      c:\n        specifier: ^1.0.0\n        version: 1.0.0\n      local:\n"),
+     "importer '.' dependencies changed"),
+    (PNPM.replace("tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n",
+                  "tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n    requiresBuild: true\n"),
+     "gains requiresBuild"),
+    (PNPM.replace("{integrity: sha512-" + "A" * 86 + "==, tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}",
+                  "{integrity: sha512-" + "A" * 86 + "==, type: custom}"), "is not a registry tarball"),
+])
+def test_pnpm_binding_refuses(tmp_path, shim_path, new, expect):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM}, lambda r: write(r, "pnpm-lock.yaml", new), expect=expect)
+
+
+def test_npm_bump_with_new_integrity_and_scoped_package_is_accepted(tmp_path, shim_path):
+    """The positive case: what `npm audit fix` really writes for a patch bump."""
+    repo = base_repo(tmp_path, {"package.json": NPM_PKG, "package-lock.json": npm_lock()})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package.json", NPM_PKG.replace('"^2.0.0"', '"^2.0.1"'))
+    write(repo, "package-lock.json", npm_lock(**{
+        "": {"name": "t", "version": "1.0.0", "dependencies": {"a": "^1.0.0", "@s/b": "^2.0.1"}},
+        "node_modules/a": A_101,
+        "node_modules/@s/b": {"version": "2.0.1", "resolved": "https://registry.npmjs.org/@s/b/-/b-2.0.1.tgz",
+                              "integrity": sri("b-2.0.1")},
+    }))
+    proc, art = run_package(tmp_path, shim_path, repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    v = run_verify(tmp_path, shim_path, checkout, art)
+    assert v.returncode == 0, v.stdout + v.stderr
+    assert v.outputs["pr_kind"] == "ok"
+    assert "verified 2 file(s): package-lock.json, package.json" in v.stdout
+
+
+def test_bump_on_a_registry_root_the_base_already_uses_is_accepted(tmp_path, shim_path):
+    mirror = "https://npm.example.internal/api/npm/remote"
+    base = npm_lock(**{"node_modules/a": {"version": "1.0.0", "resolved": f"{mirror}/a/-/a-1.0.0.tgz",
+                                          "integrity": sri("a-1.0.0")}})
+    repo = base_repo(tmp_path, {"package-lock.json": base})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", npm_lock(**{"node_modules/a": {
+        "version": "1.0.1", "resolved": f"{mirror}/a/-/a-1.0.1.tgz", "integrity": sri("a-1.0.1")}}))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_hoisting_move_of_an_existing_package_is_accepted(tmp_path, shim_path):
+    """npm may move a nested copy to the top level; the name set is unchanged."""
+    nested_key = "node_modules/a/node_modules/@s/b"
+    rec = {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@s/b/-/b-2.0.0.tgz", "integrity": sri("b-2.0.0")}
+    repo = base_repo(tmp_path, {"package-lock.json": npm_lock(**{"node_modules/@s/b": None, nested_key: rec})})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package-lock.json", npm_lock())
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_pnpm_snapshot_keys_with_peers_are_read(tmp_path, shim_path):
+    base = PNPM + "\nsnapshots:\n\n  a@1.0.0(react@18.0.0):\n    dependencies:\n      react: 18.0.0\n"
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": base})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", base.replace("1.0.0", "1.0.1"))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def _validator_namespace() -> dict:
+    """The shipped validator's definitions (everything before its first
+    action), loaded so a helper can be exercised on its own."""
+    import textwrap
+    src = publish_step("verify")["run"]
+    body = textwrap.dedent(src.split("python3 -I - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0])
+    head = body.split("# ---- result.json", 1)[0]
+    ns: dict = {}
+    exec(head.replace('os.environ["ALLOWED_MANIFEST_RE"]', "'x'").replace('os.environ["RUNNER_TEMP"]', "'.'"), ns)
+    helpers = body.split("def tarball_root(", 1)[1].split("def go_mod_directives(", 1)[0]
+    exec("def tarball_root(" + helpers, ns)
+    return ns
+
+
+@pytest.mark.parametrize("key,want", [
+    ("a@1.0.0", ("a", "1.0.0")), ("'@s/a@1.0.0'", ("@s/a", "1.0.0")), ("/a@1.0.0(b@2.0.0)", ("a", "1.0.0")),
+    ("/a/1.0.0", ("a", "1.0.0")), ("/@s/a/1.0.0_react@18.0.0", ("@s/a", "1.0.0")),
+    ("a@https://codeload.github.com/o/r/tar.gz/abc", ("a", None)), ("../x@1.0.0", (None, None)),
+])
+def test_pnpm_key_reader(key, want):
+    assert _validator_namespace()["pnpm_key"](key) == want
+
+
+@pytest.mark.parametrize("name,version,url,want", [
+    ("a", "1.0.0", "https://registry.npmjs.org/a/-/a-1.0.0.tgz", ("registry.npmjs.org", "")),
+    ("@s/b", "2.0.0", "https://registry.npmjs.org/@s/b/-/b-2.0.0.tgz", ("registry.npmjs.org", "")),
+    ("a", "1.0.0", "https://h.example/x/y/a/-/a-1.0.0.tgz", ("h.example", "/x/y")),
+    ("a", "1.0.0", "https://registry.npmjs.org/b/-/a-1.0.0.tgz", None),
+    ("a", "1.0.0", "http://registry.npmjs.org/a/-/a-1.0.0.tgz", None),
+    ("../a", "1.0.0", "https://registry.npmjs.org/../a/-/a-1.0.0.tgz", None),
+    ("a", None, "https://registry.npmjs.org/a/-/a-1.0.0.tgz", None),
+])
+def test_tarball_root(name, version, url, want):
+    assert _validator_namespace()["tarball_root"](name, version, url) == want
