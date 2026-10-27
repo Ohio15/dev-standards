@@ -1299,6 +1299,67 @@ jobs:
                   return None, None
               return name, (ver if PLAIN_VERSION.fullmatch(ver) else None)
 
+          def unquote(s):
+              """A YAML scalar as pnpm reads it: '...' ('' is a quote), "...", or plain."""
+              s = s.strip()
+              if len(s) >= 2 and s[0] == s[-1] == "'":
+                  return s[1:-1].replace("''", "'")
+              if len(s) >= 2 and s[0] == s[-1] == '"':
+                  try:
+                      return json.loads(s)
+                  except ValueError:
+                      die(f"unreadable double-quoted scalar {s!r}")
+              return s
+
+          def flow_map(path, key, value):
+              """A one-line YAML flow mapping {k: v, ...} with every key and
+              value unquoted, so `'tarball':`, `"tarball":` and `tarball:`
+              are the same key. Nesting, duplicates or anything unparseable
+              fails closed (gate pass 1 on #62, SC-03/SC-19)."""
+              if not (value.startswith("{") and value.endswith("}")):
+                  die(f"{path}: {key!r} resolution {value!r} is not a flow mapping")
+              items, cur, quote = [], "", None
+              for ch in value[1:-1]:
+                  if quote:
+                      cur += ch
+                      if ch == quote:
+                          quote = None
+                  elif ch in "'\"":
+                      quote = ch
+                      cur += ch
+                  elif ch == ",":
+                      items.append(cur)
+                      cur = ""
+                  elif ch in "{}[]&*!|>":
+                      die(f"{path}: {key!r} resolution {value!r} is not a plain flow mapping")
+                  else:
+                      cur += ch
+              if quote:
+                  die(f"{path}: {key!r} resolution {value!r} has an unterminated quote")
+              items.append(cur)
+              out = {}
+              for item in items:
+                  item = item.strip()
+                  if not item:
+                      continue
+                  if item[0] in "'\"":
+                      end = item.find(item[0], 1)
+                      while item[0] == "'" and end > 0 and item[end + 1:end + 2] == "'":
+                          end = item.find("'", end + 2)
+                      rest = item[end + 1:].lstrip() if end > 0 else ""
+                      if end < 0 or not rest.startswith(":"):
+                          die(f"{path}: {key!r} resolution entry {item!r} is unreadable")
+                      k, v = unquote(item[:end + 1]), rest[1:]
+                  else:
+                      m = re.fullmatch(r"([^\s:'\"]+):(?:\s+(.*))?", item)
+                      if not m:
+                          die(f"{path}: {key!r} resolution entry {item!r} is unreadable")
+                      k, v = m.group(1), m.group(2) or ""
+                  if k in out:
+                      die(f"{path}: {key!r} resolution repeats {k!r}")
+                  out[k] = unquote(v)
+              return out
+
           def pnpm_doc(path, text):
               """The parts of a pnpm-lock.yaml the binding rules need, read by
               indentation (no YAML library in an isolated interpreter):
@@ -1325,20 +1386,25 @@ jobs:
                       if ind == 2:
                           if not m:
                               die(f"{path}: unreadable {top} key {line!r}")
-                          rec = (top, m.group(1).strip("'\""))
+                          rec = (top, unquote(m.group(1)))
                           if rec in records:
                               die(f"{path}: duplicate {top} key {rec[1]!r}")
                           records[rec] = {}
                           field = None
                       elif rec is not None and ind == 4 and m:
-                          field = m.group(1)
+                          field = unquote(m.group(1))
                           value = (m.group(2) or "").strip()
+                          if field in records[rec]:
+                              die(f"{path}: {rec[1]!r} repeats {field!r}")
                           records[rec][field] = value
-                          if field == "resolution" and value.startswith("{"):
-                              for k, v in re.findall(r"(\w+):\s*([^,}]+)", value):
-                                  records[rec][f"resolution.{k}"] = v.strip().strip("'\"")
+                          if field == "resolution" and value:
+                              for k, v in flow_map(path, rec[1], value).items():
+                                  records[rec][f"resolution.{k}"] = v
                       elif rec is not None and ind == 6 and field == "resolution" and m:
-                          records[rec][f"resolution.{m.group(1)}"] = (m.group(2) or "").strip().strip("'\"")
+                          k = f"resolution.{unquote(m.group(1))}"
+                          if k in records[rec]:
+                              die(f"{path}: {rec[1]!r} repeats {k!r}")
+                          records[rec][k] = unquote(m.group(2) or "")
                   elif top == "importers":
                       if ind == 2 and m:
                           importer, section = m.group(1).strip("'\""), None

@@ -539,9 +539,22 @@ RUNNER_PRED = ("${{ (github.event_name == 'push' || github.event_name == 'schedu
 
 
 def hosted_variant(text: str) -> str:
-    """What install.sh writes into a public repo, and what dev-standards (a
-    public repo) runs itself: every runs-on the hosted literal."""
+    """What install.sh writes into a public repo for security-audit.yml and
+    size-guard.yml, and what dev-standards (a public repo) runs for those two
+    itself: every runs-on the hosted literal. dep-auto-apply.yml is NOT run
+    through this here: dev-standards' own copy equals its template byte for
+    byte and keeps the variable-guarded toggle on its three jobs, which is
+    inert in a public repo and not pull_request-reachable (asserted below)."""
     return text.replace("runs-on: " + RUNNER_PRED, "runs-on: ubuntu-latest")
+
+
+def test_own_dep_auto_apply_runner_is_guarded_and_not_pr_reachable():
+    own = yaml.safe_load((ROOT / ".github" / "workflows" / "dep-auto-apply.yml").read_text(encoding="utf-8"))
+    assert triggers(own) == {"schedule", "workflow_dispatch"}
+    guarded = "${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
+    for name, job in own["jobs"].items():
+        assert job["runs-on"] == guarded, name
+        assert resolve(job["runs-on"], "schedule", "refs/heads/main", private=False) == "ubuntu-latest"
 
 
 def test_dev_standards_own_copy_matches_the_template():
@@ -1032,6 +1045,31 @@ def test_untrusted_config_is_checked_up_to_the_checkout_root(tmp_path, shim_path
                           env={**os.environ, "PATH": shim_path, "TRUSTED_EVENT": "false", "DIR": "pkg",
                                "GITHUB_ENV": (tmp_path / "genv").as_posix(), "GITHUB_WORKSPACE": work.as_posix()})
     assert proc.returncode == 1 and "'registry'" in proc.stdout, proc.stdout + proc.stderr
+
+
+# Gate pass 1 on #62 (SC-04): a package.json that cannot be read is NOT
+# EXAMINED on an untrusted event, never "no pnpm config". pnpm reads a BOM.
+@pytest.mark.parametrize("body,expect", [
+    ('\ufeff{"pnpm": {"auditConfig": {"ignoreGhsas": ["GHSA-x"]}}}', "pnpm.auditConfig"),
+    ('{"pnpm": {"auditConfig": ', "unreadable (JSONDecodeError)"),
+    ('["not", "an", "object"]', "not a JSON object"),
+    ('{"pnpm": "auditConfig"}', "'pnpm' is not an object"),
+])
+def test_untrusted_package_json_that_cannot_be_read_is_not_examined(tmp_path, shim_path, body, expect):
+    proc = run_install(tmp_path, shim_path, {"package.json": body, "package-lock.json": "{}"}, "false")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not examined" in proc.stdout and expect in proc.stdout, proc.stdout
+
+
+def test_bom_package_json_without_pnpm_config_is_audited(tmp_path, shim_path):
+    proc = run_install(tmp_path, shim_path, {"package.json": '\ufeff{"name": "x"}', "package-lock.json": "{}"}, "false")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_config_report_paths_are_repr_escaped():
+    install = npm_step("Install")
+    assert install.count("bad.append(f\"{f!r}:") >= 5
+    assert "logFilters" in install
 
 
 @pytest.mark.parametrize("files", [

@@ -479,6 +479,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.detect.outputs.found == 'true'
         with:
+          # No Actions cache in a release path (audit 2026-10-27, R-C).
+          cache: false
           go-version: 'stable'
 
       - name: Install govulncheck

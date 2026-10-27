@@ -68,9 +68,9 @@ permissions:
   contents: read
 
 env:
-  # 'true' on a trusted event, 'false' otherwise: the same predicate as every
-  # job's runs-on. Scripts treat anything but the exact string 'true' as
-  # untrusted.
+  # 'true' on a trusted event (schedule, or push / workflow_dispatch on the
+  # default branch: merged code), 'false' otherwise. Scripts treat anything
+  # but the exact string 'true' as untrusted.
   # Deliberately narrower than the runner predicate: a same-repo PR may run on
   # nexus-ci but stays untrusted here.
   TRUSTED_EVENT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
@@ -484,13 +484,13 @@ jobs:
                           continue
                       m = re.match(r"([^=\s]+)\s*=", s)
                       if not m or m.group(1) not in NPMRC_OK:
-                          bad.append(f"{f}: {s.split('=', 1)[0].strip()[:60]!r}")
+                          bad.append(f"{f!r}: {s.split('=', 1)[0].strip()[:60]!r}")
               f = os.path.join(d, ".yarnrc")
               if os.path.isfile(f):
                   for ln in text(f).splitlines():
                       s = ln.strip()
                       if s and not s.startswith("#") and s.split()[0].strip('"') not in YARNRC_OK:
-                          bad.append(f"{f}: {s.split()[0][:60]!r}")
+                          bad.append(f"{f!r}: {s.split()[0][:60]!r}")
               f = os.path.join(d, "pnpm-workspace.yaml")
               if os.path.isfile(f):
                   for ln in text(f).splitlines():
@@ -498,15 +498,23 @@ jobs:
                           continue
                       m = re.match(r"(['\"]?)([A-Za-z][A-Za-z0-9]*)\1\s*:", ln)
                       if not m or m.group(2) not in PNPM_WS_OK:
-                          bad.append(f"{f}: {ln.split(':', 1)[0][:60]!r}")
+                          bad.append(f"{f!r}: {ln.split(':', 1)[0][:60]!r}")
               f = os.path.join(d, "package.json")
               if os.path.isfile(f):
+                  # utf-8-sig: pnpm reads a BOM'd package.json, so must this.
+                  # Present but unreadable is NOT EXAMINED, never "no config".
                   try:
-                      pnpm = json.loads(text(f)).get("pnpm")
-                  except (ValueError, AttributeError):
-                      pnpm = None
-                  if isinstance(pnpm, dict) and "auditConfig" in pnpm:
-                      bad.append(f"{f}: 'pnpm.auditConfig'")
+                      with open(f, encoding="utf-8-sig") as fh:
+                          doc = json.load(fh)
+                  except (OSError, ValueError) as exc:
+                      bad.append(f"{f!r}: unreadable ({exc.__class__.__name__}), so its pnpm settings are unknown")
+                      doc = {}
+                  if not isinstance(doc, dict):
+                      bad.append(f"{f!r}: not a JSON object, so its pnpm settings are unknown")
+                  elif isinstance(doc.get("pnpm"), dict) and "auditConfig" in doc["pnpm"]:
+                      bad.append(f"{f!r}: 'pnpm.auditConfig'")
+                  elif "pnpm" in doc and not isinstance(doc["pnpm"], dict):
+                      bad.append(f"{f!r}: 'pnpm' is not an object")
               if d == top or os.path.dirname(d) == d or not d.startswith(top + os.sep):
                   break
               d = os.path.dirname(d)
@@ -551,7 +559,8 @@ jobs:
                 # here is rewritten under a name the PR cannot predict,
                 # without yarnPath or plugins and with scripts off, and with
                 # every npm* key (registry, audit registry, ignored
-                # advisories, scopes, auth), proxy and CA key removed (R-B).
+                # advisories, scopes, auth), proxy and CA key, and logFilters
+                # (which can downgrade or silence messages) removed (R-B).
                 # yq parses it, so quoting, anchors and merge keys cannot
                 # carry a key past the rewrite: yarn reads only yq's JSON
                 # output. yq is on GitHub-hosted images; a runner without it
@@ -562,7 +571,7 @@ jobs:
                 d="$(pwd -P)"
                 while :; do
                   if [ -f "$d/.yarnrc.yml" ]; then
-                    yq -o=json 'explode(.) | del(.yarnPath) | del(.plugins) | with_entries(select(.key | test("^(npm[A-Z].*|.*[Pp]roxy|.*[Cc]aFilePath|enableStrictSsl|unsafeHttpWhitelist|networkSettings|injectEnvironmentFiles)$") | not)) | .enableScripts = false' "$d/.yarnrc.yml" > "$d/$rc_name"
+                    yq -o=json 'explode(.) | del(.yarnPath) | del(.plugins) | with_entries(select(.key | test("^(npm[A-Z].*|.*[Pp]roxy|.*[Cc]aFilePath|enableStrictSsl|unsafeHttpWhitelist|networkSettings|injectEnvironmentFiles|logFilters)$") | not)) | .enableScripts = false' "$d/.yarnrc.yml" > "$d/$rc_name"
                   fi
                   if [ "$d" = "$top" ] || [ "$d" = "/" ]; then break; fi
                   d="$(dirname "$d")"

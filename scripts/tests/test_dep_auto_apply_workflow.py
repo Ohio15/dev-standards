@@ -632,22 +632,42 @@ def test_apply_job_does_not_publish_a_cache():
     assert seen == {"actions/setup-go", "actions/setup-node", "actions/setup-python"}
 
 
-RELEASE_WORKFLOWS = ["docker-release.yml", "mcp-release.yml", "electron-release.yml", "lib-release.yml",
-                     "release-gates.yml"]
+# Derived from the tree, never listed: every workflow this repo runs or ships.
+ALL_WORKFLOWS = sorted(p for d in (ROOT / ".github" / "workflows", ROOT / "templates" / ".github" / "workflows",
+                                   ROOT / "workflows")
+                       for p in [*d.glob("*.yml"), *d.glob("*.yaml")])
 
 
-@pytest.mark.parametrize("name", RELEASE_WORKFLOWS)
-def test_release_workflows_never_restore_an_actions_cache(name):
-    # The restore side of the same rule: a release or secret-holding job never
-    # reads a cache apply could have written (header of dep-auto-apply.yml).
-    text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
-    assert "type=gha" not in text
-    assert not re.search(r"^\s+cache:\s*(npm|pnpm|yarn|true)\b", text, re.M)
-    assert "actions/cache@" not in text
-    for job in yaml.safe_load(text)["jobs"].values():
+def test_the_workflow_list_is_derived_and_covers_the_release_paths():
+    names = {p.relative_to(ROOT).as_posix() for p in ALL_WORKFLOWS}
+    assert {".github/workflows/promote-canary.yml", ".github/workflows/release-gates.yml",
+            ".github/workflows/docker-release.yml", "templates/.github/workflows/dep-auto-apply.yml"} <= names
+
+
+@pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_no_workflow_restores_an_actions_cache(path):
+    # The restore side of the rule in dep-auto-apply.yml's header (audit
+    # 2026-10-27, R-C; gate pass 1 on #62): no job anywhere reads a cache
+    # apply could have written. Every setup-* step has caching explicitly off.
+    text = path.read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "type=gha" not in code
+    assert "actions/cache@" not in code and "actions/cache/" not in code
+    for name, job in yaml.safe_load(text)["jobs"].items():
         for st in job.get("steps", []):
-            if str(st.get("uses", "")).startswith("actions/setup-node@"):
-                assert (st.get("with") or {}).get("package-manager-cache") is False, (name, st)
+            uses = str(st.get("uses", ""))
+            if not uses.startswith("actions/setup-"):
+                continue
+            w = st.get("with") or {}
+            if uses.startswith("actions/setup-go@"):
+                assert w.get("cache") is False, (name, uses)
+            elif uses.startswith("actions/setup-node@"):
+                assert w.get("package-manager-cache") is False and "cache" not in w, (name, uses)
+            elif uses.startswith("actions/setup-python@"):
+                # setup-python caches only when `cache` names a manager.
+                assert w.get("cache", "") == "" and "cache-dependency-path" not in w, (name, uses)
+            else:
+                raise AssertionError(f"{name}: unreviewed setup action {uses}; decide its cache rule here")
 
 
 @pytest.mark.parametrize("path", [TEMPLATE, OWN_COPY])
@@ -974,7 +994,7 @@ NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
 RUN_SHA256 = {
     "publish": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "verify": "da7078517fa31fe39256ec44305860d3285a242e5429dea95b7eb015fe9ae8c4",
+        "verify": "13f2af043c05b83ec8d479fb69124bc9fad5d7ffeee76be59e658395859219d1",
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
@@ -1698,6 +1718,60 @@ def _validator_namespace() -> dict:
 ])
 def test_pnpm_key_reader(key, want):
     assert _validator_namespace()["pnpm_key"](key) == want
+
+
+# ─── security gate pass 1 on #62 (SC-03/SC-19): a flow `resolution` is read ──
+# the way YAML reads it, so a quoted key cannot hide the tarball ──────────────
+EVIL_TB = "https://registry.npmjs.org/evil/-/evil-1.0.1.tgz"
+GOOD_TB = "https://registry.npmjs.org/a/-/a-1.0.1.tgz"
+INTEG = "sha512-" + "D" * 86 + "=="
+
+
+def pnpm_with_resolution(resolution: str) -> str:
+    base = PNPM.replace("1.0.0", "1.0.1")
+    old = base.split("    resolution: ", 1)[1].split("\n", 1)[0]
+    return base.replace("    resolution: " + old, "    resolution: " + resolution)
+
+
+SPELLINGS = {
+    "unquoted": "{{integrity: {i}, tarball: {t}}}",
+    "single-quoted": "{{integrity: {i}, 'tarball': {t}}}",
+    "double-quoted": '{{integrity: {i}, "tarball": {t}}}',
+    "json-style": '{{"integrity":"{i}","tarball":"{t}"}}',
+    "quoted-values": "{{'integrity': '{i}', 'tarball': '{t}'}}",
+}
+
+
+@pytest.mark.parametrize("spelling", SPELLINGS)
+def test_pnpm_flow_resolution_spellings_bind_the_same(tmp_path, shim_path, spelling):
+    fmt = SPELLINGS[spelling]
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", pnpm_with_resolution(fmt.format(i=INTEG, t=EVIL_TB))),
+            expect="is not the registry tarball of a@1.0.1")
+
+
+@pytest.mark.parametrize("spelling", SPELLINGS)
+def test_pnpm_flow_resolution_spellings_accept_a_real_bump(tmp_path, shim_path, spelling):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", pnpm_with_resolution(SPELLINGS[spelling].format(i=INTEG, t=GOOD_TB)))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+@pytest.mark.parametrize("new,expect", [
+    # The field name itself quoted, flow and block form.
+    (lambda: pnpm_with_resolution("x").replace("    resolution: x", "    'resolution': {integrity: %s, tarball: %s}"
+                                               % (INTEG, EVIL_TB)), "is not the registry tarball"),
+    (lambda: pnpm_with_resolution("x").replace("    resolution: x", '    "resolution":\n      "tarball": %s\n'
+                                               "      integrity: %s" % (EVIL_TB, INTEG)), "is not the registry tarball"),
+    (lambda: pnpm_with_resolution("{integrity: %s, 'type': directory, 'directory': ../x}" % INTEG), "not a registry tarball"),
+    (lambda: pnpm_with_resolution("{integrity: %s, tarball: %s, 'tarball': %s}" % (INTEG, GOOD_TB, EVIL_TB)), "repeats"),
+    (lambda: pnpm_with_resolution("{integrity: %s, tarball: {x: y}}" % INTEG), "not a plain flow mapping"),
+    (lambda: pnpm_with_resolution("{integrity: %s, 'tarball: %s}" % (INTEG, GOOD_TB)), "unterminated quote"),
+])
+def test_pnpm_resolution_tricks_fail_closed(tmp_path, shim_path, new, expect):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM}, lambda r: write(r, "pnpm-lock.yaml", new()), expect=expect)
 
 
 @pytest.mark.parametrize("name,version,url,want", [
