@@ -426,28 +426,50 @@ def test_yarn_is_declined_and_said(tmp_path, shim_path):
     assert "::warning::npm auto-apply declined" in proc.stdout
 
 
+SHARED_BEGIN = "# >>> shared manifest detection"
+SHARED_END = "# <<< shared manifest detection\n"
+
+
+def shared_detection(body: str) -> str:
+    """The marked manifest-detection block of a detect step, markers included."""
+    assert body.count(SHARED_BEGIN) == 1 and body.count(SHARED_END) == 1, "detect must carry one marked shared block"
+    start = body.index(SHARED_BEGIN)
+    return body[start:body.index(SHARED_END, start) + len(SHARED_END)]
+
+
 def test_detect_matches_security_audit(tmp_path, shim_path):
+    # Byte-for-byte, not a few spot strings: #57 (d1a791d) taught
+    # security-audit.yml workspace folding and `python3 -I`, dep-auto-apply.yml
+    # kept the old detection, and spot checks were the only thing that noticed.
     detect = step("detect")["run"]
     audit = yaml.safe_load(AUDIT_TEMPLATE.read_text(encoding="utf-8"))
     [audit_detect] = [s["run"] for s in audit["jobs"]["detect"]["steps"] if s.get("id") == "detect"]
-    for spec in ("npm_dirs=$(dirs_of 'package.json' '**/package.json')",
+    shared = shared_detection(detect)
+    assert shared == shared_detection(audit_detect), "the shared detection block differs between dep-auto-apply.yml and security-audit.yml"
+    for spec in ("npm_manifest_dirs=$(dirs_of 'package.json' '**/package.json')",
                  "go_dirs=$(dirs_of 'go.mod' '**/go.mod')",
                  "python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')"):
-        assert spec in detect and spec in audit_detect
+        assert spec in shared
+    # Nothing may redefine a shared result between the block and its use.
+    rest = detect[detect.index(SHARED_END) + len(SHARED_END):]
+    for name in ("dirs_of", "npm_dirs", "npm_covered", "go_dirs", "python_dirs"):
+        assert not re.search(rf"(?m)^\s*{name}(=|\(\))", rest), f"{name} is reassigned after the shared block"
 
     repo = git_repo(tmp_path, {
         "console/package.json": "{}", "console/clis/package.json": "{}",
         "svc/go.mod": "module x\n", "api/requirements-dev.txt": "x==1\n",
         "node_modules/dep/package.json": "{}", ".github/workflows/ci.yml": "on: push\n",
         "deploy/Dockerfile": "FROM x\n",
+        # A pnpm workspace: the member is fixed through the root's lockfile.
+        "ws/package.json": "{}", "ws/pnpm-workspace.yaml": "packages:\n  - 'pkgs/*'\n",
+        "ws/pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  pkgs/a: {}\n",
+        "ws/pkgs/a/package.json": "{}",
     })
-    out = tmp_path / "gh_out"
-    out.write_text("", encoding="utf-8")
-    proc = subprocess.run([BASH, "-c", detect], cwd=repo, capture_output=True, text=True,
-                          env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()})
-    assert proc.returncode == 0, proc.stderr
-    o = parse_outputs(out.read_text(encoding="utf-8"))
-    assert o["npm_dirs"] == '["console", "console/clis"]'
+    proc = run_step("detect", repo, shim_path, {})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    o = proc.outputs
+    assert o["npm_dirs"] == '["console", "console/clis", "ws"]'
+    assert o["npm_covered"] == '{"ws/pkgs/a": "ws"}'
     assert o["go_dirs"] == '["svc"]' and o["go_version_file"] == "svc/go.mod"
     assert o["python_dirs"] == '["api"]'
     assert o["has_docker"] == "true" and o["has_actions"] == "true"

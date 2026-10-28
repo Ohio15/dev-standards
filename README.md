@@ -164,7 +164,7 @@ Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs 
 - Anything bumped + tests fail -> **draft** PR labeled `auto-apply-broken` for human triage. Not auto-closed.
 - Nothing bumped -> exit 0 with a notice and a run summary listing every manifest location declined by policy (yarn, no lockfile, unpinned requirements, pyproject-only, stdlib vulns, go.sum churn).
 - A scanner or package manager could not examine a manifest -> the job FAILS; no PR. Unknown is never reported as "no changes".
-- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root.
+- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root, with workspace members folded into the root that declares them. The manifest-detection block between the `# >>> shared manifest detection` and `# <<< shared manifest detection` markers is byte-identical in both workflows; `scripts/tests/test_dep_auto_apply_workflow.py` compares the two, so a change to one fails the suite until the other gets it too. (#57 changed only `security-audit.yml`, and the old spot-string check was the only thing that caught it.)
 
 **Enrollment** (per-repo opt-in):
 
