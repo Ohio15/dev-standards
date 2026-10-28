@@ -85,6 +85,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # >>> shared manifest detection: byte-identical in security-audit.yml and
+          # dep-auto-apply.yml (scripts/tests/test_dep_auto_apply_workflow.py).
+          # Change both or neither.
           # Directories (repo-relative, "." for the root) that hold a tracked
           # manifest matching the pathspecs, as a JSON array.
           # The filtering is done in python, not grep: under pipefail an empty
@@ -317,6 +320,7 @@ jobs:
           rm -f "$ws_files" "$ws_split"
           go_dirs=$(dirs_of 'go.mod' '**/go.mod')
           python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')
+          # <<< shared manifest detection
           count() { python3 -I -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$1"; }
           n_npm=$(count "$npm_dirs"); n_go=$(count "$go_dirs"); n_py=$(count "$python_dirs")
           has_npm=false; [ "$n_npm" -gt 0 ] && has_npm=true

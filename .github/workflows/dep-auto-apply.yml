@@ -198,15 +198,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Same detection as security-audit.yml: directories (repo-relative,
-          # "." for the root) holding a tracked manifest, as a JSON array.
-          # Filtered in python, not grep: under pipefail an empty grep exits 1.
+          # >>> shared manifest detection: byte-identical in security-audit.yml and
+          # dep-auto-apply.yml (scripts/tests/test_dep_auto_apply_workflow.py).
+          # Change both or neither.
+          # Directories (repo-relative, "." for the root) that hold a tracked
+          # manifest matching the pathspecs, as a JSON array.
+          # The filtering is done in python, not grep: under pipefail an empty
+          # grep exits 1 and would kill this step for every repo that lacks
+          # one of the ecosystems.
           dirs_of() {
-            git ls-files -z -- "$@" | python3 -c '
+            git ls-files -z -- "$@" | python3 -I -c '
           import json, posixpath, sys
           paths = [p for p in sys.stdin.buffer.read().decode().split("\0") if p]
-          # A control character (a newline above all) in a directory name could
-          # forge a `::command::` line when a later step echoes it: refuse.
+          # A directory name is repo content a PR controls. A control character
+          # (a newline above all) could forge a `::command::` line when a later
+          # step echoes it, so refuse, never pass it on.
           hostile = [p for p in paths if any(ord(c) < 0x20 or ord(c) == 0x7f for c in p)]
           if hostile:
               sys.exit("control character in manifest path(s): " + ", ".join(repr(p) for p in hostile))
@@ -214,11 +220,222 @@ jobs:
                          if "node_modules" not in p.split("/")})
           print(json.dumps(keep))'
           }
-          npm_dirs=$(dirs_of 'package.json' '**/package.json')
+          npm_manifest_dirs=$(dirs_of 'package.json' '**/package.json')
+          # Workspace members are audited once, through the root that declares
+          # them. A member of a pnpm / npm / yarn workspace has no lockfile of
+          # its own: the ROOT's lockfile resolves it. Given a job of its own,
+          # the member ran `npm install` and died on `workspace:*`
+          # (EUNSUPPORTEDPROTOCOL), red for a reason that is not a finding
+          # (openclaw-1, 36 such jobs; shared-brain discovery 54c58aa3). A
+          # directory is folded into its root only when all of these hold:
+          # - it has no lockfile of its own;
+          # - an ancestor directory holds a tracked lockfile and declares it a
+          #   member: pnpm-workspace.yaml `packages:` when that lockfile is
+          #   pnpm-lock.yaml (pnpm ignores package.json `workspaces`), else
+          #   package.json `workspaces` (an array, or the `packages` key of an
+          #   object), `!` patterns excluding;
+          # - that lockfile names it (a pnpm importer, a package-lock.json
+          #   `packages` key, a yarn berry `@workspace:` locator; yarn classic
+          #   records no workspaces, so its globs alone decide).
+          # The nearest such ancestor wins. Anything not provably covered keeps
+          # its own job, which fails loudly rather than vanishing. The root's
+          # frozen install checks every member manifest against the lockfile
+          # and its audit reads the whole lockfile, so the root job's result is
+          # each member's result; the summary lists which root covered which
+          # member, and a member is clean only if that root's job succeeded.
+          ws_files=$(mktemp)
+          git ls-files -z -- \
+            'pnpm-lock.yaml' '**/pnpm-lock.yaml' 'pnpm-workspace.yaml' '**/pnpm-workspace.yaml' \
+            'yarn.lock' '**/yarn.lock' 'package-lock.json' '**/package-lock.json' \
+            'npm-shrinkwrap.json' '**/npm-shrinkwrap.json' > "$ws_files"
+          # A file, not $(...): bash mis-parses a quote-heavy heredoc inside a
+          # command substitution. set -e still stops the step if python fails.
+          ws_split=$(mktemp)
+          python3 -I - "$npm_manifest_dirs" "$ws_files" > "$ws_split" <<'PY'
+          import json, re, sys
+          manifest_dirs = json.loads(sys.argv[1])
+          with open(sys.argv[2], "rb") as fh:
+              tracked = {p for p in fh.read().decode().split("\0") if p}
+          LOCKS = ("pnpm-lock.yaml", "yarn.lock", "package-lock.json", "npm-shrinkwrap.json")
+          notes = []
+
+          def at(d, name):
+              return name if d == "." else d + "/" + name
+
+          def has(d, name):
+              return at(d, name) in tracked
+
+          def read(d, name):
+              with open(at(d, name), encoding="utf-8", errors="replace") as fh:
+                  return fh.read()
+
+          def scalar(s):
+              # One YAML scalar: quoted, or plain up to a ` #` comment.
+              s = s.strip()
+              if s[:1] in ("'", '"'):
+                  end = s.find(s[0], 1)
+                  return s[1:end] if end > 0 else None
+              return re.split(r"\s+#", s, maxsplit=1)[0].strip()
+
+          def pnpm_globs(text):
+              # The top-level `packages:` sequence, block or flow form. Any
+              # other shape returns None: unreadable, so nothing is folded.
+              lines = text.splitlines()
+              for i, line in enumerate(lines):
+                  m = re.match(r"packages\s*:(.*)$", line)
+                  if not m:
+                      continue
+                  rest = re.split(r"\s+#", m.group(1), maxsplit=1)[0].strip()
+                  if rest.startswith("[") and rest.endswith("]"):
+                      items = [x for x in rest[1:-1].split(",") if x.strip()]
+                  elif rest:
+                      return None
+                  else:
+                      items = []
+                      for l in lines[i + 1:]:
+                          s = l.strip()
+                          if not s or s.startswith("#"):
+                              continue
+                          if not s.startswith("-"):
+                              if l[0].isspace():
+                                  return None
+                              break
+                          items.append(s[1:])
+                  out = [scalar(x) for x in items]
+                  return None if any(x is None for x in out) else out
+              # No `packages:` key: a settings-only file (onlyBuiltDependencies
+              # and the like) for a single-project workspace. No members.
+              return []
+
+          def glob_re(pat):
+              out, i = [], 0
+              while i < len(pat):
+                  if pat.startswith("**/", i):
+                      out.append("(?:[^/]+/)*"); i += 3
+                  elif pat.startswith("**", i):
+                      out.append(".*"); i += 2
+                  elif pat[i] == "*":
+                      out.append("[^/]*"); i += 1
+                  elif pat[i] == "?":
+                      out.append("[^/]"); i += 1
+                  elif pat[i] in "[]{}()!+@":
+                      return None
+                  else:
+                      out.append(re.escape(pat[i])); i += 1
+              return re.compile("".join(out) + r"\Z")
+
+          def matcher(globs):
+              pos, neg = [], []
+              for g in globs:
+                  if not isinstance(g, str):
+                      return None
+                  bucket = neg if g.startswith("!") else pos
+                  g = g[1:] if g.startswith("!") else g
+                  while g.startswith("./"):
+                      g = g[2:]
+                  g = g.rstrip("/")
+                  rx = glob_re(g)
+                  if rx is None:
+                      if bucket is neg:
+                          return None   # an exclusion we cannot read: nothing is provably a member
+                      continue          # an inclusion we cannot read claims nothing
+                  bucket.append(rx)
+              return lambda rel: any(r.match(rel) for r in pos) and not any(r.match(rel) for r in neg)
+
+          def lock_names(d):
+              # The root's lockfile, in the order the install step picks it.
+              if has(d, "pnpm-lock.yaml"):
+                  keys, inside = set(), False
+                  for line in read(d, "pnpm-lock.yaml").splitlines():
+                      if not line.strip():
+                          continue
+                      if not line[0].isspace():
+                          inside = line.rstrip() == "importers:"
+                          continue
+                      # An importer key: exactly two spaces in, `key:` then a
+                      # newline or a value (`ui: {}`); quotes are stripped.
+                      m = re.match(r"  (\S[^:]*):(?:\s|$)", line) if inside else None
+                      if m:
+                          keys.add(scalar(m.group(1)))
+                  return lambda rel: rel in keys
+              if has(d, "yarn.lock"):
+                  text = read(d, "yarn.lock")
+                  if not re.search(r"^__metadata:", text, re.M):
+                      return lambda rel: True   # yarn classic records no workspaces
+                  return lambda rel: re.search("@workspace:" + re.escape(rel) + r'(?=[",:\s])', text) is not None
+              for name in ("package-lock.json", "npm-shrinkwrap.json"):
+                  if has(d, name):
+                      try:
+                          pkgs = json.loads(read(d, name)).get("packages")
+                      except (ValueError, AttributeError):
+                          pkgs = None
+                      keys = set(pkgs) if isinstance(pkgs, dict) else set()
+                      return lambda rel: rel in keys
+              return None
+
+          def declared(d):
+              if has(d, "pnpm-lock.yaml"):
+                  if not has(d, "pnpm-workspace.yaml"):
+                      return None
+                  where = at(d, "pnpm-workspace.yaml")
+                  globs = pnpm_globs(read(d, "pnpm-workspace.yaml"))
+              else:
+                  where = at(d, "package.json") + " workspaces"
+                  try:
+                      ws = json.loads(read(d, "package.json")).get("workspaces")
+                  except (ValueError, AttributeError):
+                      notes.append(f"{at(d, 'package.json')} is not a JSON object; no member of {d} is folded into it")
+                      return None
+                  if ws is None:
+                      return None
+                  globs = ws.get("packages") if isinstance(ws, dict) else ws
+                  if not isinstance(globs, list):
+                      globs = None
+              m = matcher(globs) if globs is not None else None
+              if m is None:
+                  notes.append(f"{where} could not be read; no member of {d} is folded into it")
+              return m
+
+          roots = {}
+          for d in manifest_dirs:
+              if any(has(d, n) for n in LOCKS):
+                  m = declared(d)
+                  if m is not None:
+                      roots[d] = (m, lock_names(d))
+          nearest_first = sorted(roots, key=lambda r: (r != ".", r.count("/"), len(r)), reverse=True)
+          audit, covered = [], {}
+          for d in manifest_dirs:
+              if d not in roots and not any(has(d, n) for n in LOCKS):
+                  for r in nearest_first:
+                      if r == d or (r != "." and not d.startswith(r + "/")):
+                          continue
+                      rel = d if r == "." else d[len(r) + 1:]
+                      claims, listed = roots[r]
+                      if not claims(rel):
+                          continue
+                      if listed is None or not listed(rel):
+                          notes.append(f"{d} matches the workspace globs of {r} but that lockfile has no entry for it; audited on its own")
+                          break
+                      covered[d] = r
+                      break
+              if d not in covered:
+                  audit.append(d)
+          print(json.dumps(audit))
+          print(json.dumps(covered, sort_keys=True))
+          for n in notes:
+              print(n)
+          PY
+          npm_dirs=$(sed -n 1p "$ws_split")
+          npm_covered=$(sed -n 2p "$ws_split")
+          while IFS= read -r note; do
+            echo "::warning::workspace: $note"
+          done < <(sed -n '3,$p' "$ws_split")
+          rm -f "$ws_files" "$ws_split"
           go_dirs=$(dirs_of 'go.mod' '**/go.mod')
           python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')
-          count() { python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$1"; }
-          first() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d[0] if d else "")' "$1"; }
+          # <<< shared manifest detection
+          count() { python3 -I -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$1"; }
+          first() { python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(d[0] if d else "")' "$1"; }
           has_npm=false; [ "$(count "$npm_dirs")" -gt 0 ] && has_npm=true
           has_go=false; [ "$(count "$go_dirs")" -gt 0 ] && has_go=true
           has_python=false; [ "$(count "$python_dirs")" -gt 0 ] && has_python=true
@@ -233,10 +450,12 @@ jobs:
           {
             echo "has_npm=$has_npm"; echo "has_go=$has_go"; echo "has_python=$has_python"
             echo "has_docker=$has_docker"; echo "has_actions=$has_actions"
-            echo "npm_dirs=$npm_dirs"; echo "go_dirs=$go_dirs"; echo "python_dirs=$python_dirs"
+            echo "npm_dirs=$npm_dirs"; echo "npm_covered=$npm_covered"
+            echo "go_dirs=$go_dirs"; echo "python_dirs=$python_dirs"
             echo "go_version_file=$go_version_file"
           } >> "$GITHUB_OUTPUT"
           echo "::notice::ecosystems: npm=$npm_dirs go=$go_dirs python=$python_dirs docker=$has_docker gh-actions=$has_actions"
+          echo "::notice::npm workspace members fixed through their root (member: root): $npm_covered"
 
       - name: Setup Node
         if: steps.enroll.outputs.enrolled == 'true' && steps.detect.outputs.has_npm == 'true'
@@ -292,6 +511,9 @@ jobs:
           tmp=$(mktemp -d)
           changed=false; notes=""; roots=(); changed_roots=()
           declare -A seen=()
+          # Per-root outcome, for the workspace-coverage summary: a member
+          # folded into a root by detect is only as clean as that root.
+          declare -A root_status=()
           # Via a file, not process substitution: a failure there would be
           # invisible and leave nothing examined, reported as "no changes".
           python3 -c 'import json,os,sys; sys.stdout.buffer.write("".join(d + "\n" for d in json.loads(os.environ["DIRS"])).encode())' > "$tmp/dirs.txt" || fail "manifest directory list is unreadable"
@@ -341,6 +563,7 @@ jobs:
               fi
             elif [ -f "$r/yarn.lock" ]; then
               decline "$r: yarn lockfile (yarn 4 has no safe 'audit fix' equivalent)"
+              root_status[$r]="declined (yarn lockfile)"
               continue
             else
               (cd "$r" && npm ci) || fail "npm ci failed in $r"
@@ -355,10 +578,12 @@ jobs:
               sys.exit("no audit report in npm audit fix output")
           PY
             fi
+            root_status[$r]="no change"
             if ! git diff --quiet -- "$r"; then
               changed=true
               changed_roots+=("$r")
               notes+="bumped $r"$'\n'
+              root_status[$r]="bumped"
             fi
           done
 
@@ -373,14 +598,21 @@ jobs:
               continue
             fi
             [ "$tests" = "not_run" ] && tests=passed
+            root_tests=passed
             if [ -f "$r/pnpm-lock.yaml" ]; then
-              (cd "$r" && pnpm test) || { tests=failed; tests_failed=true; }
+              (cd "$r" && pnpm test) || { tests=failed; tests_failed=true; root_tests=failed; }
             else
-              (cd "$r" && npm test) || { tests=failed; tests_failed=true; }
+              (cd "$r" && npm test) || { tests=failed; tests_failed=true; root_tests=failed; }
             fi
+            root_status[$r]="bumped, tests $root_tests"
           done
           emit tests "$tests"
           emit tests_failed "$tests_failed"
+          # {root: outcome} as JSON. Written last: a step that stopped early
+          # leaves it unset, and the coverage summary then trusts no root.
+          status_args=()
+          for r in "${!root_status[@]}"; do status_args+=("$r" "${root_status[$r]}"); done
+          emit root_status "$(python3 -I -c 'import json,sys; a=sys.argv[1:]; sys.stdout.write(json.dumps(dict(zip(a[::2], a[1::2])), sort_keys=True))' "${status_args[@]}")"
 
       # ----------------------------------------------------------------- go
       - name: Go — install govulncheck
@@ -735,6 +967,57 @@ jobs:
           if [ "$any_changed" = "false" ]; then
             echo "::notice::No dependency changes this run; $declined manifest location(s) declined by policy (see the run summary)."
           fi
+
+      - name: npm workspace coverage (member -> root -> result)
+        # always(): a member is reported even when the npm step failed, as
+        # NOT COVERED, never silently dropped. Report-only: it never changes
+        # the job result (a failed npm step already fails the job; declines
+        # and test failures take their existing paths).
+        if: always() && steps.enroll.outputs.enrolled == 'true' && steps.detect.outcome == 'success'
+        id: npm_coverage
+        shell: bash
+        env:
+          NPM_COVERED: ${{ steps.detect.outputs.npm_covered }}
+          NPM_OUTCOME: ${{ steps.npm.outcome }}
+          NPM_ROOT_STATUS: ${{ steps.npm.outputs.root_status }}
+        run: |
+          set -euo pipefail
+          python3 -I - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, os
+          covered = json.loads(os.environ.get("NPM_COVERED") or "{}")
+          if not covered:
+              raise SystemExit(0)
+          outcome = os.environ.get("NPM_OUTCOME", "")
+          try:
+              status = json.loads(os.environ.get("NPM_ROOT_STATUS") or "null")
+          except ValueError:
+              status = None
+          if not isinstance(status, dict):
+              status = None
+          print("### npm workspace members (fixed through their root)")
+          print("")
+          print("| Member | Root | Result |")
+          print("|---|---|---|")
+          bad = 0
+          for member, root in sorted(covered.items()):
+              got = status.get(root) if status is not None else None
+              if outcome != "success":
+                  result = f"NOT COVERED: npm step {outcome or 'did not run'}"
+              elif got is None:
+                  result = "NOT EXAMINED: no result recorded for the root"
+              elif got.startswith("declined"):
+                  result = f"NOT COVERED: root {got}"
+              elif got.endswith("tests failed"):
+                  result = f"FAILED: root {got}"
+              else:
+                  result = f"clean (root: {got})"
+              if not result.startswith("clean"):
+                  bad += 1
+              print(f"| `{member}` | `{root}` | {result} |")
+          print("")
+          if bad:
+              print(f"{bad} member(s) not clean: each is only as clean as its root.")
+          PY
 
       # ------------------------------------------------------------ package
       # The hand-over to `publish`: a patch of the allow-listed files and the
