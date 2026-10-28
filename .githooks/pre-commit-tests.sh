@@ -27,6 +27,10 @@
 #     TEST_PATHS=src/**|tests/**            # optional, |-separated globs;
 #                                           # when set, the suite runs only if a
 #                                           # staged path matches one of them
+#     TEST_CLEANUP_CMD=python tests/x.py    # optional; runs after the suite
+#                                           # on EVERY outcome, including a
+#                                           # timeout kill, to repair what a
+#                                           # killed suite cannot repair itself
 #
 # CRLF line endings and a leading UTF-8 BOM are tolerated and ignored.
 #
@@ -36,6 +40,16 @@
 #
 # A TIMEOUT IS A FAILURE, NOT A PASS. A suite that did not finish did not tell
 # you it was green. Unknown is never clean.
+#
+# THE SUITE MAY NOT CHANGE THE TREE IT IS JUDGING. Tracked files are
+# fingerprinted before the suite runs and again after it (and after any
+# TEST_CLEANUP_CMD). A tracked file whose content changed during the hook fails
+# it, named, whatever the suite's verdict. On 2026-10-27 a timeout kill landed
+# inside a mutation test in truck-mcp and left a safety guard deleted from
+# src/; that commit aborted on the timeout, but nothing said the tree was now
+# wrong, and the next `git add -A` would have committed it. Changes that were
+# already in the work tree before the hook ran are not the suite's doing and
+# do not trip this.
 #
 # Invoked by .githooks/pre-commit (the chained dispatcher).
 #
@@ -72,6 +86,7 @@ fi
 test_cmd=""
 test_timeout="300"
 test_paths=""
+test_cleanup_cmd=""
 
 first_line=1
 while IFS= read -r line || [ -n "$line" ]; do
@@ -97,6 +112,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     TEST_CMD)     test_cmd="$value" ;;
     TEST_TIMEOUT) test_timeout="$(printf '%s' "$value" | tr -d '[:space:]')" ;;
     TEST_PATHS)   test_paths="$(printf '%s' "$value" | tr -d '[:space:]')" ;;
+    TEST_CLEANUP_CMD) test_cleanup_cmd="$value" ;;
     *)
       echo "pre-commit-tests: ignoring unknown key '$key' in .pre-commit-tests" >&2
       ;;
@@ -180,6 +196,25 @@ while IFS= read -r git_var; do
   unset "$git_var"
 done < <(compgen -e | grep '^GIT_' || true)
 
+# Fingerprint of every tracked file whose work-tree content differs from the
+# index: one "<path><TAB><hash of its diff>" line each. Comparing the
+# fingerprint before and after the suite isolates exactly what the SUITE
+# changed; a partial commit's pre-existing unstaged edits appear in both and
+# cancel out. Content-based, so a file rewritten with identical bytes (a
+# mutation that was correctly restored) does not count as changed.
+tree_fingerprint() {
+  local f
+  git diff --no-ext-diff --name-only -z | while IFS= read -r -d '' f; do
+    printf '%s\t%s\n' "$f" \
+      "$(git diff --no-ext-diff --binary -- "$f" | git hash-object --stdin)"
+  done
+}
+
+if ! tree_before="$(tree_fingerprint)"; then
+  echo "ERROR: pre-commit-tests could not fingerprint the work tree before the suite; refusing to run a check whose effect on the tree cannot be verified." >&2
+  exit 1
+fi
+
 timed_out=0
 set +e
 if command -v timeout >/dev/null 2>&1; then
@@ -195,6 +230,60 @@ else
   rc=$?
 fi
 set -e
+
+# Repair step, on every outcome. It matters most after a timeout: `timeout`
+# kills the suite outright, so nothing inside it gets to clean up.
+cleanup_rc=0
+if [ -n "$test_cleanup_cmd" ]; then
+  echo "pre-commit-tests: running cleanup \`$test_cleanup_cmd\`" >&2
+  set +e
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 120 bash -c "$test_cleanup_cmd"
+  else
+    bash -c "$test_cleanup_cmd"
+  fi
+  cleanup_rc=$?
+  set -e
+fi
+
+tree_changed=""
+if ! tree_after="$(tree_fingerprint)"; then
+  tree_changed="(the work tree could not be fingerprinted after the suite)"
+else
+  tree_changed="$(printf '%s\n%s\n' "$tree_before" "$tree_after" \
+    | sed '/^$/d' | sort | uniq -u | cut -f1 | sort -u)"
+fi
+
+if [ -n "$tree_changed" ]; then
+  {
+    echo
+    echo "ERROR: the test run CHANGED TRACKED FILES and did not put them back:"
+    printf '%s\n' "$tree_changed" | sed 's/^/    /'
+    echo
+    # An array and literal pathspecs, so a path with spaces or glob
+    # characters is shown as itself rather than split or expanded.
+    mapfile -t changed_paths < <(printf '%s\n' "$tree_changed" | grep -v '^(' || true)
+    if [ "${#changed_paths[@]}" -gt 0 ]; then
+      git --literal-pathspecs diff --no-ext-diff --stat -- "${changed_paths[@]}" 2>/dev/null || true
+    fi
+    echo
+    echo "  A suite may not modify the tree it is judging. The known cause is a"
+    echo "  mutation test killed mid-mutation (e.g. by the timeout below), which"
+    echo "  leaves a deliberately broken source in place. Inspect with"
+    echo "  \`git diff\` and restore before committing; \`git add -A\` now would"
+    echo "  commit the damage."
+    echo
+    echo "Bypass (emergency only): git commit --no-verify"
+  } >&2
+fi
+
+if [ "$cleanup_rc" -ne 0 ]; then
+  {
+    echo
+    echo "ERROR: cleanup command failed (exit $cleanup_rc): $test_cleanup_cmd"
+    echo "  The tree may still hold what the suite left behind."
+  } >&2
+fi
 
 if [ "$timed_out" -eq 1 ]; then
   {
@@ -221,6 +310,11 @@ if [ "$rc" -ne 0 ]; then
     echo "Bypass (emergency only): git commit --no-verify"
   } >&2
   exit "$rc"
+fi
+
+if [ -n "$tree_changed" ] || [ "$cleanup_rc" -ne 0 ]; then
+  echo "pre-commit-tests: suite passed, but the tree check above failed — commit refused." >&2
+  exit 1
 fi
 
 exit 0
