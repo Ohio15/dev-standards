@@ -5,9 +5,10 @@ left a safety guard deleted from src/. The commit aborted on the timeout, but
 nothing said the tree was now wrong, and the next `git add -A` would have
 committed it (truck-mcp PR #12; shared-brain discovery a7a155d8). The hook now
 (a) runs an optional TEST_CLEANUP_CMD after the suite on EVERY outcome,
-including a timeout kill, and (b) fails the commit, naming the files, when a
-tracked file's content changed during the hook. Edits already in the work tree
-before the hook ran do not trip (b).
+including a timeout kill, and (b) fails the commit, naming the paths, when the
+run changed a tracked file (unstaged, or edited and staged) or created a new
+untracked, non-ignored file. State already there before the hook ran
+(unstaged edits, staged changes, untracked files) does not trip (b).
 
 Drives the REAL hook under Git's own bash in throwaway repos under pytest's
 tmp_path, with the same helpers as test_pre_commit_tests_env.py.
@@ -64,9 +65,22 @@ MUTATE_A = "open('a.txt','w').write('mutated')"
 
 
 def changed_block(stderr: str) -> str:
-    """The list of paths the tree check named, and nothing else."""
+    """The tracked paths the tree check named, and nothing else."""
     assert "CHANGED TRACKED FILES" in stderr, stderr
-    return stderr.split("CHANGED TRACKED FILES", 1)[1].split("A suite may not", 1)[0]
+    block = stderr.split("CHANGED TRACKED FILES", 1)[1]
+    return block.split("CREATED NEW FILES", 1)[0].split("A suite may not", 1)[0]
+
+
+def new_files_block(stderr: str) -> str:
+    """The new untracked paths the tree check named, and nothing else."""
+    assert "CREATED NEW FILES" in stderr, stderr
+    return stderr.split("CREATED NEW FILES", 1)[1].split("Remove them", 1)[0]
+
+
+def assert_no_tree_finding(proc: subprocess.CompletedProcess[str]) -> None:
+    assert "pre-commit-tests: running" in proc.stderr, proc.stderr
+    assert "CHANGED TRACKED FILES" not in proc.stderr, proc.stderr
+    assert "CREATED NEW FILES" not in proc.stderr, proc.stderr
 
 
 # --- TEST_CLEANUP_CMD runs on every outcome ----------------------------------
@@ -200,3 +214,104 @@ def test_rewrite_with_identical_bytes_does_not_trip(tmp_path: Path) -> None:
     assert "pre-commit-tests: running" in proc.stderr, proc.stderr
     assert "CHANGED TRACKED FILES" not in proc.stderr, proc.stderr
     assert proc.returncode == 0, proc.stderr
+
+
+# --- staged changes and new untracked files ----------------------------------
+
+def test_tracked_file_edited_and_staged_by_the_suite_fails(tmp_path: Path) -> None:
+    """Editing then `git add`-ing leaves no work-tree diff; the index shows it."""
+    repo = make_repo(
+        tmp_path, py(f"import subprocess; {MUTATE_A}; subprocess.run(['git','add','a.txt'],check=True)")
+    )
+    proc = run_hook(repo, {})
+    named = changed_block(proc.stderr)
+    assert "    a.txt" in named, proc.stderr
+    assert "b.txt" not in named, proc.stderr
+    assert proc.returncode == 1, proc.stderr
+
+
+def test_pre_existing_staged_change_does_not_trip(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, py("import sys; sys.exit(0)"))
+    (repo / "b.txt").write_text("staged before the commit\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "b.txt")
+    (repo / "b.txt").write_text("and edited again\n", encoding="utf-8", newline="\n")
+    proc = run_hook(repo, {})
+    assert_no_tree_finding(proc)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_suite_unstaging_a_pre_existing_staged_change_trips(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, py("import subprocess; subprocess.run(['git','reset','-q','b.txt'],check=True)"))
+    (repo / "b.txt").write_text("staged before the commit\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "b.txt")
+    proc = run_hook(repo, {})
+    assert "    b.txt" in changed_block(proc.stderr), proc.stderr
+    assert proc.returncode == 1, proc.stderr
+
+
+def test_new_untracked_file_created_by_the_suite_fails_and_is_named(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, py("import os; os.makedirs('out',exist_ok=True); open('out/new file.txt','w').write('x')"))
+    proc = run_hook(repo, {})
+    assert "CHANGED TRACKED FILES" not in proc.stderr, proc.stderr
+    assert "    out/new file.txt\n" in new_files_block(proc.stderr), proc.stderr
+    assert "suite passed, but the tree check above failed" in proc.stderr
+    assert proc.returncode == 1, proc.stderr
+
+
+def test_new_untracked_file_from_a_failing_suite_keeps_the_exit_code(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, py("import sys; open('junk.txt','w').write('x'); sys.exit(5)"))
+    proc = run_hook(repo, {})
+    assert "    junk.txt" in new_files_block(proc.stderr), proc.stderr
+    assert proc.returncode == 5, proc.stderr
+
+
+def test_ignored_file_created_by_the_suite_does_not_trip(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, py("import os; os.makedirs('cache',exist_ok=True); open('cache/x.bin','w').write('x')"))
+    (repo / ".gitignore").write_text("cache/\n", encoding="utf-8", newline="\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore cache")
+    proc = run_hook(repo, {})
+    assert_no_tree_finding(proc)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_pre_existing_untracked_file_rewritten_or_removed_does_not_trip(tmp_path: Path) -> None:
+    """A stale .pyc being recompiled, or leftovers from a killed run being removed."""
+    repo = make_repo(
+        tmp_path, py("import os; open('stale.pyc','w').write('recompiled'); os.remove('leftover.tmp')")
+    )
+    (repo / "stale.pyc").write_text("old", encoding="utf-8")
+    (repo / "leftover.tmp").write_text("old", encoding="utf-8")
+    proc = run_hook(repo, {})
+    assert_no_tree_finding(proc)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_untracked_file_cleaned_up_by_cleanup_cmd_does_not_trip(tmp_path: Path) -> None:
+    repo = make_repo(
+        tmp_path,
+        py("import time; open('mutant.bak','w').write('x'); time.sleep(8)"),
+        py("import os; os.remove('mutant.bak')"),
+        timeout=2,
+    )
+    proc = run_hook(repo, {})
+    assert "exceeded 2s and was killed" in proc.stderr, proc.stderr
+    assert "CREATED NEW FILES" not in proc.stderr, proc.stderr
+    assert proc.returncode == 1, proc.stderr
+
+
+def test_fingerprint_matches_glob_like_paths_literally(tmp_path: Path) -> None:
+    """A pre-existing edit to `my [ab] file.txt` is not blamed when the suite
+    edits `my a file.txt` (a glob pathspec would hash both into one entry)."""
+    odd, decoy = "my [ab] file.txt", "my a file.txt"
+    repo = make_repo(tmp_path, py(f"open('{decoy}','w').write('mutated')"))
+    (repo / odd).write_text("original\n", encoding="utf-8", newline="\n")
+    (repo / decoy).write_text("original\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "odd names")
+    (repo / odd).write_text("edited before the commit\n", encoding="utf-8", newline="\n")
+    proc = run_hook(repo, {})
+    named = changed_block(proc.stderr)
+    assert f"    {decoy}\n" in named, proc.stderr
+    assert odd not in named, proc.stderr
+    assert proc.returncode == 1, proc.stderr
