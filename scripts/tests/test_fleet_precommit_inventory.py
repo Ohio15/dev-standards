@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -133,3 +134,39 @@ def test_cli_markdown_and_json(fleet):
     assert cfg["test_cmd"] == "pytest -q\r"  # as the hook would read it
     assert cfg["test_timeout"] == "60" and cfg["valid"]
     assert cfg["warnings"] == ["CRLF line endings"]
+
+
+# --- key set derived from the hook, never restated ---------------------------
+# parse_config claims to mirror the hook's parser. The accepted key set is the
+# part that drifted (TEST_CLEANUP_CMD, PR #63): derive it from the hook's own
+# `case "$key" in` arms and require the inventory to accept exactly that set.
+
+def hook_config_keys() -> set[str]:
+    src = CANONICAL.read_text(encoding="utf-8")
+    start = src.index('case "$key" in')
+    block = src[start:src.index("esac", start)]
+    keys = set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)\)", block, re.MULTILINE))
+    # Not vacuous: the parse found the real arms and the catch-all is still there.
+    assert {"TEST_CMD", "TEST_TIMEOUT", "TEST_PATHS"} <= keys, block
+    assert re.search(r"^\s*\*\)", block, re.MULTILINE), block
+    return keys
+
+
+def test_inventory_key_set_equals_the_hooks_case_arms():
+    assert set(inv.HOOK_CONFIG_KEYS) == hook_config_keys()
+
+
+def test_inventory_parser_accepts_every_hook_key_and_rejects_others(tmp_path):
+    keys = sorted(hook_config_keys())
+    f = tmp_path / ".pre-commit-tests"
+    f.write_bytes("".join(f"{k}=1\n" for k in keys).encode() + b"TEST_BOGUS=1\n")
+    cfg = inv.parse_config(f)
+    assert cfg["unknown_keys"] == ["TEST_BOGUS"]
+
+
+def test_cleanup_cmd_is_parsed_verbatim(tmp_path):
+    f = tmp_path / ".pre-commit-tests"
+    f.write_bytes(b"TEST_CMD=pytest -q\nTEST_CLEANUP_CMD=python  tests/m.py --restore\n")
+    cfg = inv.parse_config(f)
+    assert cfg["test_cleanup_cmd"] == "python  tests/m.py --restore"
+    assert cfg["unknown_keys"] == [] and cfg["valid"]
