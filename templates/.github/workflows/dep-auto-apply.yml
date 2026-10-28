@@ -511,6 +511,9 @@ jobs:
           tmp=$(mktemp -d)
           changed=false; notes=""; roots=(); changed_roots=()
           declare -A seen=()
+          # Per-root outcome, for the workspace-coverage summary: a member
+          # folded into a root by detect is only as clean as that root.
+          declare -A root_status=()
           # Via a file, not process substitution: a failure there would be
           # invisible and leave nothing examined, reported as "no changes".
           python3 -c 'import json,os,sys; sys.stdout.buffer.write("".join(d + "\n" for d in json.loads(os.environ["DIRS"])).encode())' > "$tmp/dirs.txt" || fail "manifest directory list is unreadable"
@@ -560,6 +563,7 @@ jobs:
               fi
             elif [ -f "$r/yarn.lock" ]; then
               decline "$r: yarn lockfile (yarn 4 has no safe 'audit fix' equivalent)"
+              root_status[$r]="declined (yarn lockfile)"
               continue
             else
               (cd "$r" && npm ci) || fail "npm ci failed in $r"
@@ -574,10 +578,12 @@ jobs:
               sys.exit("no audit report in npm audit fix output")
           PY
             fi
+            root_status[$r]="no change"
             if ! git diff --quiet -- "$r"; then
               changed=true
               changed_roots+=("$r")
               notes+="bumped $r"$'\n'
+              root_status[$r]="bumped"
             fi
           done
 
@@ -592,14 +598,21 @@ jobs:
               continue
             fi
             [ "$tests" = "not_run" ] && tests=passed
+            root_tests=passed
             if [ -f "$r/pnpm-lock.yaml" ]; then
-              (cd "$r" && pnpm test) || { tests=failed; tests_failed=true; }
+              (cd "$r" && pnpm test) || { tests=failed; tests_failed=true; root_tests=failed; }
             else
-              (cd "$r" && npm test) || { tests=failed; tests_failed=true; }
+              (cd "$r" && npm test) || { tests=failed; tests_failed=true; root_tests=failed; }
             fi
+            root_status[$r]="bumped, tests $root_tests"
           done
           emit tests "$tests"
           emit tests_failed "$tests_failed"
+          # {root: outcome} as JSON. Written last: a step that stopped early
+          # leaves it unset, and the coverage summary then trusts no root.
+          status_args=()
+          for r in "${!root_status[@]}"; do status_args+=("$r" "${root_status[$r]}"); done
+          emit root_status "$(python3 -I -c 'import json,sys; a=sys.argv[1:]; sys.stdout.write(json.dumps(dict(zip(a[::2], a[1::2])), sort_keys=True))' "${status_args[@]}")"
 
       # ----------------------------------------------------------------- go
       - name: Go — install govulncheck
@@ -954,6 +967,57 @@ jobs:
           if [ "$any_changed" = "false" ]; then
             echo "::notice::No dependency changes this run; $declined manifest location(s) declined by policy (see the run summary)."
           fi
+
+      - name: npm workspace coverage (member -> root -> result)
+        # always(): a member is reported even when the npm step failed, as
+        # NOT COVERED, never silently dropped. Report-only: it never changes
+        # the job result (a failed npm step already fails the job; declines
+        # and test failures take their existing paths).
+        if: always() && steps.enroll.outputs.enrolled == 'true' && steps.detect.outcome == 'success'
+        id: npm_coverage
+        shell: bash
+        env:
+          NPM_COVERED: ${{ steps.detect.outputs.npm_covered }}
+          NPM_OUTCOME: ${{ steps.npm.outcome }}
+          NPM_ROOT_STATUS: ${{ steps.npm.outputs.root_status }}
+        run: |
+          set -euo pipefail
+          python3 -I - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, os
+          covered = json.loads(os.environ.get("NPM_COVERED") or "{}")
+          if not covered:
+              raise SystemExit(0)
+          outcome = os.environ.get("NPM_OUTCOME", "")
+          try:
+              status = json.loads(os.environ.get("NPM_ROOT_STATUS") or "null")
+          except ValueError:
+              status = None
+          if not isinstance(status, dict):
+              status = None
+          print("### npm workspace members (fixed through their root)")
+          print("")
+          print("| Member | Root | Result |")
+          print("|---|---|---|")
+          bad = 0
+          for member, root in sorted(covered.items()):
+              got = status.get(root) if status is not None else None
+              if outcome != "success":
+                  result = f"NOT COVERED: npm step {outcome or 'did not run'}"
+              elif got is None:
+                  result = "NOT EXAMINED: no result recorded for the root"
+              elif got.startswith("declined"):
+                  result = f"NOT COVERED: root {got}"
+              elif got.endswith("tests failed"):
+                  result = f"FAILED: root {got}"
+              else:
+                  result = f"clean (root: {got})"
+              if not result.startswith("clean"):
+                  bad += 1
+              print(f"| `{member}` | `{root}` | {result} |")
+          print("")
+          if bad:
+              print(f"{bad} member(s) not clean: each is only as clean as its root.")
+          PY
 
       # ------------------------------------------------------------ package
       # The hand-over to `publish`: a patch of the allow-listed files and the
