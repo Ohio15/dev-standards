@@ -127,13 +127,175 @@ def test_cli_markdown_and_json(fleet):
     data = json.loads(subprocess.run(base + ["--json"], capture_output=True, text=True, check=True).stdout)
     assert [r["path"] for r in data["repos"]] == ["gated", "inert", "nohook", "ns/inner"]
 
-def test_crlf_config_is_flagged_and_keeps_the_carriage_return(tmp_path):
+
+# --- CRLF / BOM: parsed as the hook parses them --------------------------------
+# Since 75ce527 (#56, shared-brain a0649d94) the hook drops one trailing CR per
+# line and a UTF-8 BOM from the first line, so a Windows-saved config gates
+# exactly like an LF one. The inventory used to keep the CR and warn about it
+# (shared-brain 73bd6fdd); it must report what the hook will actually run.
+
+LF_CONFIG = b"# c\nTEST_CMD=pytest -q\nTEST_TIMEOUT=60\nTEST_PATHS=src/**\n"
+BOM = b"\xef\xbb\xbf"
+
+
+@pytest.mark.parametrize("variant", ["crlf", "bom-lf", "bom-crlf"])
+def test_windows_saved_config_parses_like_lf(tmp_path, variant):
+    body = LF_CONFIG.replace(b"\n", b"\r\n") if variant.endswith("crlf") else LF_CONFIG
+    if variant.startswith("bom"):
+        body = BOM + body
+    lf, other = tmp_path / "lf", tmp_path / variant
+    lf.write_bytes(LF_CONFIG)
+    other.write_bytes(body)
+    expected = inv.parse_config(lf)
+    assert expected["test_cmd"] == "pytest -q" and expected["valid"]
+    assert inv.parse_config(other) == expected
+    assert "warnings" not in expected  # the hook emits no CRLF warning, so neither do we
+
+
+def test_bom_is_only_dropped_at_the_start_of_the_file(tmp_path):
     f = tmp_path / ".pre-commit-tests"
-    f.write_bytes(b"TEST_CMD=pytest -q\r\nTEST_TIMEOUT=60\r\n")
+    f.write_bytes(b"TEST_CMD=a\n" + BOM + b"TEST_TIMEOUT=5\n")
     cfg = inv.parse_config(f)
-    assert cfg["test_cmd"] == "pytest -q\r"  # as the hook would read it
-    assert cfg["test_timeout"] == "60" and cfg["valid"]
-    assert cfg["warnings"] == ["CRLF line endings"]
+    assert cfg["unknown_keys"] == ["﻿TEST_TIMEOUT"] and cfg["test_timeout"] == "300"
+
+
+def test_only_one_trailing_carriage_return_is_dropped(tmp_path):
+    f = tmp_path / ".pre-commit-tests"
+    f.write_bytes(b"TEST_CMD=a\r\r\nTEST_CLEANUP_CMD=b\rc\n")
+    cfg = inv.parse_config(f)
+    assert (cfg["test_cmd"], cfg["test_cleanup_cmd"]) == ("a\r", "b\rc")
+
+
+# --- parser parity with the REAL hook ----------------------------------------
+# parse_config claims to mirror the hook's parser. Rather than restate the
+# hook's rules here, run the hook's own parsing code (sliced verbatim from
+# hooks/pre-commit-tests.sh, from the defaults through the TEST_TIMEOUT check)
+# under Git's bash over the same configs, and require identical results. Any
+# future change to either parser that the other does not share fails here.
+
+PARITY_CONFIGS = {
+    "lf-all-keys": b"# c\nTEST_CMD=python -m pytest -q\nTEST_TIMEOUT = 60\n"
+                   b"TEST_PATHS= src/** | tests/** \nTEST_CLEANUP_CMD=python  t.py --restore\n",
+    "crlf-all-keys": b"# c\r\nTEST_CMD=python -m pytest -q\r\nTEST_TIMEOUT = 60\r\n"
+                     b"TEST_PATHS= src/** | tests/** \r\nTEST_CLEANUP_CMD=python  t.py --restore\r\n",
+    "bom-lf": BOM + b"TEST_CMD=pytest -q\nTEST_TIMEOUT=60\n",
+    "bom-crlf": BOM + b"TEST_CMD=pytest -q\r\nTEST_TIMEOUT=60\r\n",
+    "bom-then-blank-and-comment": BOM + b"\r\n# x\r\nTEST_CMD=a\r\n",
+    "bom-only": BOM,
+    "bom-mid-file": b"TEST_CMD=a\n" + BOM + b"TEST_TIMEOUT=5\n",
+    "crlf-no-final-newline": b"TEST_CMD=a b\r",
+    "double-cr": b"TEST_CMD=a\r\r\n",
+    "mid-line-cr": b"TEST_CMD=a\rb\n",
+    "cr-only-lines": b"\r\n\r\nTEST_CMD=x\r\n",
+    "crlf-trailing-spaces": b"TEST_CMD=pytest -q  \r\nTEST_TIMEOUT= 60 \r\n",
+    "comments-noequals-last-wins": b"  # note\nTEST_CMD=a\nTEST_CMD=echo  x=y\nNOEQUALS\nTEST_TIMEOUT=abc\n",
+    "non-ascii-whitespace-in-key": "TEST_CMD =x\nTEST\x1cTIMEOUT=5\n\x0bTEST_PATHS\t= a | b\n".encode(),
+    "non-ascii-digit-timeout": "TEST_CMD=x\nTEST_TIMEOUT=²\n".encode(),
+    "no-test-cmd": b"TEST_TIMEOUT=10\r\nBOGUS=1\r\n",
+    "empty": b"",
+}
+
+
+def hook_parse_block() -> str:
+    """The hook's parser, verbatim: defaults, read loop, and the validity checks."""
+    lines = CANONICAL.read_text(encoding="utf-8").split("\n")
+    start = lines.index('test_cmd=""')
+    loop_end = lines.index('done < "$config"', start)
+    timeout_case = lines.index('case "$test_timeout" in', loop_end)
+    end = lines.index("esac", timeout_case)
+    block = "\n".join(lines[start:end + 1])
+    # Not vacuous: the slice holds the read loop, the CR/BOM normalisation and
+    # both validity exits.
+    for needle in ("while IFS= read -r line", "$'\\r'", "$'\\xef\\xbb\\xbf'",
+                   'if [ -z "$test_cmd" ]', "exit 1"):
+        assert needle in block, needle
+    return block
+
+
+def run_hook_parser(config: Path, block: str | None = None) -> dict:
+    from test_pre_commit_tests_env import BASH, clean_env
+
+    if block is None:
+        block = hook_parse_block()
+    # The EXIT trap reports the parsed variables NUL-separated whether the
+    # block falls through (valid) or hits one of its `exit 1`s (invalid).
+    script = (
+        "set -euo pipefail\n"
+        'config="$1"\n'
+        "trap 'printf \"%s\\0\" \"$test_cmd\" \"$test_timeout\" \"$test_paths\" "
+        "\"$test_cleanup_cmd\"' EXIT\n"
+        + block + "\n"
+    )
+    proc = subprocess.run([BASH, "-c", script, "hook-parse", config.as_posix()],
+                          env=clean_env(), capture_output=True, timeout=60, check=False)
+    assert proc.returncode in (0, 1), proc.stderr
+    fields = proc.stdout.decode("utf-8", errors="replace").split("\0")
+    assert len(fields) == 5 and fields[4] == "", proc.stdout
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    return {
+        "test_cmd": fields[0],
+        "test_timeout": fields[1],
+        "test_paths": fields[2],
+        "test_cleanup_cmd": fields[3],
+        "unknown_keys": re.findall(
+            r"^pre-commit-tests: ignoring unknown key '(.*)' in \.pre-commit-tests$",
+            stderr, re.MULTILINE),
+        "valid": proc.returncode == 0,
+    }
+
+
+@pytest.mark.parametrize("name", sorted(PARITY_CONFIGS))
+def test_parse_config_matches_the_hooks_own_parser(tmp_path, name):
+    config = tmp_path / ".pre-commit-tests"
+    config.write_bytes(PARITY_CONFIGS[name])
+    hook = run_hook_parser(config)
+    ours = inv.parse_config(config)
+    assert {k: ours[k] for k in hook} == hook
+
+
+@pytest.mark.parametrize("name", ["lf-all-keys", "crlf-all-keys", "bom-crlf", "double-cr"])
+def test_parse_config_matches_the_full_hook_end_to_end(tmp_path, name):
+    """The whole hook, in a throwaway repo, as git would run it: the command and
+    timeout it announces (and the cleanup command it runs) are exactly what
+    parse_config reports. Guards the slice above against no longer being the
+    code the hook actually executes."""
+    from test_pre_commit_tests_env import BASH, clean_env
+
+    body = PARITY_CONFIGS[name]
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=clean_env(), check=True)
+    # TEST_CMD/TEST_CLEANUP_CMD run for real: neutralise them to `true` while
+    # keeping the bytes around each value (CRs, spacing) under test.
+    body = re.sub(rb"(TEST_(?:CLEANUP_)?CMD=)[^\r\n]*?(\r*)(?=\n|$)", rb"\1true \2", body)
+    body = re.sub(rb"TEST_PATHS=[^\r\n]*", b"TEST_PATHS=*", body)
+    (repo / ".pre-commit-tests").write_bytes(body)
+    (repo / "a.txt").write_text("x")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, env=clean_env(), check=True)
+    proc = subprocess.run([BASH, CANONICAL.as_posix()], cwd=repo, env=clean_env(),
+                          capture_output=True, timeout=120, check=False)
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    # [^\n], not '.': a CR the hook kept must be captured, not end the match.
+    ran = re.search(r"^pre-commit-tests: running `([^\n]*)` \(timeout ([0-9]+)s\)$",
+                    stderr, re.MULTILINE)
+    assert ran, stderr
+    cfg = inv.parse_config(repo / ".pre-commit-tests")
+    assert (ran.group(1), ran.group(2)) == (cfg["test_cmd"], cfg["test_timeout"])
+    cleanup = re.search(r"^pre-commit-tests: running cleanup `([^\n]*)`$",
+                        stderr, re.MULTILINE)
+    assert (cleanup.group(1) if cleanup else "") == cfg["test_cleanup_cmd"]
+
+
+def test_parity_harness_detects_a_divergent_parser(tmp_path):
+    """Not vacuous: with the hook's CR strip removed (the pre-#56 hook), the
+    harness reports a different TEST_CMD than parse_config for a CRLF config."""
+    strip = "  line=\"${line%$'\\r'}\""
+    block = hook_parse_block()
+    assert block.count(strip + "\n") == 1, "CR-strip line moved; update this test"
+    config = tmp_path / ".pre-commit-tests"
+    config.write_bytes(PARITY_CONFIGS["crlf-all-keys"])
+    mutated = run_hook_parser(config, block=block.replace(strip + "\n", ""))
+    assert mutated["test_cmd"] == "python -m pytest -q\r"
+    assert mutated["test_cmd"] != inv.parse_config(config)["test_cmd"]
 
 
 # --- key set derived from the hook, never restated ---------------------------
