@@ -49,7 +49,9 @@
 # src/; that commit aborted on the timeout, but nothing said the tree was now
 # wrong, and the next `git add -A` would have committed it. Changes that were
 # already in the work tree before the hook ran are not the suite's doing and
-# do not trip this.
+# do not trip this. What is compared is each tracked file's work-tree
+# difference from the index, so untracked files, and a change the suite
+# also stages into the index, are not covered.
 #
 # Invoked by .githooks/pre-commit (the chained dispatcher).
 #

@@ -40,6 +40,11 @@ DISPATCHER_REL = Path(".githooks") / "pre-commit"
 CONFIG_NAME = ".pre-commit-tests"
 DEFAULT_TIMEOUT = "300"
 CANONICAL_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "pre-commit-tests.sh"
+# The keys the hook's `case "$key" in` arms accept; anything else it ignores as
+# unknown. parse_config rejects every key not listed here, and
+# scripts/tests/test_fleet_precommit_inventory.py derives the hook's set from
+# its source and requires equality, so a new hook key cannot drift silently.
+HOOK_CONFIG_KEYS = frozenset({"TEST_CMD", "TEST_TIMEOUT", "TEST_PATHS", "TEST_CLEANUP_CMD"})
 
 
 def _read_text(path: Path) -> str:
@@ -51,6 +56,7 @@ def parse_config(path: Path) -> dict:
     test_cmd = ""
     timeout = DEFAULT_TIMEOUT
     paths = ""
+    cleanup_cmd = ""
     unknown: list[str] = []
     # bash `read -r` splits on \n only; a trailing \r stays on the line.
     raw = _read_text(path)
@@ -64,14 +70,18 @@ def parse_config(path: Path) -> dict:
         if not sep:
             value = line  # ${line#*=} with no '=' leaves the whole line
         key = re.sub(r"\s+", "", key)
-        if key == "TEST_CMD":
+        if key not in HOOK_CONFIG_KEYS:
+            unknown.append(key)
+        elif key == "TEST_CMD":
             test_cmd = value
         elif key == "TEST_TIMEOUT":
             timeout = re.sub(r"\s+", "", value)
         elif key == "TEST_PATHS":
             paths = re.sub(r"\s+", "", value)
-        else:
-            unknown.append(key)
+        elif key == "TEST_CLEANUP_CMD":
+            cleanup_cmd = value
+        else:  # a HOOK_CONFIG_KEYS entry with no branch is a bug here, not in the config
+            raise AssertionError(f"parse_config has no branch for hook key {key}")
     problems = []
     if not test_cmd:
         problems.append("no TEST_CMD")
@@ -81,6 +91,7 @@ def parse_config(path: Path) -> dict:
         "test_cmd": test_cmd,
         "test_timeout": timeout,
         "test_paths": paths,
+        "test_cleanup_cmd": cleanup_cmd,
         "unknown_keys": unknown,
         "valid": not problems,
         "problems": problems,
