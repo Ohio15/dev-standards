@@ -40,12 +40,14 @@ This replaces the earlier `core.hooksPath = D:/Projects/git-hooks` global model,
 ## Install into a new repo
 
 ```bash
-./install.sh /path/to/target-repo
+./install.sh [--private|--public] [--no-gh] /path/to/target-repo
 cd /path/to/target-repo
-git add .githooks .github/workflows/size-guard.yml .large-files-allowlist .gitleaks.toml SECURITY-CHECKS.md
+git add .githooks .github/workflows .large-files-allowlist .gitleaks.toml SECURITY-CHECKS.md
 git commit -m "ci: install dev-standards guards"
 git push
 ```
+
+The runner the PR workflows ask for follows the target's visibility (register SC-37, `STANDARDS.md` section 4): a private repo's `size-guard.yml` and `security-audit.yml` carry the canonical allow-list predicate (same-repo PRs and trusted events on `vars.CI_RUNNER`, everything else hosted); a public repo's carry `runs-on: ubuntu-latest`, because the `nexus-ci` registrar refuses public repositories. The installer asks GitHub (`gh api repos/<owner>/<repo>`) unless `--private`/`--public` says so, refuses a flag GitHub contradicts, and installs nothing when it cannot tell. For a private repo under the registrar's owner it also sets the repo variable `CI_RUNNER=nexus-ci` when unset and reports whether the repo is mapped in Ohio15/infra `ci-vm/registrar/config.json`; the mapping, its apply on NEXUS and the GitHub App installation stay explicit steps the installer prints. `--no-gh` makes no GitHub call (a visibility flag is then required) and prints the onboarding commands instead.
 
 CI workflows are the real enforcement; the local hooks are courtesies that catch mistakes before they leave the developer's machine.
 
