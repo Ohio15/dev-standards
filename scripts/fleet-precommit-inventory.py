@@ -19,9 +19,12 @@ treated as a namespace and its direct children are checked. `.archive`,
 `.staging-licenses` and `data` at the root are skipped.
 
 `.pre-commit-tests` is parsed exactly as hooks/pre-commit-tests.sh parses it
-(KEY=value, '#'/blank lines skipped, key whitespace stripped, value verbatim,
-TEST_TIMEOUT whitespace stripped, default 300, last assignment wins). If the
-hook's parser changes, change `parse_config` with it.
+(a leading UTF-8 BOM and one trailing CR per line dropped, KEY=value, '#'/blank
+lines skipped, ASCII whitespace stripped from the key, value verbatim,
+TEST_TIMEOUT and TEST_PATHS whitespace stripped, default 300, last assignment
+wins). If the hook's parser changes, change `parse_config` with it: the parity
+test in scripts/tests/test_fleet_precommit_inventory.py runs the hook's own
+parsing loop over the same configs and fails on any difference.
 
 Run:  python -I scripts/fleet-precommit-inventory.py [--root D:/Projects] [--json]
 """
@@ -45,6 +48,12 @@ CANONICAL_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "pre-commit-
 # scripts/tests/test_fleet_precommit_inventory.py derives the hook's set from
 # its source and requires equality, so a new hook key cannot drift silently.
 HOOK_CONFIG_KEYS = frozenset({"TEST_CMD", "TEST_TIMEOUT", "TEST_PATHS", "TEST_CLEANUP_CMD"})
+# The hook strips whitespace with `tr -d '[:space:]'`, which works on bytes and
+# removes ASCII whitespace only. Python's `\s` also matches NBSP, U+0085 and
+# \x1c-\x1f, so using it would accept keys the hook ignores as unknown.
+_HOOK_SPACE = re.compile(r"[ \t\n\v\f\r]+")
+_ASCII_DIGITS = re.compile(r"[0-9]+")
+_BOM = "﻿"
 
 
 def _read_text(path: Path) -> str:
@@ -58,26 +67,33 @@ def parse_config(path: Path) -> dict:
     paths = ""
     cleanup_cmd = ""
     unknown: list[str] = []
-    # bash `read -r` splits on \n only; a trailing \r stays on the line.
     raw = _read_text(path)
+    # The hook drops a UTF-8 BOM from its FIRST line only, i.e. from the start
+    # of the file; a BOM anywhere else stays part of that line's key.
+    if raw.startswith(_BOM):
+        raw = raw[len(_BOM):]
+    # bash `read -r` splits on \n only; the hook then drops ONE trailing \r per
+    # line (`${line%$'\r'}`), so a CRLF config parses exactly like an LF one.
     lines = raw.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     for line in lines:
+        if line.endswith("\r"):
+            line = line[:-1]
         if line == "" or line.startswith("#"):
             continue
         key, sep, value = line.partition("=")
         if not sep:
             value = line  # ${line#*=} with no '=' leaves the whole line
-        key = re.sub(r"\s+", "", key)
+        key = _HOOK_SPACE.sub("", key)
         if key not in HOOK_CONFIG_KEYS:
             unknown.append(key)
         elif key == "TEST_CMD":
             test_cmd = value
         elif key == "TEST_TIMEOUT":
-            timeout = re.sub(r"\s+", "", value)
+            timeout = _HOOK_SPACE.sub("", value)
         elif key == "TEST_PATHS":
-            paths = re.sub(r"\s+", "", value)
+            paths = _HOOK_SPACE.sub("", value)
         elif key == "TEST_CLEANUP_CMD":
             cleanup_cmd = value
         else:  # a HOOK_CONFIG_KEYS entry with no branch is a bug here, not in the config
@@ -85,7 +101,9 @@ def parse_config(path: Path) -> dict:
     problems = []
     if not test_cmd:
         problems.append("no TEST_CMD")
-    if not timeout.isdigit():
+    # The hook's `case ... ''|*[!0-9]*)` test; str.isdigit() would also pass
+    # non-ASCII digits such as '²' that the hook rejects.
+    if not _ASCII_DIGITS.fullmatch(timeout):
         problems.append(f"bad TEST_TIMEOUT {timeout!r}")
     return {
         "test_cmd": test_cmd,
@@ -95,9 +113,6 @@ def parse_config(path: Path) -> dict:
         "unknown_keys": unknown,
         "valid": not problems,
         "problems": problems,
-        # Not a validity failure here, but the hook keeps the \r in TEST_CMD, so
-        # `bash -c` receives a command ending in a carriage return.
-        "warnings": ["CRLF line endings"] if "\r" in raw else [],
     }
 
 
@@ -181,7 +196,6 @@ def inspect(repo: Path, root: Path, canonical: bytes | None) -> dict:
         "test_cmd": cfg["test_cmd"] if cfg else None,
         "test_timeout": cfg["test_timeout"] if cfg else None,
         "config_problems": cfg["problems"] if cfg else [],
-        "config_warnings": cfg["warnings"] if cfg else [],
         "detected_test_cmd": detect_test_command(repo),
     }
 
@@ -205,7 +219,7 @@ def render_markdown(rows: list[dict]) -> str:
     lines = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
     for r in rows:
         cfg = _cell(r["has_config"])
-        notes = r["config_problems"] + r["config_warnings"]
+        notes = r["config_problems"]
         if notes:
             cfg += " (" + "; ".join(notes) + ")"
         lines.append("| " + " | ".join([
