@@ -123,6 +123,7 @@ install_pr_workflow() {
   content="${content%x}"
   content="${content//"$CANON_RUNS_ON"/"$HOSTED_RUNS_ON"}"
   case "$content" in
+    # shellcheck disable=SC2016  # literal: matching the text `${{`, not expanding it
     *'runs-on: ${{'*)
       echo "ERROR: $src has a runs-on expression that is not the canonical predicate; refusing to install it into a public repository" >&2
       exit 1
