@@ -173,6 +173,15 @@ dev-standards exposes gates in two layers:
 - Production promotion keeps a required reviewer on its environment (separation of duties, NIST SSDF PO.3). With a single maintainer the reviewer is that maintainer plus the immutable deployment log; the control is batched, never dropped.
 - Release signing material is scoped to the signing job alone: an environment secret on a job that runs no build or dependency code, on an ephemeral runner (SLSA Build L3 isolation, NIST SSDF PS.1). A build job never holds a signing key.
 
+**Warn-mode ships (ratified 2026-10-29 by Ron after audit-infra-2026-10-29; register SC-47):** a warn, observe or report mode is a migration step, never a destination. The 2026-10-29 audit found one live twelve days after it shipped, because nothing forced the flip: the receiver's strict side was opt-in and its sender was never wired. A change that ships a warn mode therefore carries, in the same pull request:
+
+- **The strict default in code.** An absent or empty mode variable selects enforce. The environment may only escalate; a value the code does not know refuses to start.
+- **The counterpart wired.** Whatever makes enforce safe to turn on (the sender that carries the credential, the client that sends the header, the data that satisfies the new check) lands in the same PR or is already deployed. A warn mode whose counterpart does not exist yet is not shippable.
+- **A dated flip commitment.** A work-queue item tagged `flip-<VARIABLE>` with a `due_at`, naming the evidence that ends the migration (for example "zero unauthenticated accepts across one repeat_interval"). Past its `due_at`, the warn state is a failing health check (an alert, not a log line), so the flip cannot be forgotten quietly.
+- **Removal at the flip.** Once enforce is live, the lenient mode is removed unless a documented need keeps it. A mode the environment can still select is a mode that can come back.
+
+TO-BE: the per-session security gate reports a change that introduces a permissive `*_MODE` default without an open `flip-<var>` commitment (cortex-hooks `security-gate`, warn tier first). Until it ships, SC-47's grep is the gate's check.
+
 **Release-time gates (`release-gates.yml`, called by every surface workflow):**
 
 | Gate | Catches | Correctly passes | **Blind spot** |
