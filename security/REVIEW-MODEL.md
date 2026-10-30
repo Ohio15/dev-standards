@@ -31,8 +31,9 @@ what makes the gate sharper over time instead of the rounds getting deeper.
    the fixes to the first. The session records the residual in its handoff
    brief and the change waits for the audit. The only ways past the cap: an
    operator token at `~/.cortex/security-gate/override/<key>` (the protected
-   floor, written from the operator's own terminal), or an audit that clears
-   the counter.
+   floor, written from the operator's own terminal), or an audit whose
+   audited commit has the branch's reviewed commits in its history (audit
+   step 5 below).
 5. **Load-bearing gate.** Code touching auth, credentials, or mutation
    surfaces may MERGE behind a flag on a gate pass. The FLAG FLIP waits for an
    audit pass. Merged-and-inert is acceptable; deployed-and-load-bearing on a
@@ -55,7 +56,17 @@ what makes the gate sharper over time instead of the rounds getting deeper.
    additions". Proposals need operator approval; the audit never edits the
    register.
 5. `security-audit.js record` consumes the run's trailer, stores the audited
-   commit, and clears that repo's gate counters.
+   commit, and clears a branch's gate counter ONLY when every pass that still
+   counts reviewed a commit in the audited commit's history
+   (`git merge-base --is-ancestor`; cortex-hooks v0.88.20). The reviewers read
+   the repo at the audited commit, so a branch whose reviewed commits are not
+   in that history was never read by them and keeps counting; `record` lists
+   it under `gate_records_not_covered`. A pass with no head commit, or a probe
+   that cannot answer, also leaves the record uncleared (fail closed;
+   `gate_records_not_examined`). Consequence: a capped branch is uncapped only
+   after its reviewed work lands on the audited branch. A capped branch that
+   is SQUASH-merged keeps its record, because its commits never enter main's
+   history; reusing that branch name needs the operator token.
 
 ## "Routine" decays into "never" — the dead-man
 
