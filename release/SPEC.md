@@ -275,19 +275,22 @@ Reusable release workflows pick their runner as
 `${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}`; they are called
 from tag pushes only (see the caller shape above). Synced guard workflows
 (`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it as
-`${{ (github.event_name == 'schedule' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.CI_RUNNER || 'ubuntu-latest' }}`:
-a variable runner only for a schedule, or a push / workflow_dispatch of the
-default branch.
+`${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest' }}`:
+a variable runner for push, schedule, workflow_dispatch, release, merge_group
+and a SAME-REPO pull request (runner policy amended 2026-10-27, STANDARDS.md);
+a fork pull request and every other event get the hosted literal.
 Set the repository variable `CI_RUNNER` to a self-hosted label
 (for example `nexus-ci`, the fenced ephemeral-VM runners on NEXUS) to move
 gates, tests and image builds there without editing any workflow; unset it to
 fall back to GitHub-hosted runners. Deploy and notify jobs keep their explicit
 `[self-hosted, nexus-deploy]` label because they must reach the host.
-The rule is mechanical, not a convention: a job reachable from `pull_request`
-can never resolve its runner from a variable. `&&`/`||` return an operand, so
-on any other event or ref the expression is the literal
-`ubuntu-latest` whatever `CI_RUNNER` holds, and pull-request code never lands
-on a self-hosted runner through these workflows. The same predicate sets
+The rule is mechanical, not a convention: a job reached from a FORK pull
+request (or pull_request_target, workflow_run, or any event off the
+allow-list) can never resolve its runner from a variable. `&&`/`||` return an
+operand, so there the expression is the literal `ubuntu-latest` whatever
+`CI_RUNNER` holds. Same-repo pull-request code does run on the self-hosted
+runner; the registrar's run-trust check (ci-registrar 0.4.0+) is the
+server-side control. The same predicate sets
 `TRUSTED_EVENT`, and on an untrusted event the audit runs no PR-controlled
 code (pnpmfile, yarnPath, yarn plugins, `.corepack.env`, Python build
 backends); what it cannot audit without running such code is NOT EXAMINED
