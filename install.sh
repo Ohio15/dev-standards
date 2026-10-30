@@ -9,13 +9,18 @@
 # allowlist + gitleaks config files. Does not commit — review and commit
 # yourself.
 #
-# Runner (register SC-37, STANDARDS.md section 4): the pull_request-reachable
-# templates carry the canonical allow-list predicate, which lets a private
-# repo's jobs (same-repo PRs included) run on vars.CI_RUNNER (nexus-ci). A
-# public repo must carry the hosted literal instead, so the repo's visibility
-# decides what is written. It comes from GitHub (`gh api repos/<origin>`)
-# unless --private/--public says so; an explicit flag that GitHub contradicts
-# is refused, and an unknown visibility installs nothing.
+# Runner (register SC-37, STANDARDS.md section 4; audit 2026-10-27): the CI
+# templates carry the guarded allow-list predicate, which selects the
+# self-hosted nexus-ci runner only for an allow-listed event (same-repo PRs
+# included) in a PRIVATE repo whose vars.CI_RUNNER is exactly 'nexus-ci', and
+# the hosted literal otherwise. A copy installed into a public repo must carry
+# the hosted literal instead, so the repo's visibility decides what is
+# written. Visibility is resolved before anything is written. GitHub's own
+# answer (`gh api repos/<origin>`), when gh can give one, wins: --private or
+# --public that contradicts it is an ERROR, never an override. Without
+# GitHub's answer the flag decides; with neither, the visibility is
+# unconfirmed and counts as public (hosted literal), the safe direction.
+# Re-run this installer after a repo changes visibility.
 #
 # nexus-ci onboarding (private repos whose owner the ci-registrar serves):
 # with gh available the installer sets the repo variable CI_RUNNER=nexus-ci
@@ -23,8 +28,8 @@
 # ci-vm/registrar/config.json) to report whether the repo is mapped there.
 # The registrar mapping and its apply on NEXUS are a reviewed infra change, so
 # the installer prints those steps and never performs them. --no-gh skips
-# every GitHub call (a visibility flag is then required) and prints the
-# commands instead.
+# every GitHub call (without --private the target is then unconfirmed, so
+# public) and prints the commands instead.
 
 set -euo pipefail
 
@@ -65,9 +70,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # ci-vm/README.md ("apply-config") is the procedure that deploys it.
 REGISTRAR_REPO="Ohio15/infra"
 REGISTRAR_CONFIG="ci-vm/registrar/config.json"
-# The canonical SC-37 predicate, exactly as the templates carry it. A public
-# repo's copy gets the hosted literal in its place.
-CANON_RUNS_ON="runs-on: \${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest' }}"
+# The guarded SC-37 predicate, exactly as the pull_request-reachable templates
+# carry it, and dep-auto-apply.yml's private-only literal toggle (it runs on
+# schedule/workflow_dispatch only). A public or unconfirmed repo's copy gets
+# the hosted literal in place of either.
+CANON_RUNS_ON="runs-on: \${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
+TOGGLE_RUNS_ON="runs-on: \${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
 HOSTED_RUNS_ON="runs-on: ubuntu-latest"
 
 # owner/repo of origin when it is a github.com remote, else empty.
@@ -96,24 +104,30 @@ if [ "$use_gh" -eq 1 ] && [ -n "$slug" ] && command -v gh >/dev/null 2>&1; then
   fi
 fi
 
+# visibility_source says where the answer came from, for the report.
+visibility_source=""
 if [ "$gh_ok" -eq 1 ]; then
   if [ "$gh_private" = "true" ]; then gh_visibility="private"; else gh_visibility="public"; fi
   if [ -n "$visibility" ] && [ "$visibility" != "$gh_visibility" ]; then
-    echo "ERROR: --$visibility given, but GitHub reports $slug as $gh_visibility; nothing installed" >&2
+    echo "ERROR: --$visibility contradicts GitHub, which reports $slug as $gh_visibility; nothing installed" >&2
     exit 1
   fi
   visibility="$gh_visibility"
-elif [ -z "$visibility" ]; then
-  echo "ERROR: cannot determine whether $target is a private or a public repository" >&2
-  echo "  (needs a github.com origin and an authenticated gh, or --private / --public)." >&2
-  echo "  The runner predicate depends on it (SC-37); nothing installed." >&2
-  exit 1
+  visibility_source="github"
+elif [ -n "$visibility" ]; then
+  visibility_source="flag"
+else
+  # Unconfirmed counts as public: the hosted literal is always safe, the
+  # self-hosted toggle never is in a repo that might be public.
+  visibility="public"
+  visibility_source="unconfirmed"
 fi
 
-# Copy a pull_request-reachable template. Private: verbatim. Public: every
-# canonical runs-on becomes the hosted literal, and a runs-on expression left
-# over afterwards is refused rather than installed.
-install_pr_workflow() {
+# Copy a CI template. Private: verbatim. Public or unconfirmed: every guarded
+# runs-on becomes the hosted literal, and a runs-on that could still select a
+# runner afterwards (an expression, a variable or a self-hosted label) is
+# refused rather than installed.
+install_workflow() {
   local src="$1" dst="$2" content
   if [ "$visibility" = "private" ]; then
     cp "$src" "$dst"
@@ -122,13 +136,12 @@ install_pr_workflow() {
   content="$(cat "$src"; printf x)"
   content="${content%x}"
   content="${content//"$CANON_RUNS_ON"/"$HOSTED_RUNS_ON"}"
+  content="${content//"$TOGGLE_RUNS_ON"/"$HOSTED_RUNS_ON"}"
   # shellcheck disable=SC2016  # the pattern matches the literal text `${{`; no expansion wanted
-  case "$content" in
-    *'runs-on: ${{'*)
-      echo "ERROR: $src has a runs-on expression that is not the canonical predicate; refusing to install it into a public repository" >&2
-      exit 1
-      ;;
-  esac
+  if printf '%s' "$content" | grep -Eq '^[[:space:]]*runs-on:.*(\$\{\{|vars\.|nexus-ci|self-hosted)'; then
+    echo "ERROR: $src has a runs-on that is not the guarded predicate; refusing to install it into a repository not confirmed private" >&2
+    exit 1
+  fi
   printf '%s' "$content" >"$dst"
 }
 
@@ -163,13 +176,14 @@ git -C "$target" add --chmod=+x   ".githooks/commit-msg"   ".githooks/pre-commit
 #   security-audit.yml  — Layer A: always-on dep-vuln gate (npm/go/python)
 #   dep-auto-apply.yml  — Layer B: weekly auto-apply cron (per-repo opt-in
 #                         via .github/auto-apply-enabled — NOT created here)
-#   size-guard.yml and security-audit.yml are pull_request-reachable: their
-#   runs-on follows the repo's visibility (install_pr_workflow above).
-#   dep-auto-apply.yml runs on schedule/workflow_dispatch only and carries its
-#   own private-only literal toggle, so it is copied as is.
-install_pr_workflow "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
-install_pr_workflow "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
-cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
+#   Every runs-on follows the repo's visibility (install_workflow above):
+#   size-guard.yml and security-audit.yml (pull_request-reachable) carry the
+#   guarded SC-37 predicate, dep-auto-apply.yml (schedule/workflow_dispatch
+#   only) its private-only literal toggle; a public or unconfirmed repo gets
+#   the hosted literal in all three.
+install_workflow "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
+install_workflow "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
+install_workflow "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
 # Security register (security/REVIEW-MODEL.md): the per-session gate reads
 # <repo>/SECURITY-CHECKS.md and falls back to the canonical copy, reporting
@@ -212,8 +226,13 @@ runner_report=()
 onboarding_incomplete=0
 report() { runner_report+=("$1"); }
 
-if [ "$visibility" = "public" ]; then
-  report "Public repository: PR-reachable jobs run on the hosted literal (ubuntu-latest)."
+if [ "$visibility_source" = "unconfirmed" ]; then
+  report "Visibility unconfirmed (no GitHub answer and no --private/--public): treated as public."
+  report "  Every job runs on the hosted literal (ubuntu-latest). If the repo is private, re-run with"
+  report "  --private (GitHub, when reachable, must agree) to install the guarded nexus-ci predicate."
+  onboarding_incomplete=1
+elif [ "$visibility" = "public" ]; then
+  report "Public repository: every job runs on the hosted literal (ubuntu-latest)."
   report "  The nexus-ci registrar refuses public repositories; CI_RUNNER must stay unset (SC-37, SC-46)."
   if [ "$gh_ok" -eq 1 ] && public_var="$(gh api "repos/$slug/actions/variables/CI_RUNNER" --jq .value 2>/dev/null)"; then
     report "  WARNING: CI_RUNNER is set to '$public_var' on public $slug. Remove it:"
@@ -329,7 +348,9 @@ echo
 echo "Review the files, then:"
 echo "  git add -A && git commit -m 'ci: install dev-standards guards'"
 echo
-if [ "$onboarding_incomplete" -eq 1 ]; then
+if [ "$visibility_source" = "unconfirmed" ]; then
+  echo "CI runner (visibility unconfirmed, treated as public): ubuntu-latest only"
+elif [ "$onboarding_incomplete" -eq 1 ]; then
   echo "CI runner ($visibility repository): nexus-ci onboarding INCOMPLETE"
 else
   echo "CI runner ($visibility repository):"

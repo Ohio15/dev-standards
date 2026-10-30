@@ -15,7 +15,8 @@ jobs:
   # binary (same version and digest as Ohio15/infra script-lint.yml), so CI
   # and a local run use the same version.
   shell-lint:
-    # Hosted literal: dev-standards is a public repository and the nexus-ci
+    # Always the GitHub-hosted literal: dev-standards is a public repository,
+    # a public repo never selects a runner from a variable, and the nexus-ci
     # registrar refuses public repositories (STANDARDS.md section 4, SC-37).
     runs-on: ubuntu-latest
     steps:

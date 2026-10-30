@@ -14,6 +14,20 @@ name: Dependency Auto-Apply (Layer B)
 #            produces is trusted. It hands over one artifact: a `git diff` of
 #            the allow-listed manifests/lockfiles (ALLOWED_MANIFEST_RE below)
 #            plus a result.json of per-ecosystem flags and notes.
+#            That is its only INTENDED channel, not its only one: code running
+#            here can also reach the Actions cache service of the default
+#            branch (audit 2026-10-27, MEDIUM: on a hosted runner the job's
+#            ACTIONS_RUNTIME_TOKEN is readable from the runner process, the
+#            "Cacheract" technique). So no setup-* step in this job saves a
+#            cache (each has caching switched off; the test suite enforces
+#            it), and a workflow that builds release artifacts or holds a
+#            secret must NEVER restore an Actions cache (no `cache:` on
+#            setup-*, no actions/cache, no `cache-from: type=gha`): anything
+#            this job could have written is unreviewed dependency output.
+#            dev-standards' own release workflows follow that rule. Fully
+#            closing the channel needs `apply` on a runner with no cache
+#            service at all (an ephemeral VM, nexus-ci); on hosted runners the
+#            restore-side rule is the control.
 #   publish  contents: write, pull-requests: write. NO secrets: it runs a
 #            third-party action (create-pull-request), and an action release
 #            can poison $GITHUB_PATH/$GITHUB_ENV for every later step of its
@@ -26,25 +40,55 @@ name: Dependency Auto-Apply (Layer B)
 #            `git apply --index`, and fails closed unless every staged path
 #            matches the allow-list as a regular-file modify (or a new go.sum)
 #            and passes its content check:
+#            The dependency NAME SET is the base's everywhere: a fix moves
+#            versions of dependencies the repo already has, so any name added
+#            or removed fails the run (apply such a change by hand).
 #              package.json   only dependency sections change; each changed
-#                             spec is a version range (no URL/path/git/alias)
-#              npm lockfiles  parsed as JSON; every changed `resolved` is https
-#                             on a host the base lockfile already used, no
-#                             record becomes a `link`, every changed `version`
-#                             is a plain version
+#                             spec is a version range (no URL/path/git/alias);
+#                             each section keeps exactly its base names
+#              npm lockfiles  parsed as JSON; the installed package names, the
+#                             root/workspace records and their dependency
+#                             names equal the base's; every changed `resolved`
+#                             is https on a host the base already used AND is
+#                             exactly <root>/<name>/-/<basename>-<version>.tgz
+#                             for the record's own name and version, on a
+#                             registry root (host + path prefix) the base
+#                             already used; no record becomes a `link` or
+#                             gains an alias `name`, a `hasInstallScript` its
+#                             package never had, or a new `integrity` for an
+#                             unchanged name and version; every changed
+#                             `version` is a plain version
 #              pnpm-lock      every added line: URLs only https on known hosts,
 #                             no protocol prefix (file:, link:, git...), no
 #                             scp-style git ref; a `specifier:` must be a
-#                             version/range, optionally npm:-aliased
+#                             version/range, optionally npm:-aliased. Then by
+#                             record: package and importer dependency names
+#                             equal the base's; a changed `tarball` binds to
+#                             its key's name and version as above; a changed
+#                             resolution is integrity/tarball only; the same
+#                             key never gets another integrity; no new
+#                             `requiresBuild`
 #              (any URL)      refused if its authority holds a backslash,
 #                             userinfo (`@`) or whitespace, before parsing
 #              go.mod         parsed by directive, single-line and block form:
-#                             only require/go/toolchain may change; replace,
-#                             exclude, retract and the rest must equal the base
+#                             only require/go/toolchain may change, and the
+#                             set of required modules equals the base's;
+#                             replace, exclude, retract and the rest must
+#                             equal the base
 #              go.sum         hash lines only
-#              requirements   pinned specs (== / ~=), markers, --hash only
+#              requirements   pinned specs (== / ~=), markers, --hash only;
+#                             the set of pinned projects equals the base's
+#            What this does NOT prove: that a bumped version of a dependency
+#            the repo already has is benign (that is the upstream release, the
+#            same trust a manual bump extends), or that the apply job's test
+#            report is true. Those are the human reviewer's and CI's job.
 #            Added lines over 4096 chars are refused before any regex runs.
 #            Then create-pull-request with add-paths = exactly those files.
+#            It opens the PR with this job's GITHUB_TOKEN, and GitHub starts
+#            no workflow for an event that token caused: NO CI and no Layer A
+#            audit runs on the PR by itself. No App or PAT is configured for
+#            this workflow, so the PR body says so plainly and the reviewer
+#            starts CI (close and reopen the PR, or push to its branch).
 #   notify   permissions {}, the two notification secrets, run: steps only
 #            (no action at all, no dependency code). Gets the PR URLs and
 #            date from publish as job outputs, through env:, and accepts
@@ -235,8 +279,13 @@ jobs:
           #   package.json `workspaces` (an array, or the `packages` key of an
           #   object), `!` patterns excluding;
           # - that lockfile names it (a pnpm importer, a package-lock.json
-          #   `packages` key, a yarn berry `@workspace:` locator; yarn classic
-          #   records no workspaces, so its globs alone decide).
+          #   `packages` key, a yarn berry `@workspace:` locator). yarn classic
+          #   records no workspaces in yarn.lock, so nothing proves membership
+          #   and its members are NEVER folded: each keeps its own job (audit
+          #   2026-10-27: a glob alone folded a dot-directory yarn never sees).
+          # Globs follow the package managers' own (minimatch / fast-glob,
+          # dot: false): `*`, `?` and `**` never match a path segment that
+          # starts with a dot; only a literal leading dot does.
           # The nearest such ancestor wins. Anything not provably covered keeps
           # its own job, which fails loudly rather than vanishing. The root's
           # frozen install checks every member manifest against the lockfile
@@ -308,21 +357,27 @@ jobs:
               return []
 
           def glob_re(pat):
-              out, i = [], 0
-              while i < len(pat):
-                  if pat.startswith("**/", i):
-                      out.append("(?:[^/]+/)*"); i += 3
-                  elif pat.startswith("**", i):
-                      out.append(".*"); i += 2
-                  elif pat[i] == "*":
-                      out.append("[^/]*"); i += 1
-                  elif pat[i] == "?":
-                      out.append("[^/]"); i += 1
-                  elif pat[i] in "[]{}()!+@":
+              # Per segment, so a wildcard can never match a dot segment.
+              segs, rx = pat.split("/"), ""
+              for n, seg in enumerate(segs):
+                  last = n == len(segs) - 1
+                  if seg == "**":
+                      rx += r"(?!\.)[^/]+(?:/(?!\.)[^/]+)*" if last else r"(?:(?!\.)[^/]+/)*"
+                      continue
+                  if seg in ("", ".", ".."):
                       return None
-                  else:
-                      out.append(re.escape(pat[i])); i += 1
-              return re.compile("".join(out) + r"\Z")
+                  part = "" if seg.startswith(".") else r"(?!\.)"
+                  for ch in seg:
+                      if ch == "*":
+                          part += "[^/]*"
+                      elif ch == "?":
+                          part += "[^/]"
+                      elif ch in "[]{}()!+@":
+                          return None
+                      else:
+                          part += re.escape(ch)
+                  rx += part + ("" if last else "/")
+              return re.compile(rx + r"\Z")
 
           def matcher(globs):
               pos, neg = [], []
@@ -361,7 +416,7 @@ jobs:
               if has(d, "yarn.lock"):
                   text = read(d, "yarn.lock")
                   if not re.search(r"^__metadata:", text, re.M):
-                      return lambda rel: True   # yarn classic records no workspaces
+                      return None   # yarn classic records no workspaces: never fold
                   return lambda rel: re.search("@workspace:" + re.escape(rel) + r'(?=[",:\s])', text) is not None
               for name in ("package-lock.json", "npm-shrinkwrap.json"):
                   if has(d, name):
@@ -1190,6 +1245,14 @@ jobs:
           # A version range only: no URL, path, git, alias or workspace protocol.
           DEP_SPEC = re.compile(r"[0-9A-Za-z.+^~<>=*| -]{1,128}")
           PLAIN_VERSION = re.compile(r"[0-9A-Za-z.+-]{1,128}")
+          # An npm package name as it appears in a lockfile key and in the
+          # registry tarball path. No `.`/`..` segment and no leading dot or
+          # underscore, so a name can never walk the URL path.
+          NPM_NAME = re.compile(r"(?:@[A-Za-z0-9~-][A-Za-z0-9._~-]{0,213}/)?[A-Za-z0-9~-][A-Za-z0-9._~-]{0,213}")
+          INTEGRITY = re.compile(r"(?:sha1|sha256|sha384|sha512)-[A-Za-z0-9+/]{20,}={0,2}(?: (?:sha1|sha256|sha384|sha512)-[A-Za-z0-9+/]{20,}={0,2})*")
+          DEFAULT_ROOT = ("registry.npmjs.org", "")
+          # One `key: value` (or `key:`) line of pnpm-lock.yaml, key optionally quoted.
+          PNPM_KV = re.compile(r"('(?:[^']|'')*'|\"[^\"]*\"|[^'\"\s]\S*?):(?:[ \t]+(.*))?")
           GO_MODULE = re.compile(r"[A-Za-z0-9._~/-]+")
           GO_VERSION = re.compile(r"v[0-9A-Za-z.+-]+")
           GO_SUM_LINE = re.compile(r"[A-Za-z0-9._~/-]+ v[0-9A-Za-z.+-]+(?:/go\.mod)? h1:[A-Za-z0-9+/]{43}=")
@@ -1345,6 +1408,37 @@ jobs:
               if parts.scheme != "https" or parts.hostname not in known:
                   die(f"{path}: new URL {url!r} (only https to a host the lockfile already used)")
 
+          def tarball_root(name, version, url):
+              """(authority, path prefix) of a registry tarball URL that is
+              exactly <prefix>/<name>/-/<basename>-<version>.tgz, else None.
+              A record named for one package can then only point at that
+              package's own tarball, at that version (audit 2026-10-27 HIGH)."""
+              if not (isinstance(name, str) and NPM_NAME.fullmatch(name)
+                      and isinstance(version, str) and PLAIN_VERSION.fullmatch(version)):
+                  return None
+              parts = urlsplit(url)
+              if parts.scheme != "https" or parts.query or parts.fragment or "%" in parts.path:
+                  return None
+              suffix = f"/{name}/-/{name.rsplit('/', 1)[-1]}-{version}.tgz"
+              if not parts.path.endswith(suffix):
+                  return None
+              return (parts.netloc.lower(), parts.path[:-len(suffix)])
+
+          def bind_tarball(path, what, name, version, url, roots):
+              # Called after https_on_known_host, so the authority is already clean.
+              root = tarball_root(name, version, url)
+              if root is None:
+                  die(f"{path}: {what} URL {url!r} is not the registry tarball of {name}@{version} "
+                      f"(must be <registry>/{name}/-/<basename>-{version}.tgz)")
+              if root not in roots:
+                  die(f"{path}: {what} URL {url!r} uses a registry root {root!r} the base lockfile never used")
+
+          def same_names(path, what, before, after):
+              if before != after:
+                  added, removed = sorted(after - before), sorted(before - after)
+                  die(f"{path}: {what} changed (added {added[:5]!r}, removed {removed[:5]!r}); "
+                      "auto-apply only moves versions of dependencies the base already has")
+
           def lock_entries(doc):
               """Every package record of an npm lockfile (v1 nested
               `dependencies`, v2/v3 `packages`), keyed by its position."""
@@ -1366,6 +1460,16 @@ jobs:
                   walk(doc["dependencies"], ())
               return out
 
+          def record_name(key):
+              """The package a record installs, from its position: the part
+              after the last node_modules/ (v2/v3), the key itself (v1). None
+              for the root and workspace-folder records of `packages`."""
+              if key[0] == "dependencies":
+                  return key[-1]
+              if "node_modules/" not in "/" + key[1]:
+                  return None
+              return ("/" + key[1]).rsplit("/node_modules/", 1)[1]
+
           def check_npm_lock(path, old, new):
               try:
                   o, n = json.loads(old), json.loads(new)
@@ -1377,23 +1481,60 @@ jobs:
               known = DEFAULT_HOSTS | {urlsplit(r["resolved"]).hostname for r in before.values()
                                        if isinstance(r, dict) and isinstance(r.get("resolved"), str)}
               known.discard(None)
+              # Registry roots the base lockfile already used, learnt only from
+              # records whose URL binds to their own name and version.
+              roots = {DEFAULT_ROOT}
+              base_integrity = collections.defaultdict(set)
+              base_scripts = set()
+              for key, rec in before.items():
+                  name = record_name(key)
+                  if not isinstance(rec, dict) or name is None:
+                      continue
+                  real = rec.get("name") if isinstance(rec.get("name"), str) else name
+                  if isinstance(rec.get("resolved"), str):
+                      root = tarball_root(real, rec.get("version"), rec["resolved"])
+                      if root is not None:
+                          roots.add(root)
+                  if isinstance(rec.get("integrity"), str):
+                      base_integrity[(name, rec.get("version"))].add(rec["integrity"])
+                  if rec.get("hasInstallScript"):
+                      base_scripts.add(name)
               for key, rec in after.items():
                   if not isinstance(rec, dict):
                       die(f"{path}: record {key!r} is not an object")
                   prev = before.get(key) if isinstance(before.get(key), dict) else {}
+                  name = record_name(key)
                   # A value identical at the same key in the base commit is the
                   # base's own; every other value is judged.
                   if rec.get("link") != prev.get("link") and rec.get("link") not in (None, False):
                       die(f"{path}: {key!r} becomes a link")
+                  ver = rec.get("version")
+                  if ver is not None and ver != prev.get("version"):
+                      if not (isinstance(ver, str) and PLAIN_VERSION.fullmatch(ver)):
+                          die(f"{path}: {key!r} version {ver!r} is not a plain version")
+                  # An installed record's `name` makes it an alias: it installs
+                  # that package under this one's name. Never introduced.
+                  if name is not None and rec.get("name") != prev.get("name"):
+                      die(f"{path}: {key!r} gains or changes an alias `name` ({rec.get('name')!r})")
                   res = rec.get("resolved")
                   if res is not None and res != prev.get("resolved"):
                       if not isinstance(res, str):
                           die(f"{path}: {key!r} resolved is not a string")
                       https_on_known_host(path, res, known)
-                  ver = rec.get("version")
-                  if ver is not None and ver != prev.get("version"):
-                      if not (isinstance(ver, str) and PLAIN_VERSION.fullmatch(ver)):
-                          die(f"{path}: {key!r} version {ver!r} is not a plain version")
+                      if name is None:
+                          die(f"{path}: {key!r} is not an installed package but gains a resolved URL")
+                      real = rec.get("name") if isinstance(rec.get("name"), str) else name
+                      bind_tarball(path, f"{key!r} resolved", real, ver, res, roots)
+                  integ = rec.get("integrity")
+                  if integ is not None and integ != prev.get("integrity"):
+                      if not (isinstance(integ, str) and INTEGRITY.fullmatch(integ)):
+                          die(f"{path}: {key!r} integrity {integ!r} is not an SRI hash")
+                      # Same package, same version, different bytes.
+                      seen = base_integrity.get((name, ver))
+                      if seen and integ not in seen:
+                          die(f"{path}: {key!r} integrity changes without a version change")
+                  if name is not None and rec.get("hasInstallScript") and name not in base_scripts:
+                      die(f"{path}: {key!r} gains hasInstallScript (an install script the base never ran)")
                   # Root and workspace records mirror package.json: ranges only.
                   if key[0] == "packages" and "node_modules" not in key[1].split("/"):
                       for sec in DEP_SECTIONS:
@@ -1403,6 +1544,16 @@ jobs:
                           for dep, spec in specs.items():
                               if spec != prev_specs.get(dep) and not (isinstance(spec, str) and DEP_SPEC.fullmatch(spec)):
                                   die(f"{path}: {key!r} {sec}.{dep} = {spec!r} is not a version range")
+                          if isinstance(prev_specs, dict):
+                              same_names(path, f"{key!r} {sec}", set(prev_specs), set(specs))
+              # The dependency set is the base's: no package name appears or
+              # disappears, no root/workspace record is added or dropped.
+              def names(entries):
+                  return {record_name(k) for k in entries if record_name(k) is not None}
+              def folders(entries):
+                  return {k for k in entries if k[0] == "packages" and record_name(k) is None}
+              same_names(path, "the set of installed package names", names(before), names(after))
+              same_names(path, "the set of root/workspace records", folders(before), folders(after))
 
           def check_lock_lines(path, old, lines):
               known = (DEFAULT_HOSTS | {urlsplit(u).hostname for u in URL.findall(old or "")}) - {None}
@@ -1422,6 +1573,288 @@ jobs:
                       die(f"{path}: new local/git reference {ln.strip()!r}")
                   if SCP_REF.search(ln):
                       die(f"{path}: new scp-style git reference {ln.strip()!r}")
+
+          def pnpm_key(raw):
+              """(name, version) of a pnpm `packages:`/`snapshots:` key, any
+              lockfile version: a@1.0.0, '@s/a@1.0.0', /a@1.0.0(peer@1),
+              /a/1.0.0_peer@1 (v5). The version is None when it is not a
+              plain version (a URL, a path, an alias)."""
+              key = raw.strip().strip("'\"").lstrip("/")
+              v5 = re.fullmatch(r"((?:@[^/@]+/)?[^/@]+)/([0-9][^/]*)", key)
+              at = key.find("@", 1) if key.startswith("@") else key.find("@")
+              if v5:
+                  name, ver = v5.groups()
+              elif at > 0:
+                  name, ver = key[:at], key[at + 1:]
+              else:
+                  return None, None
+              ver = re.split(r"[(_]", ver, maxsplit=1)[0]
+              if not NPM_NAME.fullmatch(name):
+                  return None, None
+              return name, (ver if PLAIN_VERSION.fullmatch(ver) else None)
+
+          def unquote(s):
+              """A YAML scalar as pnpm reads it: '...' ('' is a quote), "...", or plain."""
+              s = s.strip()
+              if len(s) >= 2 and s[0] == s[-1] == "'":
+                  return s[1:-1].replace("''", "'")
+              if len(s) >= 2 and s[0] == s[-1] == '"':
+                  try:
+                      return json.loads(s)
+                  except ValueError:
+                      die(f"unreadable double-quoted scalar {s!r}")
+              return s
+
+          def flow_map(path, key, value):
+              """A one-line YAML flow mapping {k: v, ...} with every key and
+              value unquoted, so `'tarball':`, `"tarball":` and `tarball:`
+              are the same key. Nesting, duplicates or anything unparseable
+              fails closed (gate pass 1 on #62, SC-03/SC-19)."""
+              if not (value.startswith("{") and value.endswith("}")):
+                  die(f"{path}: {key!r} resolution {value!r} is not a flow mapping")
+              items, cur, quote = [], "", None
+              for ch in value[1:-1]:
+                  if quote:
+                      cur += ch
+                      if ch == quote:
+                          quote = None
+                  elif ch in "'\"":
+                      quote = ch
+                      cur += ch
+                  elif ch == ",":
+                      items.append(cur)
+                      cur = ""
+                  elif ch in "{}[]&*!|>":
+                      die(f"{path}: {key!r} resolution {value!r} is not a plain flow mapping")
+                  else:
+                      cur += ch
+              if quote:
+                  die(f"{path}: {key!r} resolution {value!r} has an unterminated quote")
+              items.append(cur)
+              out = {}
+              for item in items:
+                  item = item.strip()
+                  if not item:
+                      continue
+                  if item[0] in "'\"":
+                      end = item.find(item[0], 1)
+                      while item[0] == "'" and end > 0 and item[end + 1:end + 2] == "'":
+                          end = item.find("'", end + 2)
+                      rest = item[end + 1:].lstrip() if end > 0 else ""
+                      if end < 0 or not rest.startswith(":"):
+                          die(f"{path}: {key!r} resolution entry {item!r} is unreadable")
+                      k, v = unquote(item[:end + 1]), rest[1:]
+                  else:
+                      m = re.fullmatch(r"([^\s:'\"]+):(?:\s+(.*))?", item)
+                      if not m:
+                          die(f"{path}: {key!r} resolution entry {item!r} is unreadable")
+                      k, v = m.group(1), m.group(2) or ""
+                  if k in out:
+                      die(f"{path}: {key!r} resolution repeats {k!r}")
+                  out[k] = unquote(v)
+              return out
+
+          def yaml_blocks(path, text):
+              """The block-mapping structure of a YAML document, nesting
+              read from RELATIVE indentation (a stack), as YAML does: any
+              consistent indent is understood, and every line is either
+              placed or refused (gate pass 2 on #62, SC-19). Modelled: block
+              mappings `key: value` / `key:`, block sequences of plain items,
+              one-line flow values (kept as raw text). Refused, fail-closed:
+              tabs in indentation, a line deeper than its parent allows, an
+              indent matching no open level, block scalars, anchors, aliases,
+              tags, complex keys, `- key: value` items, duplicate keys,
+              multi-document streams."""
+              root = {}
+              # [indent of the parent line, indent of the children (None
+              # until the first child), container (None until typed)]
+              stack = [[-1, None, root]]
+              for no, raw in enumerate((text or "").splitlines(), 1):
+                  body = raw.rstrip()
+                  if not body.strip() or body.lstrip().startswith("#"):
+                      continue
+                  lead = body[:len(body) - len(body.lstrip())]
+                  if lead.strip(" "):
+                      die(f"{path}:{no}: tab in indentation; cannot be read safely")
+                  if body.strip() in ("---", "..."):
+                      if no == 1 or not root:
+                          continue
+                      die(f"{path}:{no}: a second YAML document; cannot be read safely")
+                  ind, line = len(lead), body.strip()
+                  while True:
+                      parent_ind, child_ind = stack[-1][0], stack[-1][1]
+                      if child_ind is None:
+                          if ind > parent_ind:
+                              stack[-1][1] = ind
+                              break
+                          if len(stack) == 1:
+                              die(f"{path}:{no}: unreadable indentation")
+                          stack.pop()
+                          continue
+                      if ind == child_ind:
+                          break
+                      if ind < child_ind and len(stack) > 1:
+                          stack.pop()
+                          continue
+                      die(f"{path}:{no}: indentation {ind} matches no open level; cannot be read safely")
+                  entry = stack[-1]
+                  if line == "-" or line.startswith("- "):
+                      item = line[1:].strip()
+                      if entry[2] is None:
+                          entry[2] = []
+                          entry[3][entry[4]] = entry[2]
+                      if not isinstance(entry[2], list) or PNPM_KV.fullmatch(item) or item[:1] in "&*!|>?-{[":
+                          die(f"{path}:{no}: unmodelled sequence item {line[:80]!r}")
+                      entry[2].append(unquote(item))
+                      continue
+                  m = PNPM_KV.fullmatch(line)
+                  if not m or line[:1] in "?&*!|>-[{":
+                      die(f"{path}:{no}: unreadable line {line[:80]!r}")
+                  key, value = unquote(m.group(1)), (m.group(2) or "").strip()
+                  if value[:1] in ("&", "*", "!", "|", ">"):
+                      die(f"{path}:{no}: anchor, alias, tag or block scalar at {key!r}; cannot be read safely")
+                  if entry[2] is None:
+                      entry[2] = {}
+                      entry[3][entry[4]] = entry[2]
+                  if not isinstance(entry[2], dict):
+                      die(f"{path}:{no}: a mapping key inside a sequence ({key!r})")
+                  if key in entry[2]:
+                      die(f"{path}:{no}: duplicate key {key!r}")
+                  if value:
+                      entry[2][key] = value
+                  else:
+                      entry[2][key] = None
+                      stack.append([ind, None, None, entry[2], key])
+              return root
+
+          def pnpm_doc(path, text):
+              """The parts of a pnpm-lock.yaml the binding rules need, from
+              yaml_blocks: records {(section, key): {field: value}} from
+              packages:/snapshots: (resolution flattened to resolution.<k>,
+              flow or block), importer dependency names
+              {(importer, section): {names}} and their versions
+              {(importer, section, name): version}; a v5/v6 single-project
+              lockfile's top-level dependency sections are importer '.'."""
+              doc = yaml_blocks(path, text)
+              records, importers, versions = {}, collections.defaultdict(set), {}
+              for sec in ("packages", "snapshots"):
+                  part = doc.get(sec)
+                  if part is None:
+                      continue
+                  if not isinstance(part, dict):
+                      die(f"{path}: {sec} is not a block mapping")
+                  for key, rec in part.items():
+                      fields = {}
+                      if isinstance(rec, str):
+                          # `a@1.0.0: {}` (v9 snapshots). A packages record
+                          # written inline could carry a resolution unseen.
+                          if rec != "{}" and sec == "packages":
+                              die(f"{path}: packages record {key!r} is written inline; cannot be read safely")
+                      elif isinstance(rec, dict):
+                          for field, value in rec.items():
+                              if field == "resolution":
+                                  if isinstance(value, str):
+                                      sub = flow_map(path, key, value)
+                                  elif isinstance(value, dict) and all(isinstance(v, str) for v in value.values()):
+                                      sub = {k: unquote(v) for k, v in value.items()}
+                                  else:
+                                      die(f"{path}: {key!r} resolution has an unmodelled shape")
+                                  fields["resolution"] = value if isinstance(value, str) else "<block>"
+                                  for k, v in sub.items():
+                                      fields[f"resolution.{k}"] = v
+                              elif isinstance(value, str):
+                                  fields[field] = unquote(value)
+                              else:
+                                  fields[field] = "<nested>"
+                      elif rec is not None:
+                          die(f"{path}: {sec} record {key!r} has an unmodelled shape")
+                      records[(sec, key)] = fields
+              def deps(importer, block):
+                  if not isinstance(block, dict):
+                      die(f"{path}: importer {importer!r} is not a block mapping")
+                  for section, entries in block.items():
+                      if section not in DEP_SECTIONS:
+                          continue
+                      if not isinstance(entries, dict):
+                          die(f"{path}: importer {importer!r} {section} is not a block mapping")
+                      for name, spec in entries.items():
+                          importers[(importer, section)].add(name)
+                          if isinstance(spec, dict):
+                              ver = spec.get("version")
+                          else:
+                              ver = spec
+                          if ver is not None and not isinstance(ver, str):
+                              die(f"{path}: importer {importer!r} {section}.{name} version is not a scalar")
+                          versions[(importer, section, name)] = unquote(ver) if ver else None
+              imps = doc.get("importers")
+              if imps is not None:
+                  if not isinstance(imps, dict):
+                      die(f"{path}: importers is not a block mapping")
+                  for importer, block in imps.items():
+                      if block is not None:
+                          deps(importer, block)
+              top = {k: v for k, v in doc.items() if k in DEP_SECTIONS}
+              if top:
+                  deps(".", top)
+              return records, importers, versions
+
+          def check_pnpm_lock(path, old, new):
+              o_recs, o_imps, o_vers = pnpm_doc(path, old)
+              n_recs, n_imps, n_vers = pnpm_doc(path, new)
+              roots = {DEFAULT_ROOT}
+              base_scripts = set()
+              for (sec, key), rec in o_recs.items():
+                  name, ver = pnpm_key(key)
+                  url = rec.get("resolution.tarball")
+                  if url:
+                      root = tarball_root(name, ver, url)
+                      if root is not None:
+                          roots.add(root)
+                  if rec.get("requiresBuild") == "true":
+                      base_scripts.add(name)
+              known = (DEFAULT_HOSTS | {urlsplit(u).hostname for u in URL.findall(old or "")}) - {None}
+              for (sec, key), rec in n_recs.items():
+                  prev = o_recs.get((sec, key), {})
+                  name, ver = pnpm_key(key)
+                  if name is None:
+                      die(f"{path}: {sec} key {key!r} names no package")
+                  res = {k: v for k, v in rec.items() if k.startswith("resolution.")}
+                  prev_res = {k: v for k, v in prev.items() if k.startswith("resolution.")}
+                  if res != prev_res:
+                      # A git, directory or other typed resolution is never written by a bump.
+                      if set(res) - {"resolution.integrity", "resolution.tarball"}:
+                          die(f"{path}: {key!r} resolution {rec.get('resolution')!r} is not a registry tarball")
+                      # The key carries the version: same key, different bytes.
+                      if (sec, key) in o_recs and res.get("resolution.integrity") != prev_res.get("resolution.integrity"):
+                          die(f"{path}: {key!r} integrity changes without a version change")
+                      integ = res.get("resolution.integrity")
+                      if integ is not None and not INTEGRITY.fullmatch(integ):
+                          die(f"{path}: {key!r} integrity {integ!r} is not an SRI hash")
+                      url = res.get("resolution.tarball")
+                      if url is not None and url != prev_res.get("resolution.tarball"):
+                          https_on_known_host(path, url, known)
+                          bind_tarball(path, f"{key!r} tarball", name, ver, url, roots)
+                  if rec.get("requiresBuild") == "true" and name not in base_scripts:
+                      die(f"{path}: {key!r} gains requiresBuild (an install script the base never ran)")
+              for sec in ("packages", "snapshots"):
+                  same_names(path, f"the set of package names in {sec}",
+                             {pnpm_key(k)[0] for s, k in o_recs if s == sec},
+                             {pnpm_key(k)[0] for s, k in n_recs if s == sec})
+              same_names(path, "the set of importer dependency sections", set(o_imps), set(n_imps))
+              for k in n_imps:
+                  same_names(path, f"importer {k[0]!r} {k[1]}", o_imps[k], n_imps[k])
+              # A changed importer version must name a package record of this
+              # lockfile (dep@version, or an npm: alias target name@version).
+              targets = {pnpm_key(k) for s, k in n_recs if s == "packages"}
+              for (imp, section, dep), ver in n_vers.items():
+                  if ver == o_vers.get((imp, section, dep)):
+                      continue
+                  plain = re.split(r"[(_]", ver or "", maxsplit=1)[0]
+                  if PLAIN_VERSION.fullmatch(plain or "-") and (dep, plain) in targets:
+                      continue
+                  if plain and pnpm_key(plain) in targets and pnpm_key(plain)[1] is not None:
+                      continue
+                  die(f"{path}: importer {imp!r} {section}.{dep} version {ver!r} names no package record")
 
           def go_mod_directives(path, text):
               """(verb, args) for every directive, single-line and block form."""
@@ -1472,6 +1905,11 @@ jobs:
                   elif verb == "toolchain":
                       if not re.fullmatch(r"go\d+(?:\.\d+){1,2}", args):
                           die(f"{path}: toolchain {args!r}")
+              # A bump moves versions of modules already required; a new
+              # module path is a new dependency.
+              same_names(path, "the set of required modules",
+                         {a.split(" ")[0] for v, a in o if v == "require"},
+                         {a.split(" ")[0] for v, a in n if v == "require"})
 
           def requirement_ok(ln):
               s = ln.strip()
@@ -1489,6 +1927,21 @@ jobs:
                   return bool(options)  # a continuation line of hashes
               req, sep, marker = rest.partition(";")
               return bool(REQ_SPEC.fullmatch(req.replace(" ", ""))) and (not sep or bool(REQ_MARKER.fullmatch(marker)))
+
+          def requirement_names(text):
+              """Canonical project names a requirements file pins (PEP 503)."""
+              out, logical = set(), ""
+              for raw in (text or "").splitlines():
+                  ln = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].rstrip()
+                  if ln.endswith("\\"):
+                      logical += ln[:-1] + " "
+                      continue
+                  logical, line = "", (logical + ln).strip()
+                  # An option line (-r, -i, --hash continuation...) names no project.
+                  m = None if line.startswith("-") else re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", line)
+                  if m:
+                      out.add(re.sub(r"[-_.]+", "-", m.group(0)).lower())
+              return out
 
           for path in staged:
               name = path.rsplit("/", 1)[-1]
@@ -1515,10 +1968,13 @@ jobs:
                       for dep, spec in after.items():
                           if before.get(dep) != spec and not (isinstance(spec, str) and DEP_SPEC.fullmatch(spec)):
                               die(f"{path}: {sec}.{dep} = {spec!r} is not a version range")
+                      if isinstance(before, dict):
+                          same_names(path, f"the {sec} names", set(before), set(after))
               elif name in ("package-lock.json", "npm-shrinkwrap.json"):
                   check_npm_lock(path, old, new)
               elif name == "pnpm-lock.yaml":
                   check_lock_lines(path, old, lines)
+                  check_pnpm_lock(path, old, new)
               elif name == "go.mod":
                   check_go_mod(path, old, new)
               elif name == "go.sum":
@@ -1529,6 +1985,7 @@ jobs:
                   for ln in lines:
                       if not requirement_ok(ln):
                           die(f"{path}: line {ln.strip()!r} is not a pinned requirement")
+                  same_names(path, "the set of pinned projects", requirement_names(old), requirement_names(new))
 
           # ---- PR metadata: built here, from validated data only ------------
           def notes_block(text):
@@ -1556,9 +2013,14 @@ jobs:
                          "Automated weekly bumps for safe (non-major) dependency fixes.\n")
           body = "\n".join([
               head_md,
+              "### No CI has run on this PR",
+              "This PR was opened with the workflow's GITHUB_TOKEN, and GitHub starts no workflow for an",
+              "event that token causes: no CI and no Layer A security audit ran on it. Start them before",
+              "merging (close and reopen the PR, or push a commit to its branch) and wait for them to pass.",
+              "",
               "### Per-ecosystem",
               "Test results below are what the apply job reported. That job runs the dependencies'",
-              "own code, so its report is unverified: CI on this PR is the check that counts.",
+              "own code, so its report is unverified until CI runs here.",
               "",
               *table,
               "",
@@ -1573,11 +2035,14 @@ jobs:
               "",
               "### Files in this PR",
               "Each one matched the manifest allow-list and passed the publish job's content checks:",
-              "package.json changes only dependency versions, each a version range; npm lockfiles are",
-              "parsed and every changed `resolved` must be https on a host the lockfile already used, no",
-              "record may become a `link`, every changed `version` is a plain version; pnpm-lock lines add",
-              "no URL off those hosts, no protocol (`file:`, `link:`, `git`...) and no scp-style git ref;",
-              "go.mod changes only require/go/toolchain directives; requirements lines are pinned specs.",
+              "no dependency name was added or removed in any file; package.json changes only dependency",
+              "specs, each a version range; in npm and pnpm lockfiles every changed download URL is the",
+              "registry tarball of its own record's name and version on a registry the lockfile already",
+              "used, no record became a link or an alias, gained an install script, or changed its",
+              "integrity without changing its version; pnpm-lock lines add no protocol (`file:`, `link:`,",
+              "`git`...) and no scp-style git ref; go.mod changes only require/go/toolchain directives;",
+              "requirements lines are pinned specs. These checks bind each download to the package it",
+              "names; they do not vet the new upstream versions themselves.",
               files,
               "",
               "### Not shipped (modified by the apply job, outside the allow-list)",
@@ -1587,8 +2052,8 @@ jobs:
               "- [ ] Lockfile diff is present and reasonable",
               "- [ ] No major version bumps slipped through",
               "- [ ] CVE / GHSA list (if any) maps to the bumps",
-              "- [ ] CI is green on this PR",
-              "- [ ] Layer A `security-audit` workflow passes",
+              "- [ ] CI was started by a human on this PR (it does not start on its own) and is green",
+              "- [ ] Layer A `security-audit` workflow ran on this PR and passes",
               "",
               f"Workflow run: {run_url}",
               "",

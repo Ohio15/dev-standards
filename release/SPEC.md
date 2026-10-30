@@ -274,24 +274,35 @@ repo waits its turn.
 Reusable release workflows pick their runner as
 `${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}`; they are called
 from tag pushes only (see the caller shape above). Synced guard workflows
-(`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it as
-`${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest' }}`:
-a variable runner for push, schedule, workflow_dispatch, release, merge_group
-and a SAME-REPO pull request (runner policy amended 2026-10-27, STANDARDS.md);
-a fork pull request and every other event get the hosted literal.
-Set the repository variable `CI_RUNNER` to a self-hosted label
-(for example `nexus-ci`, the fenced ephemeral-VM runners on NEXUS) to move
-gates, tests and image builds there without editing any workflow; unset it to
-fall back to GitHub-hosted runners. Deploy and notify jobs keep their explicit
-`[self-hosted, nexus-deploy]` label because they must reach the host.
-The rule is mechanical, not a convention: a job reached from a FORK pull
+(`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it
+with the guarded SC-37 predicate (audit-dev-standards-2026-10-27; register
+amendment PROPOSED on #62):
+`${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}`:
+`nexus-ci` for push, schedule, workflow_dispatch, release, merge_group and a
+SAME-REPO pull request (runner policy amended 2026-10-27, STANDARDS.md), and
+only in a private repository whose `CI_RUNNER` is exactly `nexus-ci`; a fork
+pull request, every other event and every public repository get the hosted
+literal. The variable only toggles between those two literals; it can never
+name another label. `install.sh` writes the hosted literal instead into any
+repository it cannot confirm is private, and dev-standards (public) carries
+the hosted literal in its own copies.
+For the reusable release workflows, set the repository variable `CI_RUNNER`
+to a self-hosted label (for example `nexus-ci`, the fenced ephemeral-VM
+runners on NEXUS) to move gates, tests and image builds there without editing
+any workflow; unset it to fall back to GitHub-hosted runners. Deploy and
+notify jobs keep their explicit `[self-hosted, nexus-deploy]` label because
+they must reach the host.
+The rule is mechanical, not a convention: a guard job reached from a FORK pull
 request (or pull_request_target, workflow_run, or any event off the
-allow-list) can never resolve its runner from a variable. `&&`/`||` return an
-operand, so there the expression is the literal `ubuntu-latest` whatever
-`CI_RUNNER` holds. Same-repo pull-request code does run on the self-hosted
-runner; the registrar's run-trust check (ci-registrar 0.4.0+) is the
-server-side control. The same predicate sets
-`TRUSTED_EVENT`, and on an untrusted event the audit runs no PR-controlled
+allow-list), or run in a public repository, can never resolve to a
+self-hosted runner. `&&`/`||` return an operand, so there the expression is
+the literal `ubuntu-latest` whatever `CI_RUNNER` holds. Same-repo pull-request
+code does run on the self-hosted runner; the registrar's run-trust check
+(ci-registrar 0.4.0+) is the server-side control. Trust is a separate,
+narrower predicate: `TRUSTED_EVENT` is true only for a schedule, or a push /
+workflow_dispatch of the default branch (merged code), so it is false on
+every pull request whichever runner it lands on, and on an untrusted event
+the audit runs no PR-controlled
 code (pnpmfile, yarnPath, yarn plugins, `.corepack.env`, Python build
 backends); what it cannot audit without running such code is NOT EXAMINED
 and fails. `scripts/tests/test_security_audit_workflow.py` enforces this

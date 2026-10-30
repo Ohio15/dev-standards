@@ -641,6 +641,20 @@ github.repository`), which is exactly what the canonical predicate admits.
 policy `68d983a4`). Before this, any variable-selected runner on a
 PR-reachable job was a finding. A same-repo `pull_request` in a private,
 registrar-served repository is now CLEAR under conditions 1 to 3 above.
+**Amended (PROPOSED, pending Ron's approval; audit-dev-standards-2026-10-27,
+PR #62).** The guarded literal toggle is ALSO canonical, and is THE canonical
+text for dev-standards fleet templates (which install.sh may copy into any
+repository). Token for token (whitespace aside), Linux:
+`(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'`.
+Windows: the same allow-list, then
+`&& github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci-windows' || 'windows-latest'`.
+It meets condition 1. It is stricter than the variable form: the variable
+can only toggle between two literal labels (never name another runner, e.g. a
+persistent deploy runner), and a public repository always resolves to the
+hosted literal. Condition 2 still applies to any repository that actually sets
+`CI_RUNNER`; in a public repository the guarded form is still a hit under the
+"stay FINDINGs" list unless the copy is the hosted literal (install.sh writes
+the hosted literal into any repository it cannot confirm is private).
 **Origin.** audit-pdfmanager-2026-10-08, proposed there as SC-34
 (MEDIUM, latent; approved by Ron 2026-10-09).
 

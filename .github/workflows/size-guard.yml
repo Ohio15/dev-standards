@@ -9,6 +9,10 @@ permissions:
 
 jobs:
   size-guard:
+    # Fleet template: SC-37 allow-list, then nexus-ci only in a private repo
+    # with vars.CI_RUNNER == 'nexus-ci', else ubuntu-latest. install.sh (and
+    # dev-standards' own public copy) writes the literal ubuntu-latest instead
+    # into any repo not confirmed private.
     runs-on: ubuntu-latest
     steps:
       # SHA-pinned, same ref as security-audit.yml and dep-auto-apply.yml

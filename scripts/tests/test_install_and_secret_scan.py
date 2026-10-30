@@ -7,11 +7,13 @@ lookup (SC-12), from the 2026-10-05 security gate on the templates.
 - SC-12: with gitleaks off PATH the hook ran `${GOPATH:-$HOME/go}/bin/gitleaks`,
   a binary an inherited environment chooses. It now fails closed.
 
-Runner predicate (SC-37, amended 2026-10-27): install.sh writes the canonical
-allow-list predicate into a private repo's pull_request-reachable workflows and
-the hosted literal into a public repo's, and refuses to install when it cannot
-tell which the target is. The tests pass --no-gh with an explicit visibility,
-so no test talks to GitHub.
+Runner predicate (SC-37, amended 2026-10-27; audit-dev-standards-2026-10-27):
+install.sh writes the templates verbatim (the guarded allow-list predicate, and
+dep-auto-apply's private-only toggle) into a private repo, and the hosted
+literal into a public or unconfirmed one. A flag GitHub contradicts is an
+error; visibility is settled before anything is written. Most tests pass
+--no-gh; the GitHub-answer tests put a fake `gh` first on PATH, so no test
+talks to GitHub.
 
 Everything runs against throwaway repos and directories under tmp_path.
 
@@ -70,19 +72,40 @@ def install(repo: Path, *flags: str) -> subprocess.CompletedProcess[str]:
 REGISTER = ROOT / "security" / "SECURITY-CHECKS.md"
 
 
-def canonical_predicate() -> str:
-    """The SC-37 canonical Linux predicate, read from the register so the test
-    and the installer cannot drift from it independently."""
-    sc37 = REGISTER.read_text(encoding="utf-8").split("### SC-37", 1)[1]
-    m = re.search(r"`(\(github\.event_name == 'push'.*?\|\| 'ubuntu-latest')`", sc37, re.S)
-    assert m, "SC-37 canonical predicate not found in the register"
-    return m.group(1)
+def _sc37_predicates() -> list[str]:
+    sc37 = REGISTER.read_text(encoding="utf-8").split("### SC-37", 1)[1].split("\n### ", 1)[0]
+    found = re.findall(r"`(\(github\.event_name == 'push'.*?\|\| 'ubuntu-latest')`", sc37, re.S)
+    assert found, "SC-37 canonical predicate not found in the register"
+    return [" ".join(p.split()) for p in found]
 
+
+GUARD_TAIL = "&& github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'"
+
+
+def canonical_predicate() -> str:
+    """The guarded SC-37 Linux predicate the fleet templates carry, read from
+    the register so the test and the installer cannot drift from it
+    independently."""
+    [guarded] = [p for p in _sc37_predicates() if p.endswith(GUARD_TAIL)]
+    return guarded
+
+
+# dep-auto-apply.yml runs on schedule/workflow_dispatch only; its jobs carry
+# the bare private-only literal toggle rather than the event allow-list.
+DEP_TOGGLE = "${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
 
 PR_TEMPLATES = {
     "size-guard.yml": ROOT / "workflows" / "size-guard.yml",
     "security-audit.yml": ROOT / "templates" / ".github" / "workflows" / "security-audit.yml",
 }
+DEP_TEMPLATE = ROOT / "templates" / ".github" / "workflows" / "dep-auto-apply.yml"
+ALL_TEMPLATES = {**PR_TEMPLATES, "dep-auto-apply.yml": DEP_TEMPLATE}
+
+
+def hosted_copy(text: str) -> str:
+    """What install.sh writes for a public or unconfirmed target."""
+    return (text.replace("runs-on: ${{ " + canonical_predicate() + " }}", "runs-on: ubuntu-latest")
+                .replace("runs-on: " + DEP_TOGGLE, "runs-on: ubuntu-latest"))
 
 
 def runs_on_lines(text: str) -> list[str]:
@@ -163,17 +186,30 @@ def test_installed_hook_copies_match_canonical():
 
 
 # ─── SC-37: runner predicate follows the target's visibility ─────────────────
+# audit-dev-standards-2026-10-27 MEDIUM: a template that reaches a public repo
+# carries the hosted literal; unconfirmed visibility counts as public.
 
-def test_private_repo_gets_the_canonical_predicate_verbatim(tmp_path):
+def assert_hosted_install(repo: Path) -> None:
+    for name, template in ALL_TEMPLATES.items():
+        installed = (repo / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        lines = runs_on_lines(installed)
+        assert lines and all(l == "runs-on: ubuntu-latest" for l in lines), (name, lines)
+        assert "runs-on: ${{" not in installed
+        # Only the runs-on lines differ from the template.
+        assert installed == hosted_copy(template.read_text(encoding="utf-8")), name
+
+
+def test_private_repo_gets_the_guarded_predicate_verbatim(tmp_path):
     repo = target_repo(tmp_path)
     proc = install(repo, "--private", "--no-gh")
     assert proc.returncode == 0, proc.stderr
     canon = "runs-on: ${{ " + canonical_predicate() + " }}"
-    for name, template in PR_TEMPLATES.items():
+    for name, template in ALL_TEMPLATES.items():
         installed = (repo / ".github" / "workflows" / name).read_bytes()
         assert installed == template.read_bytes(), f"{name} is not the template byte for byte"
         lines = runs_on_lines(installed.decode("utf-8"))
-        assert lines and all(l == canon for l in lines), (name, lines)
+        want = canon if name in PR_TEMPLATES else "runs-on: " + DEP_TOGGLE
+        assert lines and all(l == want for l in lines), (name, lines)
     assert "CI runner (private repository): nexus-ci onboarding INCOMPLETE" in proc.stdout
     assert "gh variable set CI_RUNNER --body nexus-ci" in proc.stdout
     assert "ci-vm/registrar/config.json" in proc.stdout
@@ -183,38 +219,19 @@ def test_public_repo_gets_the_hosted_literal_and_no_runs_on_expression(tmp_path)
     repo = target_repo(tmp_path)
     proc = install(repo, "--public", "--no-gh")
     assert proc.returncode == 0, proc.stderr
-    for name, template in PR_TEMPLATES.items():
-        installed = (repo / ".github" / "workflows" / name).read_text(encoding="utf-8")
-        lines = runs_on_lines(installed)
-        assert lines and all(l == "runs-on: ubuntu-latest" for l in lines), (name, lines)
-        assert "runs-on: ${{" not in installed
-        # Only the runs-on lines differ from the template.
-        expected = template.read_text(encoding="utf-8").replace(
-            "runs-on: ${{ " + canonical_predicate() + " }}", "runs-on: ubuntu-latest")
-        assert installed == expected, name
+    assert_hosted_install(repo)
     assert "CI runner (public repository):" in proc.stdout
     assert "CI_RUNNER must stay unset" in proc.stdout
     assert "gh variable set CI_RUNNER" not in proc.stdout
 
 
-def test_dep_auto_apply_is_copied_as_is_whatever_the_visibility(tmp_path):
-    for flag in ("--private", "--public"):
-        repo = tmp_path / flag.strip("-")
-        repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        proc = install(repo, flag, "--no-gh")
-        assert proc.returncode == 0, proc.stderr
-        assert (repo / ".github" / "workflows" / "dep-auto-apply.yml").read_bytes() ==             (ROOT / "templates" / ".github" / "workflows" / "dep-auto-apply.yml").read_bytes()
-
-
-def test_unknown_visibility_installs_nothing(tmp_path):
+def test_unconfirmed_visibility_installs_the_hosted_literal(tmp_path):
     repo = target_repo(tmp_path)  # no origin, and --no-gh: visibility cannot be learned
     proc = install(repo, "--no-gh")
-    assert proc.returncode == 1
-    assert "cannot determine whether" in proc.stderr and "nothing installed" in proc.stderr
-    assert not (repo / ".github").exists() and not (repo / ".githooks").exists()
-    assert subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath"],
-                          capture_output=True, text=True).returncode != 0
+    assert proc.returncode == 0, proc.stderr
+    assert_hosted_install(repo)
+    assert "visibility unconfirmed, treated as public" in proc.stdout
+    assert "gh variable set CI_RUNNER" not in proc.stdout
 
 
 def test_both_visibility_flags_is_a_usage_error(tmp_path):
@@ -225,13 +242,68 @@ def test_both_visibility_flags_is_a_usage_error(tmp_path):
     assert not (repo / ".github").exists()
 
 
+@pytest.mark.parametrize("flag", ["--visibility=private", "--visibility=internal", "--internal"])
+def test_unknown_flag_is_a_usage_error(tmp_path, flag):
+    repo = target_repo(tmp_path)
+    proc = install(repo, flag, "--no-gh")
+    assert proc.returncode == 2 and "Usage:" in proc.stderr
+    assert not (repo / ".github").exists()
+
+
 def test_installer_substitutes_only_the_register_predicate():
-    """install.sh's CANON_RUNS_ON must be the register's SC-37 text, so a public
-    copy loses exactly the canonical predicate and nothing else."""
+    """install.sh's CANON_RUNS_ON must be the register's guarded SC-37 text, so
+    a public copy loses exactly that predicate and nothing else."""
     text = INSTALL.read_text(encoding="utf-8")
     m = re.search(r'^CANON_RUNS_ON="runs-on: \\\$\{\{ (.*?) \}\}"$', text, re.M)
     assert m, "CANON_RUNS_ON not found in install.sh"
     assert m.group(1).replace('\\"', '"') == canonical_predicate()
+    m = re.search(r'^TOGGLE_RUNS_ON="runs-on: \\(\$\{\{ .*? \}\})"$', text, re.M)
+    assert m and m.group(1) == DEP_TOGGLE, "TOGGLE_RUNS_ON is not dep-auto-apply's toggle"
     for template in PR_TEMPLATES.values():
         for line in runs_on_lines(template.read_text(encoding="utf-8")):
             assert line == "runs-on: ${{ " + canonical_predicate() + " }}", (template.name, line)
+    for line in runs_on_lines(DEP_TEMPLATE.read_text(encoding="utf-8")):
+        assert line == "runs-on: " + DEP_TOGGLE, line
+
+
+def install_with_gh(tmp_path: Path, repo: Path, private: str, *flags: str) -> subprocess.CompletedProcess[str]:
+    """install.sh with a fake `gh` first on PATH that reports the origin repo's
+    `private` as <private> and fails every other call (variables unset,
+    registrar config unreadable). The target gets a github.com origin."""
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text("#!/usr/bin/env bash\n"
+                  'if [ "$1" = api ] && [ "$2" = repos/o/r ]; then printf \'%s\\tr\\to\\n\' ' + private + "; exit 0; fi\n"
+                  'echo "gh: HTTP 404" >&2; exit 1\n', encoding="utf-8", newline="\n")
+    gh.chmod(0o755)
+    git_dir = Path(shutil.which("git")).resolve().parent
+    env = {**os.environ, "PATH": f"{bash_path(bindir)}:{bash_path(git_dir)}:/usr/bin:/bin"}
+    return subprocess.run([BASH, INSTALL.as_posix(), *flags, repo.as_posix()], capture_output=True, text=True, env=env)
+
+
+@pytest.mark.parametrize("private,flag", [("false", "--private"), ("true", "--public")])
+def test_flag_contradicting_github_is_an_error(tmp_path, private, flag):
+    repo = target_repo(tmp_path)
+    proc = install_with_gh(tmp_path, repo, private, flag)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "contradicts GitHub" in proc.stderr and "nothing installed" in proc.stderr
+    assert not (repo / ".github").exists() and not (repo / ".githooks").exists(), \
+        "nothing may be written before visibility is settled"
+    assert subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath"],
+                          capture_output=True, text=True).returncode != 0
+
+
+@pytest.mark.parametrize("private,want_hosted", [("false", True), ("true", False)])
+def test_github_answer_decides_without_a_flag(tmp_path, private, want_hosted):
+    repo = target_repo(tmp_path)
+    proc = install_with_gh(tmp_path, repo, private)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    if want_hosted:
+        assert_hosted_install(repo)
+        assert "CI runner (public repository):" in proc.stdout
+    else:
+        for name, template in ALL_TEMPLATES.items():
+            assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
+        assert "CI runner (private repository)" in proc.stdout
