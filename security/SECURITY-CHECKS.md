@@ -828,6 +828,89 @@ workflows and refs, or no self-hosted runner on the repo.
 
 ---
 
+### SC-47 · A security mode read from the environment whose absent or empty value selects the permissive setting
+**Shape.** `MODE = process.env.X_MODE || 'warn'`, `${X_MODE:-warn}`, or a
+parser that maps unset or empty to the lenient branch, for any variable that
+chooses between warn/enforce, off/on, allow/deny, report/block. A redeploy that
+drops the env line silently lowers enforcement, and the environment can lower
+what the code would otherwise enforce. infra 2026-10-29: alertmanager-ntfy
+`auth.js` mapped an unset `WEBHOOK_AUTH_MODE` to `warn` while the compose file
+set `warn`; 15 unauthenticated accepts in 48h.
+**Check.** Grep: `process\.env\.[A-Z_]*MODE[^;]*\|\|\s*['"](warn|off|allow|permissive|report)`
+and `\$\{[A-Z_]*MODE:-(warn|off|allow|report)\}`. Mechanical test: unset the
+variable and assert the strictest mode is selected; an unknown value refuses to
+start rather than falling back.
+**Fix form.** Strict default in code; the environment may only escalate (or the
+lenient mode is removed once the migration ends). Ship a warn mode only with the
+counterpart wired in the same change and a dated flip commitment (STANDARDS.md
+§4 "Warn-mode ships").
+**Since.** 2026-10-29.
+**Origin.** audit-infra-2026-10-29 (MEDIUM; proposed there as SC-43, renumbered
+because SC-43..SC-46 were already graduated; approved by Ron 2026-10-29).
+
+### SC-48 · A control-plane or observability service routed by the edge proxy with no authentication and no source allow-list
+**Shape.** A reverse-proxy router (a Traefik `traefik.http.routers.<r>.rule`
+label, or a file-provider router) in front of a service that has no login of
+its own (Alertmanager, Prometheus, exporters, admin APIs), with no middleware
+that is an ipAllowList, basicAuth or forwardAuth (directly or through a chain).
+Labels copied from a stack whose app authenticates itself carry the gap with
+them. infra 2026-10-29: Prometheus and Alertmanager routed on `web,websecure`
+with no middleware; any LAN, tailnet or edge-network peer could silence every
+alert.
+**Check.** Mechanical: every router resolves to an access-control middleware or
+sits on an explicit public list that names why the backend is safe, and a list
+entry whose router no longer exists fails (infra `traefik/test-router-access.py`;
+nexus-deploy 0.3.0 refuses a restricted stack's router without a stack
+ipallowlist). Boundary test: an unauthenticated request with the router's Host
+header from a non-allow-listed source returns 401/403, never 200.
+**Fix form.** Default-deny at the proxy: allow-list plus authentication on every
+router unless a reviewed opt-out says the backend authenticates every request.
+Keep such services off shared proxy networks (a dedicated proxy-only network).
+**Since.** 2026-10-29.
+**Origin.** audit-infra-2026-10-29 (MEDIUM; proposed there as SC-44; approved by
+Ron 2026-10-29).
+
+### SC-49 · Artifact integrity anchored only on references the same writer controls
+**Shape.** A verifier compares an artifact against a digest, SHA256SUMS file,
+release note, sidecar or manifest that was published through the same
+credential and channel as the artifact, with no second-channel anchor (a hash
+pinned in a reviewed repo, or a signature from a key the publishing channel
+does not hold). Whoever can upload the artifact can upload the matching digest.
+infra 2026-10-29: nexus-deploy publish checked GitHub's asset digest and the
+release's SHA256SUMS (both writer-controlled) and installed any asset with no
+sidecar; the Linux runner tarball's SHA was scraped from the same release API.
+**Check.** Grep: `SHA256SUMS|\.digest|/releases/.*/assets|releases/latest` in
+verifier or provisioning code with no adjacent reference to a tracked pin file
+or a signature verification. Mechanical test: alter the artifact AND its
+co-published digest together; the verifier must refuse.
+**Fix form.** Verify a signature from an off-CI key (e.g. `ssh-keygen -Y
+verify` against a pinned allowed_signers file) over a manifest of every
+installed asset, or pin the hash in-repo; fail closed when the anchor is absent.
+**Since.** 2026-10-29.
+**Origin.** audit-infra-2026-10-29 (MEDIUM; proposed there as SC-45; approved by
+Ron 2026-10-29).
+
+### SC-50 · Signing material or long-lived secrets staged on persistent storage and cleaned up by unlink or rmtree on a success-only path
+**Shape.** A PFX, private key, deploy key or token written to a disk-backed path
+(not tmpfs, `/dev/shm` or `/run`), removed with unlink or rmtree rather than
+shredded, and removed only on a path that also needs an unrelated external call
+to succeed, so an error leaves it in place indefinitely and freed blocks keep
+it. infra 2026-10-29: ci_registrar `_make_iso` staged release.json (PFX,
+password, deploy key) and the ISO on disk; the only deletion ran after a GitHub
+API call succeeded.
+**Check.** Grep: writes of `pfx|private_key|deploy_key|secret|token` material
+outside `/dev/shm|/run|tmpfs` paths, and `rmtree|unlink|os\.remove` on those
+paths. Mechanical test: fail the external call after staging and assert the
+secret file is gone; assert the staging directory is on tmpfs.
+**Fix form.** Stage on tmpfs; shred when the owning ledger entry closes
+(delivered, aborted or finished) independent of any external call; prefer an
+agent (ssh-agent, op) so the key never reaches a file at all.
+**Since.** 2026-10-29.
+**Origin.** audit-infra-2026-10-29 (LOW latent; proposed there as SC-46;
+approved by Ron 2026-10-29).
+
+---
+
 ## Proposed additions (from the routine audit; operator approval required)
 
 _None pending._ Audits append proposals here in the format above with a
@@ -840,7 +923,9 @@ SC-35..SC-38 (audit-pdfmanager-2026-10-08, proposed there as SC-32..SC-35
 and renumbered because those numbers were already graduated), approved
 2026-10-09. SC-39..SC-42 (audit-patriot-provisioning-2026-10-10), approved
 2026-10-10. SC-43..SC-46 (audit-sentinel-2026-10-26), approved
-2026-10-26. SC-37 amended 2026-10-27 (same-repo pull requests on
+2026-10-26. SC-47..SC-50 (audit-infra-2026-10-29, proposed there as
+SC-43..SC-46 and renumbered because those numbers were already graduated),
+approved 2026-10-29. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.

@@ -52,7 +52,7 @@ The shared-brain at `https://shared-brain.us` is the system of record for cross-
 - T1.6 Sub-agent dispatch: supervisor recalls, hands findings to agent as context — agents do NOT recall independently unless their mission is research
 - T1.7 Session end: supervisor synthesizes, writes `[REMEMBER]:` markers — never the agents
 
-**Sub-agent vs supervisor save responsibility.** Sub-agents return findings to the supervisor. Only the supervisor writes `[REMEMBER]:` markers, after synthesis. This prevents three agents writing three contradictory memories about the same finding.
+**Sub-agent vs supervisor save responsibility.** Sub-agents return findings to the supervisor. Only the supervisor writes `[REMEMBER]:` markers, after synthesis. This prevents three agents writing three contradictory memories about the same finding. One exception: a discovered-issue agent stores its own outcome (§14.2).
 
 **Conflict resolution.** When `recall` returns contradictory memories: newest wins by default, but always surface the conflict to Ron explicitly. Never silently overwrite. Old memory gets a `superseded_by:<new_id>` tag, never deleted (per `feedback_data_preservation`).
 
@@ -78,7 +78,7 @@ Every Ron-owned repo, before it can be release-piloted via dev-standards reusabl
 
 **`.gitleaks.toml` shape:** extends dev-standards' base config (with anchors for Ron-specific patterns: `ron-mcp-api-key`, `ron-brain-pg-password`, etc.); per-repo `[allowlist]` block only for genuine false-positives (test fixtures, public sample keys), each entry commented with the why.
 
-**Pre-commit installation:** clone dev-standards (`main`) and run `./install.sh /path/to/repo`. There is no curl one-liner: `install.sh` copies `hooks/`, `workflows/`, `templates/` and `security/` from its own checkout, so a piped script has nothing to copy (the former `.../v1/install.sh` one-liner never worked and was removed 2026-09-11). The `v1` tag is for the reusable release workflows (`release-gates.yml@v1`, moved by `promote-canary.yml`), not for onboarding. Idempotent. Currently installs: `.githooks/commit-msg` (conventional subject + attribution scrub, always overwritten) + `.githooks/pre-commit` (dispatcher) + `pre-commit-secret-scan.sh` (gitleaks staged-diff) + `pre-commit-size-guard.sh` (10 MB ceiling) + `pre-commit-healthcheck-lint.sh` + `pre-commit-tests.sh`. Sets `core.hooksPath=.githooks`. Version-bump-reminder hook is a TO-BE addition (IMPL-2).
+**Pre-commit installation:** clone dev-standards (`main`) and run `./install.sh /path/to/repo`. There is no curl one-liner: `install.sh` copies `hooks/`, `workflows/`, `templates/` and `security/` from its own checkout, so a piped script has nothing to copy (the former `.../v1/install.sh` one-liner never worked and was removed 2026-09-11). The `v1` tag is for the reusable release workflows (`release-gates.yml@v1`, moved by `promote-canary.yml`), not for onboarding. Idempotent. Currently installs: `.githooks/commit-msg` (conventional subject + attribution scrub, always overwritten) + `.githooks/pre-commit` (dispatcher) + `pre-commit-secret-scan.sh` (gitleaks staged-diff) + `pre-commit-size-guard.sh` (10 MB ceiling) + `pre-commit-healthcheck-lint.sh` + `pre-commit-tests.sh`. Sets `core.hooksPath=.githooks`. `pre-commit-tests.sh` runs only what the repo declares in `.pre-commit-tests` (parsed, never sourced): `TEST_CMD` (required), `TEST_TIMEOUT` (seconds, default 300; a timeout fails the commit), `TEST_PATHS` (`|`-separated globs gating when the suite runs) and `TEST_CLEANUP_CMD` (optional; runs after the suite on every outcome, including a timeout kill, bounded at 120 s, and a non-zero exit fails the commit). The hook also snapshots the tree before and after the suite: each tracked file's work-tree difference from the index, each staged difference from HEAD, and the list of untracked, non-ignored files. The commit fails, naming the paths, whatever the suite's verdict, if the run changed a tracked file (edited, deleted, restored, or edited and staged) or created a new untracked file. State already there before the hook ran (unstaged edits, staged changes, untracked files) does not trip it, nor does a pre-existing untracked file the suite rewrites or removes; ignored files are never examined, so caches a suite legitimately leaves behind belong in `.gitignore` (truck-mcp PR #12, discovery a7a155d8). Version-bump-reminder hook is a TO-BE addition (IMPL-2).
 
 **Conventional commits:** `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `security:`, `build:`, `ci:`, with optional `(scope)` and breaking `!` per the Conventional Commits spec (`chore(deps):` from Dependabot is valid). Enforced locally by `hooks/commit-msg` (block). Enforcement plan for the server side: PR titles via GitHub branch ruleset; CI gate on protected branches (block).
 
@@ -167,10 +167,20 @@ dev-standards exposes gates in two layers:
 
 **CI runner policy (decided from the OpenSSF Scorecard / GitHub Actions hardening guidance, ratified 2026-10-11):**
 
-- A fork `pull_request` job runs only on GitHub-hosted runners, never on a self-hosted or `nexus-ci` runner. A same-repo `pull_request` in a private repository may run on the ephemeral `nexus-ci` runner (register SC-37 as amended 2026-10-27); no `pull_request` job ever sees a secret, and its code stays untrusted wherever it runs. Fork pull requests use `pull_request`, never `pull_request_target`; first-time contributors need approval before any workflow runs (repository setting "Require approval for all outside collaborators").
-- Variables may select a runner (`runs-on: ${{ vars.CI_RUNNER }}`) only on `push` to a protected branch, `schedule`, `workflow_dispatch` and `workflow_call` reached from those events (register SC-37). The `nexus-ci` registrar additionally refuses public repositories, so a template that reaches a public repo must carry the hosted literal. The fleet templates toggle only between the literals `nexus-ci` (private repo, allow-listed event, `vars.CI_RUNNER == 'nexus-ci'`) and `ubuntu-latest`, never passing the variable through; `install.sh` rewrites every variable-selected `runs-on` to `ubuntu-latest` unless the target is confirmed private (`--visibility=private` or `gh repo view`), so a public or unconfirmed repo gets the hosted literal (audit-dev-standards-2026-10-27). Re-run the installer after a visibility change.
+- A `pull_request` job never sees a secret. A fork pull request runs only on GitHub-hosted runners, never on a self-hosted or `nexus-ci` runner; a same-repo pull request in a private repository served by ci-registrar >= 0.4.1 may run on `nexus-ci` (amended 2026-10-27 by Ron, decision `68d983a4`, register SC-37 amendment `288e5d95`), where `TRUSTED_EVENT` stays false so no PR-controlled code runs. Fork pull requests use `pull_request`, never `pull_request_target`; first-time contributors need approval before any workflow runs (repository setting "Require approval for all outside collaborators").
+- Variables may select a runner only through the canonical SC-37 predicate, verbatim: `(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest'`. The fleet templates (`workflows/size-guard.yml`, `templates/.github/workflows/security-audit.yml`) carry its guarded form (audit-dev-standards-2026-10-27; register SC-37 amendment PROPOSED on dev-standards #62, pending Ron's approval): the same allow-list, then `&& github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'`, so the variable only toggles between the literals `nexus-ci` and `ubuntu-latest` (it never names another label) and a public repo always resolves to the hosted literal; `templates/.github/workflows/dep-auto-apply.yml` (schedule and `workflow_dispatch` only) carries the same private-only literal toggle without the event allow-list. The `nexus-ci` registrar refuses public repositories, so a template that reaches a public repo carries the hosted literal: `install.sh` settles the target's visibility before it writes anything. GitHub's answer wins, and a `--private`/`--public` that contradicts it is an error, never an override; without GitHub's answer the flag decides; with neither, the target is unconfirmed and treated as public. A public or unconfirmed repo's copy gets `runs-on: ubuntu-latest` in all three workflows, which is also what dev-standards (public) carries in its own `size-guard.yml` and `security-audit.yml` under `.github/workflows/`. Re-run the installer after a visibility change.
+- New-repo onboarding to `nexus-ci`: for a private repo `install.sh` sets the repo variable `CI_RUNNER=nexus-ci` when unset and reports whether the repo is mapped in the tracked registrar config (Ohio15/infra `ci-vm/registrar/config.json`). Mapping it there (PR, gate, merge), applying it on NEXUS (`ci-vm/README.md`, apply-config) and adding the repo to the registrar's GitHub App installation stay explicit steps the installer prints; until all three are done the repo's PR jobs ask for `ubuntu-latest`.
 - Production promotion keeps a required reviewer on its environment (separation of duties, NIST SSDF PO.3). With a single maintainer the reviewer is that maintainer plus the immutable deployment log; the control is batched, never dropped.
 - Release signing material is scoped to the signing job alone: an environment secret on a job that runs no build or dependency code, on an ephemeral runner (SLSA Build L3 isolation, NIST SSDF PS.1). A build job never holds a signing key.
+
+**Warn-mode ships (ratified 2026-10-29 by Ron after audit-infra-2026-10-29; register SC-47):** a warn, observe or report mode is a migration step, never a destination. The 2026-10-29 audit found one live twelve days after it shipped, because nothing forced the flip: the receiver's strict side was opt-in and its sender was never wired. A change that ships a warn mode therefore carries, in the same pull request:
+
+- **The strict default in code.** An absent or empty mode variable selects enforce. The environment may only escalate; a value the code does not know refuses to start.
+- **The counterpart wired.** Whatever makes enforce safe to turn on (the sender that carries the credential, the client that sends the header, the data that satisfies the new check) lands in the same PR or is already deployed. A warn mode whose counterpart does not exist yet is not shippable.
+- **A dated flip commitment.** A work-queue item tagged `flip-<VARIABLE>` with a `due_at`, naming the evidence that ends the migration (for example "zero unauthenticated accepts across one repeat_interval"). Past its `due_at`, the warn state is a failing health check (an alert, not a log line), so the flip cannot be forgotten quietly.
+- **Removal at the flip.** Once enforce is live, the lenient mode is removed unless a documented need keeps it. A mode the environment can still select is a mode that can come back.
+
+TO-BE: the per-session security gate reports a change that introduces a permissive `*_MODE` default without an open `flip-<var>` commitment (cortex-hooks `security-gate`, warn tier first). Until it ships, SC-47's grep is the gate's check.
 
 **Release-time gates (`release-gates.yml`, called by every surface workflow):**
 
@@ -561,6 +571,101 @@ Findings are advisory until the gate flips; Ron triages weekly with the rest of 
 | all other repos | not yet assessed | | | | | | |
 
 First actions: AIWebBrowser `docs/RELEASE.md` from the runbook; confirm the signing key's 1Password item; restore Actions billing or move the release workflow to the self-hosted `nexus-ci` runner. Assess the remaining repos in the first weekly hygiene scan after IMPL-34 lands.
+
+## 14. Discovered-Issue Triage
+
+**Ratified 2026-10-16 (Ron):** "Make this flow standard across all sessions: discovered issues are assigned an agent to resolve and logged to shared-brain independently." Decision memory `7f366ca7`.
+
+**Amended 2026-10-28 (Ron):** the work queue was ratified ("plan B is the plan", then "good to ship" after mockup v2), decision memory `52817d26`. A discovered issue now goes to the work-queue **Inbox** by default. Only three triggers still get it a dedicated agent. Agent-per-discovery made breadth the default: sessions grew past their objective one discovery at a time. The queue keeps the evidence and leaves the order to Ron.
+
+**Motivating case (AIBrowser MCP, 2026-10-16):** during an Apple Business store task, AIBrowser's MCP could not read a cross-origin iframe. Fixing the browser inline would have derailed the purchase task. Noting the gap and moving on would have left a capability gap as a wall, against the build-option rule. The right move was to record the gap, put it where it gets fixed, and carry on.
+
+**Rule:** a **discovered issue** is a defect, tooling or capability gap, or blocker found while working on something else, outside the primary task's own diff. In the same turn it is found, the discovering session:
+
+1. logs it to shared-brain with its evidence;
+2. files it to the work-queue Inbox with that evidence, its line of business, its kind and its severity (§14.5);
+3. tells Ron one line: the issue, where it was filed, and its severity.
+
+It then continues the primary task without fixing the issue inline or waiting for permission.
+
+The issue gets its **own dedicated background agent ONLY if** one of these holds:
+
+- it **blocks the current session objective** (§15);
+- it is a **security finding rated HIGH or worse** (unrated security counts as HIGH, §14.5);
+- it is a **live production break**.
+
+Everything else waits in the Inbox until Ron ranks it.
+
+### 14.1 The discovery (discovering session)
+
+1. `brain_recall` the issue. If an open discovery, Inbox item or assigned agent already exists, `reinforce` it with the new evidence and stop there. One item and at most one agent per issue.
+2. `brain_store` (remember): the issue, the evidence (error text, file:line, repro), where it was found, an explicit `domain`, the tag `discovered-issue` and the owning project.
+3. File it: `brain_commitments add` with `kind: issue`, `lob` (`patriot`, `sentinel`, `nexus-infra`, `cortex-brain`, `truck`, `personal-apps` or `unsorted`), `severity` + `severity_reason` from §14.5, `security` (true/false), and `evidence` naming the discovery memory id. Session-filed items land on the board as `queued`; extractor-sourced items always land in `inbox`.
+4. Only if an agent trigger above holds: launch a background agent with full context, scope, constraints, acceptance criteria, the discovery memory id and the Inbox item id. Implementation goes to `lead-engineer` (Opus); investigation, diagnosis or review goes to a Sonnet agent. Name the trigger in the one-line notice to Ron.
+
+### 14.2 The resolution (resolving agent, when one is assigned)
+
+- The agent `brain_store`s its own outcome (fixed, build proposal, or blocked on Ron) in the **same domain** as the discovery, cites the discovery id, and updates the Inbox item. That is the "independently" in the rule: two writes by two writers, at discovery time and at resolution time. Neither waits for the other or for the end of the session. The supervisor references the outcome and doesn't store a second copy. This is the one exception to the §1 rule that only the supervisor writes. A discovered-issue agent owns a distinct finding, linked by id and domain, so it can't produce competing memories about one finding.
+- **Scope is the issue only.** The agent doesn't widen the primary task. It stops and surfaces anything outward-facing (email, posts, purchases, third-party changes), destructive, or needing Ron's decision. If the fix needs a new service, new infra or an architecture call, the deliverable is a Rigor-format build proposal stored to the brain, not the build.
+- **Every other floor binds the agent:** §2 workspace layout (worktrees in `D:\Worktrees`), branch + version bump + commit/push (never to a default branch, never forced), the Ohio15 default and PatriotCompanies allow-list, the security review model (`/security-gate` for auth, credential and mutation surfaces; the audit before a flag flip), §11 rotation for a leaked secret, and UAC for elevation.
+
+### 14.3 Interaction with other rules
+
+| Rule | How §14 applies it |
+|------|--------------------|
+| Capability gap = build option | The build option is filed as a queue item. It runs now only on an agent trigger, otherwise when Ron ranks it. |
+| Resolve unknowns as they arise | Unknowns about the **current objective** are still resolved now. A discovered issue is resolved by filing it with its evidence, so nothing is lost, and it is worked in Ron's order. |
+| Don't over-extend scope | Filing instead of launching is the boundary. An agent, when there is one, fixes the issue, never the primary task's scope. |
+| Session objective (§15) | "Blocks the current session objective" is the first agent trigger. A session declares no objective it could stretch to absorb discoveries. |
+| Deferred follow-up (reminder + notification) | A queue item is the self-reminder for an issue. If an assigned agent can't finish in-session or its fix needs a later re-check: `brain_commitments` with a `due_at`, a scheduled trigger, and an n3xus-notify. An open discovery at session end goes into the handoff brief by memory id. |
+| Fan-out is warn-only | No cap. The DR-010 notice asks whether each further agent serves the declared objective or a queue item Ron ranked, and points to the Inbox otherwise. |
+| SPEND line | When an assigned agent's issue feeds a recommendation or plan, the agent's cost goes in its `SPEND:`. |
+| Blocking issues | A blocker of the current objective gets its agent. The main session works the unblocked parts, then waits on the agent's result. |
+
+### 14.4 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Session rule in global `CLAUDE.md` + framework `feedback_discovered-issue-agents.md` | every AI session | ACTIVE 2026-10-16, amended 2026-10-28 |
+| cortex-hooks decision register row DR-032, tier `norm`. Whether something counts as a discovered issue, and which trigger it meets, is a judgement of intent; no tool boundary carries it. Audit signals: a discovered-issue memory with no Inbox item citing it; an agent launched for a discovery that meets no trigger; an agent-launched discovery with no outcome memory. | journal + routine audit | ACTIVE 2026-10-16, amended 2026-10-28 (cortex-hooks v0.91.0) |
+| cortex-hooks DR-010 fan-out notice asks the objective / ranked-queue question at each 12th launch, warn tier | every AI session | ACTIVE 2026-10-28 (cortex-hooks v0.91.0) |
+
+### 14.5 Severity rubric and SLA
+
+The filing session sets the severity from this rubric and cites the evidence in `severity_reason`. The first rule that matches wins:
+
+| Condition | Severity |
+|-----------|----------|
+| Security item | The finding's own rating (security-gate / audit CRITICAL, HIGH, MEDIUM, LOW). **Unrated security → `high`** until rated. |
+| Production break or data-loss risk | `high` |
+| Blocks a merge, deploy, release or gate | `medium` |
+| Otherwise | `low` |
+
+**SLA** from the item's `created_at`: critical **7 days**, high **30 days**, medium **90 days**, low **none**. It is computed at read time (`sla_due_at`), never stored.
+
+**Order on the board:** items Ron has ranked come first, in his order. Then severity, then overdue, then due date, then age. **Ron's rank always beats severity.** Ron may change a severity only with a recorded reason (`severity_source: ron`). **P0-P3 is not used.**
+
+## 15. Session Objective
+
+**Ratified 2026-10-28 (Ron):** "Every session declares an objective and its done criteria in the first response and stops once they are met." Decision memory `52817d26`, superseding proposal `77a3272c`.
+
+**Why:** runaway sessions were rarely one bad step. They were a sequence of reasonable next steps with no declared finish line. A finish line written down in the first response gives the session, the fan-out notice and Ron something to measure against.
+
+**Rule:**
+
+1. **Declare.** Every session states its **objective** and its **"done when" criteria** in its first response.
+2. **Done means:** green, committed, version bumped, deployed and verified at the observable boundary, and the work queue updated. Criteria that cannot apply say why (for example, a docs-only repo has no deploy).
+3. **Record.** The session records both with the MCP action `brain_commitments objective_set` and records progress with `objective_update`.
+4. **Stop.** The session stops when the criteria are met. More work comes from **Ron ranking the board** (`brain_commitments next` lists the top queued items), not from what the session found along the way. Those findings go to the Inbox under §14.
+5. **Continuing sessions.** A resumed or compacted session restates its declared objective and its open criteria before further work. If it had none, it declares one then.
+
+### 15.1 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Session rule in global `CLAUDE.md` | every AI session | ACTIVE 2026-10-28 |
+| cortex-hooks SessionStart nudge (`hooks/session-objective-core.ts`, a priority-0 bootstrap block on both bootstrap paths) | every AI session | ACTIVE 2026-10-28 (cortex-hooks v0.91.0) |
+| cortex-hooks decision register row DR-036, tier `norm` (whether a response states an objective is prose; whether a launch serves it is intent). Audit signal: a session with no `session_objectives` row, or one that kept working after its row went `met`. | journal + routine audit | ACTIVE 2026-10-28 |
 
 ---
 

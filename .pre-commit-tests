@@ -1,10 +1,11 @@
 # Parsed (never sourced) by .githooks/pre-commit-tests.sh. Keys: TEST_CMD,
-# TEST_TIMEOUT, TEST_PATHS. Scoped to the docker-release helper-mode guard
-# (PR #38, SC-14): the full scripts/tests suite is not gated here because it
-# is red on main (test_action_pins: version comment above a pin, 5 cases).
-# Also gates hooks/pre-commit-tests.sh itself with its GIT_* strip test
-# (shared-brain 05d9bff3). `python` first: on Windows `python3` is often the
+# TEST_TIMEOUT, TEST_PATHS, TEST_CLEANUP_CMD (not needed here). Scoped to the
+# docker-release helper-mode guard (PR #38, SC-14): the full scripts/tests
+# suite is not gated here because it is red on main (test_action_pins: version
+# comment above a pin, 5 cases). Also gates hooks/pre-commit-tests.sh itself
+# with its GIT_* strip test (shared-brain 05d9bff3) and its cleanup/tree-check
+# test (discovery a7a155d8). `python` first: on Windows `python3` is often the
 # Store stub.
-TEST_CMD=py="$(command -v python || command -v python3)"; "$py" -m pytest scripts/tests/test_docker_release_helper.py scripts/tests/test_pre_commit_tests_env.py -q
+TEST_CMD=py="$(command -v python || command -v python3)"; "$py" -m pytest scripts/tests/test_docker_release_helper.py scripts/tests/test_pre_commit_tests_env.py scripts/tests/test_pre_commit_tests_tree_check.py -q
 TEST_TIMEOUT=300
-TEST_PATHS=.github/workflows/docker-release.yml|scripts/tests/test_docker_release_helper.py|.pre-commit-tests|hooks/pre-commit-tests.sh|.githooks/pre-commit-tests.sh|scripts/tests/test_pre_commit_tests_env.py
+TEST_PATHS=.github/workflows/docker-release.yml|scripts/tests/test_docker_release_helper.py|.pre-commit-tests|hooks/pre-commit-tests.sh|.githooks/pre-commit-tests.sh|scripts/tests/test_pre_commit_tests_env.py|scripts/tests/test_pre_commit_tests_tree_check.py

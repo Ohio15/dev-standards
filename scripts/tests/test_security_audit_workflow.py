@@ -531,11 +531,28 @@ def test_no_run_step_exits_zero_on_a_skip():
             assert not re.search(r"skipping\"?\s*\n\s*exit 0", body), f"{name}: a skip exits 0"
 
 
-RUNNER_PRED = ("${{ (github.event_name == 'push' || github.event_name == 'schedule' || "
-               "github.event_name == 'workflow_dispatch' || github.event_name == 'release' || "
-               "github.event_name == 'merge_group' || github.event_name == 'pull_request' && "
-               "github.event.pull_request.head.repo.full_name == github.repository) && "
-               "github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}")
+REGISTER = ROOT / "security" / "SECURITY-CHECKS.md"
+
+
+def _sc37_predicates() -> list[str]:
+    """Every backticked Linux predicate in the register's SC-37 entry, in
+    order, so the templates cannot drift from the register independently of
+    the tests."""
+    sc37 = REGISTER.read_text(encoding="utf-8").split("### SC-37", 1)[1].split("\n### ", 1)[0]
+    found = re.findall(r"`(\(github\.event_name == 'push'.*?\|\| 'ubuntu-latest')`", sc37, re.S)
+    assert found, "SC-37 canonical predicate not found in the register"
+    return [" ".join(p.split()) for p in found]
+
+
+# The 2026-10-27 amended allow-list form (variable tail), and the guarded
+# literal toggle the fleet templates carry (audit-dev-standards-2026-10-27;
+# register amendment PROPOSED on #62).
+CANONICAL_PREDICATE = _sc37_predicates()[0]
+[GUARDED_PREDICATE] = [p for p in _sc37_predicates()
+                       if p.endswith("&& github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'")]
+RUNNER_PRED = "${{ " + GUARDED_PREDICATE + " }}"
+CANON_RUNS_ON = "runs-on: " + RUNNER_PRED
+HOSTED_RUNS_ON = "runs-on: ubuntu-latest"
 
 
 def hosted_variant(text: str) -> str:
@@ -545,7 +562,7 @@ def hosted_variant(text: str) -> str:
     through this here: dev-standards' own copy equals its template byte for
     byte and keeps the variable-guarded toggle on its three jobs, which is
     inert in a public repo and not pull_request-reachable (asserted below)."""
-    return text.replace("runs-on: " + RUNNER_PRED, "runs-on: ubuntu-latest")
+    return text.replace(CANON_RUNS_ON, HOSTED_RUNS_ON)
 
 
 def test_own_dep_auto_apply_runner_is_guarded_and_not_pr_reachable():
@@ -558,10 +575,15 @@ def test_own_dep_auto_apply_runner_is_guarded_and_not_pr_reachable():
 
 
 def test_dev_standards_own_copy_matches_the_template():
-    # This repo is public: its own copy is the template with the hosted literal
-    # (audit 2026-10-27 LOW, SC-37: no variable-selected runner in a public repo).
+    """dev-standards is a public repository, so its own copy is the template
+    with the hosted literal where the template carries the guarded SC-37
+    predicate (exactly what install.sh writes for a public target) and nothing
+    else different (audit 2026-10-27 LOW: no variable-selected runner in a
+    public repo)."""
+    template = TEMPLATE.read_text(encoding="utf-8")
+    assert CANON_RUNS_ON in template
     own = OWN_COPY.read_text(encoding="utf-8")
-    assert own == hosted_variant(TEMPLATE.read_text(encoding="utf-8"))
+    assert own == hosted_variant(template)
     assert not re.search(r"runs-on:.*vars\.", own)
 
 
@@ -676,15 +698,21 @@ def test_install_refuses_an_unknown_yarn_lockfile(tmp_path, shim_path):
 
 
 # ─── runner and trust (audit-dev-standards-2026-10-10 HIGH 3; SC-37, SC-13) ──
-# A repo variable may choose the runner only on a trusted event, and on an
-# untrusted one (pull_request) no PR-controlled code runs. The runs-on
-# expression is EVALUATED here with Actions' operand-returning &&/|| rules,
-# for every job a pull_request reaches, with CI_RUNNER set to a self-hosted
-# label: none may resolve to it.
+# SC-37 as amended 2026-10-27 (same-repo pull requests on nexus-ci): a repo
+# variable may choose the runner only through the canonical allow-list
+# predicate, verbatim, which lets push, schedule, workflow_dispatch, release,
+# merge_group and a SAME-REPO pull_request run on CI_RUNNER and sends every
+# other event (a fork pull_request, pull_request_target, workflow_run,
+# issue_comment, ...) to the hosted literal. Trust is separate: TRUSTED_EVENT
+# is false on every pull_request, whichever runner it lands on, so no
+# PR-controlled code runs there. The runs-on expression is EVALUATED here with
+# Actions' operand-returning &&/|| rules for every job a pull_request reaches.
+# dev-standards itself is public, so its own copies carry the hosted literal.
 
 import json
 
-SIZE_GUARD_COPIES = [ROOT / "workflows" / "size-guard.yml", ROOT / ".github" / "workflows" / "size-guard.yml"]
+SIZE_GUARD_TEMPLATE = ROOT / "workflows" / "size-guard.yml"
+SIZE_GUARD_OWN_COPY = ROOT / ".github" / "workflows" / "size-guard.yml"
 
 
 def triggers(wf: dict) -> set[str]:
@@ -786,8 +814,8 @@ def eval_expr(text: str, ctx: dict):
     return out
 
 
-def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci", private: bool = True,
-            head_repo: str = "o/r"):
+def resolve(expr, event: str, ref: str, head_repo: str = "", ci_runner: str = "nexus-ci",
+            private: bool = True):
     if not isinstance(expr, str) or "${{" not in expr:
         return expr
     m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
@@ -795,16 +823,35 @@ def resolve(expr, event: str, ref: str, ci_runner: str = "nexus-ci", private: bo
     return eval_expr(m.group(1), {
         "github.event_name": event, "github.ref": ref,
         "github.event.repository.default_branch": "main", "vars.CI_RUNNER": ci_runner,
-        "github.event.repository.private": private, "github.repository": "o/r",
-        "github.event.pull_request.head.repo.full_name": head_repo if event == "pull_request" else "",
+        "github.event.repository.private": private, "github.repository": "Ohio15/some-repo",
+        "github.event.pull_request.head.repo.full_name": head_repo,
     })
 
 
-UNTRUSTED = [("pull_request", "refs/pull/7/merge"), ("pull_request_target", "refs/heads/main"),
-             ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7"), ("release", "refs/tags/v1"),
-             ("push", "refs/heads/feature"), ("push", "refs/heads/master"), ("push", "refs/tags/v1"),
-             ("workflow_dispatch", "refs/heads/feature")]
-TRUSTED = [("schedule", "refs/heads/main"), ("push", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main")]
+# (event, ref, head_repo). head_repo is the PR head's repository; "" when the
+# event carries no pull_request payload.
+SAME_REPO = "Ohio15/some-repo"
+FORK = "someone-else/some-repo"
+# Events the predicate must send to the hosted literal whatever CI_RUNNER holds.
+HOSTED_ONLY = [("pull_request", "refs/pull/7/merge", FORK),
+               ("pull_request_target", "refs/heads/main", SAME_REPO),
+               ("pull_request_target", "refs/heads/main", FORK),
+               ("workflow_run", "refs/heads/main", ""), ("issue_comment", "refs/heads/main", ""),
+               ("repository_dispatch", "refs/heads/main", ""), ("check_run", "refs/heads/main", "")]
+# Events the predicate lets CI_RUNNER serve (the registrar is the control that
+# refuses what it should not serve).
+ALLOW_LISTED = [("pull_request", "refs/pull/7/merge", SAME_REPO),
+                ("push", "refs/heads/main", ""), ("push", "refs/heads/feature", ""), ("push", "refs/tags/v1", ""),
+                ("schedule", "refs/heads/main", ""), ("workflow_dispatch", "refs/heads/feature", ""),
+                ("release", "refs/tags/v1", ""), ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7", "")]
+# TRUSTED_EVENT: only merged code on the default branch is trusted.
+UNTRUSTED = [("pull_request", "refs/pull/7/merge", SAME_REPO), ("pull_request", "refs/pull/7/merge", FORK),
+             ("pull_request_target", "refs/heads/main", FORK),
+             ("merge_group", "refs/heads/gh-readonly-queue/main/pr-7", ""), ("release", "refs/tags/v1", ""),
+             ("push", "refs/heads/feature", ""), ("push", "refs/heads/master", ""), ("push", "refs/tags/v1", ""),
+             ("workflow_dispatch", "refs/heads/feature", "")]
+TRUSTED = [("schedule", "refs/heads/main", ""), ("push", "refs/heads/main", ""),
+           ("workflow_dispatch", "refs/heads/main", "")]
 
 
 def test_the_pull_request_workflow_list_is_derived_not_listed():
@@ -823,19 +870,51 @@ NEVER = [("pull_request_target", "refs/heads/main"), ("workflow_run", "refs/head
 
 
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
-def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
+def test_pull_request_jobs_use_the_canonical_predicate_or_the_hosted_literal(path):
+    """Every PR-reachable job: the guarded SC-37 text verbatim (a template)
+    or the hosted literal (dev-standards' own public-repo workflows). Nothing
+    in between, and never a bare label."""
     wf = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert wf["jobs"], "no jobs parsed"
     for name, job in wf["jobs"].items():
+        runs_on = job["runs-on"]
+        if path.parent == ROOT / ".github" / "workflows":
+            assert runs_on == "ubuntu-latest", f"{path.name}:{name}: public repo, hosted literal only ({runs_on!r})"
+        else:
+            assert runs_on == RUNNER_PRED, f"{path.name}:{name} is not the guarded canonical predicate"
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_pull_request_job_runner_resolution(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for name, job in wf["jobs"].items():
+        for event, ref, head in HOSTED_ONLY:
+            got = resolve(job["runs-on"], event, ref, head)
+            assert got == "ubuntu-latest", f"{path.name}:{name} on {event} {ref} from {head!r} runs on {got!r}"
+        if "${{" in str(job["runs-on"]):
+            for event, ref, head in ALLOW_LISTED:
+                assert resolve(job["runs-on"], event, ref, head) == "nexus-ci", (name, event, ref, head)
+                assert resolve(job["runs-on"], event, ref, head, ci_runner="") == "ubuntu-latest", (name, event)
+                # The visibility guard: a public repo never leaves the hosted
+                # literal, whatever CI_RUNNER holds.
+                assert resolve(job["runs-on"], event, ref, head, private=False) == "ubuntu-latest", (name, event)
+
+
+@pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_pull_request_job_runner_matrix(path):
+    """Exhaustive: nexus-ci only for an allow-listed event (a same-repo PR
+    included) in a PRIVATE repo with CI_RUNNER exactly 'nexus-ci'; any other
+    variable value can never name another label."""
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for name, job in wf["jobs"].items():
         expr = job["runs-on"]
-        assert expr == "ubuntu-latest" or expr == RUNNER_PRED, f"{path.name}:{name}: non-canonical runs-on {expr!r}"
         for event in ALLOWED_EVENTS + [e for e, _ in NEVER]:
             for private in (True, False):
                 for var in ("nexus-ci", "", "nexus-deploy", "self-hosted"):
-                    for head in ("o/r", "fork/r"):
-                        got = resolve(expr, event, "refs/heads/main", ci_runner=var, private=private, head_repo=head)
+                    for head in (SAME_REPO, FORK):
+                        got = resolve(expr, event, "refs/heads/main", head, ci_runner=var, private=private)
                         want = ("nexus-ci" if expr != "ubuntu-latest" and private and var == "nexus-ci"
-                                and event in ALLOWED_EVENTS and not (event == "pull_request" and head != "o/r")
+                                and event in ALLOWED_EVENTS and not (event == "pull_request" and head != SAME_REPO)
                                 else "ubuntu-latest")
                         assert got == want, (path.name, name, event, private, var, head, got)
 
@@ -843,18 +922,42 @@ def test_no_pull_request_job_resolves_its_runner_from_a_variable(path):
 def test_every_template_job_carries_the_guarded_predicate():
     for name, job in JOBS.items():
         assert job["runs-on"] == RUNNER_PRED, name
-    sg = yaml.safe_load((ROOT / "workflows" / "size-guard.yml").read_text(encoding="utf-8"))
+    sg = yaml.safe_load(SIZE_GUARD_TEMPLATE.read_text(encoding="utf-8"))
     for name, job in sg["jobs"].items():
         assert job["runs-on"] == RUNNER_PRED, name
 
 
-def test_trusted_event_flag_is_narrower_than_the_runner():
-    # A same-repo PR may run on nexus-ci, but its code stays untrusted.
-    flag = WORKFLOW["env"]["TRUSTED_EVENT"]
-    for event, ref in UNTRUSTED:
-        assert resolve(flag, event, ref) is False, (event, ref)
-    for event, ref in TRUSTED:
-        assert resolve(flag, event, ref) is True, (event, ref)
+def test_guarded_predicate_is_the_register_allow_list_plus_the_guard():
+    """The guarded text keeps the amended SC-37 allow-list token for token and
+    only replaces the variable tail with the private-repo literal toggle."""
+    tail = " && vars.CI_RUNNER || 'ubuntu-latest'"
+    assert CANONICAL_PREDICATE.endswith(tail)
+    assert GUARDED_PREDICATE == CANONICAL_PREDICATE[:-len(tail)] + (
+        " && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest'")
+
+
+@pytest.mark.parametrize("pred", ["CANONICAL_PREDICATE", "GUARDED_PREDICATE"])
+def test_canonical_predicate_is_not_the_refused_short_form(pred):
+    """SC-37 refuses the negated form: it is true for pull_request_target,
+    workflow_run and issue_comment. The canonical text names each event."""
+    text = globals()[pred]
+    assert "!=" not in text and "!(" not in text
+    for event in ("push", "schedule", "workflow_dispatch", "release", "merge_group", "pull_request"):
+        assert f"github.event_name == '{event}'" in text, event
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in text
+
+
+def test_trusted_event_flag_is_false_on_every_pull_request():
+    """Trust is separate from the runner: a same-repo pull_request may land on
+    nexus-ci, and TRUSTED_EVENT must still be false there so no PR-controlled
+    code runs. Only merged code on the default branch is trusted."""
+    for path in (TEMPLATE, OWN_COPY):
+        flag = yaml.safe_load(path.read_text(encoding="utf-8"))["env"]["TRUSTED_EVENT"]
+        for event, ref, head in UNTRUSTED:
+            assert resolve(flag, event, ref, head) is False, (path.name, event, ref, head)
+        for event, ref, head in TRUSTED:
+            assert resolve(flag, event, ref, head) is True, (path.name, event, ref)
+        assert "vars." not in flag, "the trust flag must not depend on a repository variable"
 
 
 @pytest.mark.parametrize("path", PR_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
@@ -890,7 +993,11 @@ def test_no_execute_switches_are_present():
 
 
 def test_size_guard_copies_agree():
-    template, own = (p.read_text(encoding="utf-8") for p in SIZE_GUARD_COPIES)
+    """The own copy is the template with the hosted literal in place of the
+    guarded predicate (public repo), and nothing else different."""
+    template = SIZE_GUARD_TEMPLATE.read_text(encoding="utf-8")
+    assert CANON_RUNS_ON in template
+    own = SIZE_GUARD_OWN_COPY.read_text(encoding="utf-8")
     assert own == hosted_variant(template) and not re.search(r"runs-on:.*vars\.", own)
 
 

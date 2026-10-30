@@ -40,12 +40,14 @@ This replaces the earlier `core.hooksPath = D:/Projects/git-hooks` global model,
 ## Install into a new repo
 
 ```bash
-./install.sh /path/to/target-repo
+./install.sh [--private|--public] [--no-gh] /path/to/target-repo
 cd /path/to/target-repo
-git add .githooks .github/workflows/size-guard.yml .large-files-allowlist .gitleaks.toml SECURITY-CHECKS.md
+git add .githooks .github/workflows .large-files-allowlist .gitleaks.toml SECURITY-CHECKS.md
 git commit -m "ci: install dev-standards guards"
 git push
 ```
+
+The runner the CI workflows ask for follows the target's visibility (register SC-37, `STANDARDS.md` section 4; audit-dev-standards-2026-10-27): a private repo gets the templates verbatim, so its `size-guard.yml` and `security-audit.yml` carry the guarded allow-list predicate (`nexus-ci` only for push, schedule, workflow_dispatch, release, merge_group and a same-repo PR, only when the repo is private and `vars.CI_RUNNER == 'nexus-ci'`; everything else hosted) and `dep-auto-apply.yml` its private-only literal toggle; a public or unconfirmed repo's copies carry `runs-on: ubuntu-latest` in all three, because the `nexus-ci` registrar refuses public repositories. Visibility is settled before anything is written: the installer asks GitHub (`gh api repos/<owner>/<repo>`), refuses a `--private`/`--public` that GitHub contradicts (an error, never an override), takes the flag when GitHub cannot answer, and treats a target it cannot confirm either way as public. For a private repo under the registrar's owner it also sets the repo variable `CI_RUNNER=nexus-ci` when unset and reports whether the repo is mapped in Ohio15/infra `ci-vm/registrar/config.json`; the mapping, its apply on NEXUS and the GitHub App installation stay explicit steps the installer prints. `--no-gh` makes no GitHub call (without `--private` the target is then unconfirmed, so public) and prints the onboarding commands instead. Re-run the installer after a repo changes visibility.
 
 CI workflows are the real enforcement; the local hooks are courtesies that catch mistakes before they leave the developer's machine.
 
@@ -164,7 +166,7 @@ Weekly cron (`Sundays 06:00 UTC`) that auto-**APPLIES** safe fixes itself, runs 
 - Anything bumped + tests fail -> **draft** PR labeled `auto-apply-broken` for human triage. Not auto-closed.
 - Nothing bumped -> exit 0 with a notice and a run summary listing every manifest location declined by policy (yarn, no lockfile, unpinned requirements, pyproject-only, stdlib vulns, go.sum churn).
 - A scanner or package manager could not examine a manifest -> the job FAILS; no PR. Unknown is never reported as "no changes".
-- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root.
+- Detection matches `security-audit.yml`: every tracked manifest in the tree, not just the root, with workspace members folded into the root that declares them. The manifest-detection block between the `# >>> shared manifest detection` and `# <<< shared manifest detection` markers is byte-identical in both workflows; `scripts/tests/test_dep_auto_apply_workflow.py` compares the two, so a change to one fails the suite until the other gets it too. (#57 changed only `security-audit.yml`, and the old spot-string check was the only thing that caught it.) Workspace members folded into a root are listed in the run summary with that root and its result (`npm workspace coverage` step): a member is clean only if the npm step succeeded and its root was not declined and did not fail its tests.
 
 **Enrollment** (per-repo opt-in):
 

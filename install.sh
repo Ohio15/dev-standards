@@ -2,35 +2,62 @@
 # Install the dev-standards guards into a target repo.
 #
 # Usage:
-#   ./install.sh [--visibility=private|public] /path/to/target-repo
-#
-# Runner choice (STANDARDS.md section 4, register SC-37; audit 2026-10-27):
-# the CI templates select the self-hosted `nexus-ci` runner only in a private
-# repo. A copy installed into a PUBLIC repo must carry the hosted literal, so
-# unless the target is confirmed private every variable-selected `runs-on:` in
-# the installed workflows is rewritten to `ubuntu-latest`. Visibility comes
-# from --visibility, else from `gh repo view` on the target's origin; anything
-# unconfirmed counts as public (hosted), the safe direction. Re-run this
-# installer after a repo changes visibility.
+#   ./install.sh [--private|--public] [--no-gh] /path/to/target-repo
 #
 # Wires the chained pre-commit dispatcher plus the size-guard and secret-scan
-# sub-hooks into .githooks/, drops the CI workflow, and seeds default
+# sub-hooks into .githooks/, drops the CI workflows, and seeds default
 # allowlist + gitleaks config files. Does not commit — review and commit
 # yourself.
+#
+# Runner (register SC-37, STANDARDS.md section 4; audit 2026-10-27): the CI
+# templates carry the guarded allow-list predicate, which selects the
+# self-hosted nexus-ci runner only for an allow-listed event (same-repo PRs
+# included) in a PRIVATE repo whose vars.CI_RUNNER is exactly 'nexus-ci', and
+# the hosted literal otherwise. A copy installed into a public repo must carry
+# the hosted literal instead, so the repo's visibility decides what is
+# written. Visibility is resolved before anything is written. GitHub's own
+# answer (`gh api repos/<origin>`), when gh can give one, wins: --private or
+# --public that contradicts it is an ERROR, never an override. Without
+# GitHub's answer the flag decides; with neither, the visibility is
+# unconfirmed and counts as public (hosted literal), the safe direction.
+# Re-run this installer after a repo changes visibility.
+#
+# nexus-ci onboarding (private repos whose owner the ci-registrar serves):
+# with gh available the installer sets the repo variable CI_RUNNER=nexus-ci
+# when it is unset, and reads the tracked registrar config (Ohio15/infra
+# ci-vm/registrar/config.json) to report whether the repo is mapped there.
+# The registrar mapping and its apply on NEXUS are a reviewed infra change, so
+# the installer prints those steps and never performs them. --no-gh skips
+# every GitHub call (without --private the target is then unconfirmed, so
+# public) and prints the commands instead.
 
 set -euo pipefail
 
-visibility=""
-case "${1:-}" in
-  --visibility=private|--visibility=public) visibility="${1#--visibility=}"; shift ;;
-  --visibility=*) echo "ERROR: --visibility must be private or public" >&2; exit 2 ;;
-esac
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 [--visibility=private|public] /path/to/target-repo" >&2
+usage() {
+  echo "Usage: $0 [--private|--public] [--no-gh] /path/to/target-repo" >&2
   exit 2
-fi
+}
 
-target="$1"
+visibility=""
+use_gh=1
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --private|--public)
+      [ -z "$visibility" ] || usage
+      visibility="${1#--}"
+      ;;
+    --no-gh) use_gh=0 ;;
+    -*) usage ;;
+    *)
+      [ -z "$target" ] || usage
+      target="$1"
+      ;;
+  esac
+  shift
+done
+[ -n "$target" ] || usage
+
 # A linked worktree has a .git FILE, not a directory; ask git instead of stat.
 if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "ERROR: $target is not a git working tree" >&2
@@ -39,21 +66,84 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
-# Visibility is resolved before anything is written. GitHub's own answer,
-# when gh can give one, wins: a flag that contradicts it is an error, never
-# an override, so --visibility=private cannot put the nexus-ci toggle into a
-# repo GitHub says is public.
-gh_visibility=""
-if command -v gh >/dev/null 2>&1; then
-  if v="$(cd "$target" && gh repo view --json isPrivate --jq .isPrivate 2>/dev/null)"; then
-    case "$v" in true) gh_visibility=private ;; false) gh_visibility=public ;; esac
+# The tracked ci-registrar config: which repos nexus-ci serves. Ohio15/infra
+# ci-vm/README.md ("apply-config") is the procedure that deploys it.
+REGISTRAR_REPO="Ohio15/infra"
+REGISTRAR_CONFIG="ci-vm/registrar/config.json"
+# The guarded SC-37 predicate, exactly as the pull_request-reachable templates
+# carry it, and dep-auto-apply.yml's private-only literal toggle (it runs on
+# schedule/workflow_dispatch only). A public or unconfirmed repo's copy gets
+# the hosted literal in place of either.
+CANON_RUNS_ON="runs-on: \${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
+TOGGLE_RUNS_ON="runs-on: \${{ github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}"
+HOSTED_RUNS_ON="runs-on: ubuntu-latest"
+
+# owner/repo of origin when it is a github.com remote, else empty.
+slug=""
+origin_url="$(git -C "$target" remote get-url origin 2>/dev/null || true)"
+case "$origin_url" in
+  https://github.com/*|git@github.com:*|ssh://git@github.com/*)
+    slug="${origin_url#*github.com[:/]}"
+    slug="${slug%/}"
+    slug="${slug%.git}"
+    [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || slug=""
+    ;;
+esac
+
+gh_ok=0
+gh_private=""
+repo_name=""
+repo_owner=""
+if [ "$use_gh" -eq 1 ] && [ -n "$slug" ] && command -v gh >/dev/null 2>&1; then
+  if meta="$(gh api "repos/$slug" --jq '[.private, .name, .owner.login] | @tsv' 2>/dev/null)"; then
+    IFS=$'\t' read -r gh_private repo_name repo_owner <<<"$meta" || true
+    if { [ "$gh_private" = "true" ] || [ "$gh_private" = "false" ]; } \
+       && [[ "$repo_name" =~ ^[A-Za-z0-9_.-]+$ ]] && [[ "$repo_owner" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+      gh_ok=1
+    fi
   fi
 fi
-if [ -n "$visibility" ] && [ -n "$gh_visibility" ] && [ "$visibility" != "$gh_visibility" ]; then
-  echo "ERROR: --visibility=$visibility contradicts GitHub, which reports this repo as $gh_visibility" >&2
-  exit 2
+
+# visibility_source says where the answer came from, for the report.
+visibility_source=""
+if [ "$gh_ok" -eq 1 ]; then
+  if [ "$gh_private" = "true" ]; then gh_visibility="private"; else gh_visibility="public"; fi
+  if [ -n "$visibility" ] && [ "$visibility" != "$gh_visibility" ]; then
+    echo "ERROR: --$visibility contradicts GitHub, which reports $slug as $gh_visibility; nothing installed" >&2
+    exit 1
+  fi
+  visibility="$gh_visibility"
+  visibility_source="github"
+elif [ -n "$visibility" ]; then
+  visibility_source="flag"
+else
+  # Unconfirmed counts as public: the hosted literal is always safe, the
+  # self-hosted toggle never is in a repo that might be public.
+  visibility="public"
+  visibility_source="unconfirmed"
 fi
-[ -n "$visibility" ] || visibility="$gh_visibility"
+
+# Copy a CI template. Private: verbatim. Public or unconfirmed: every guarded
+# runs-on becomes the hosted literal, and a runs-on that could still select a
+# runner afterwards (an expression, a variable or a self-hosted label) is
+# refused rather than installed.
+install_workflow() {
+  local src="$1" dst="$2" content
+  if [ "$visibility" = "private" ]; then
+    cp "$src" "$dst"
+    return
+  fi
+  content="$(cat "$src"; printf x)"
+  content="${content%x}"
+  content="${content//"$CANON_RUNS_ON"/"$HOSTED_RUNS_ON"}"
+  content="${content//"$TOGGLE_RUNS_ON"/"$HOSTED_RUNS_ON"}"
+  # shellcheck disable=SC2016  # the pattern matches the literal text `${{`; no expansion wanted
+  if printf '%s' "$content" | grep -Eq '^[[:space:]]*runs-on:.*(\$\{\{|vars\.|nexus-ci|self-hosted)'; then
+    echo "ERROR: $src has a runs-on that is not the guarded predicate; refusing to install it into a repository not confirmed private" >&2
+    exit 1
+  fi
+  printf '%s' "$content" >"$dst"
+}
 
 mkdir -p "$target/.githooks" "$target/.github/workflows"
 
@@ -86,25 +176,14 @@ git -C "$target" add --chmod=+x   ".githooks/commit-msg"   ".githooks/pre-commit
 #   security-audit.yml  — Layer A: always-on dep-vuln gate (npm/go/python)
 #   dep-auto-apply.yml  — Layer B: weekly auto-apply cron (per-repo opt-in
 #                         via .github/auto-apply-enabled — NOT created here)
-cp "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
-cp "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
-cp "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
-
-runner_note="nexus-ci in this private repo when vars.CI_RUNNER == 'nexus-ci', else ubuntu-latest"
-if [ "$visibility" != "private" ]; then
-  # Public or unconfirmed: hosted literal only (SC-37 makes any
-  # variable-selected runner in a public repo a finding).
-  for wf in size-guard.yml security-audit.yml dep-auto-apply.yml; do
-    f="$target/.github/workflows/$wf"
-    sed -E 's/^([[:space:]]*runs-on:[[:space:]]*)\$\{\{.*vars\.CI_RUNNER.*\}\}[[:space:]]*$/\1ubuntu-latest/' "$f" > "$f.tmp"
-    mv "$f.tmp" "$f"
-    if grep -Eq '^[[:space:]]*runs-on:.*(vars\.|nexus-ci|self-hosted)' "$f"; then
-      echo "ERROR: $f still selects a runner from a variable after the hosted rewrite" >&2
-      exit 1
-    fi
-  done
-  runner_note="ubuntu-latest only (visibility: ${visibility:-unconfirmed, treated as public}; pass --visibility=private to allow nexus-ci)"
-fi
+#   Every runs-on follows the repo's visibility (install_workflow above):
+#   size-guard.yml and security-audit.yml (pull_request-reachable) carry the
+#   guarded SC-37 predicate, dep-auto-apply.yml (schedule/workflow_dispatch
+#   only) its private-only literal toggle; a public or unconfirmed repo gets
+#   the hosted literal in all three.
+install_workflow "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
+install_workflow "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
+install_workflow "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
 
 # Security register (security/REVIEW-MODEL.md): the per-session gate reads
 # <repo>/SECURITY-CHECKS.md and falls back to the canonical copy, reporting
@@ -141,13 +220,107 @@ fi
 
 git -C "$target" config core.hooksPath .githooks
 
+# nexus-ci onboarding. Every line goes into runner_report, printed at the end.
+# A step that could not be done or checked says so; it is never reported done.
+runner_report=()
+onboarding_incomplete=0
+report() { runner_report+=("$1"); }
+
+if [ "$visibility_source" = "unconfirmed" ]; then
+  report "Visibility unconfirmed (no GitHub answer and no --private/--public): treated as public."
+  report "  Every job runs on the hosted literal (ubuntu-latest). If the repo is private, re-run with"
+  report "  --private (GitHub, when reachable, must agree) to install the guarded nexus-ci predicate."
+  onboarding_incomplete=1
+elif [ "$visibility" = "public" ]; then
+  report "Public repository: every job runs on the hosted literal (ubuntu-latest)."
+  report "  The nexus-ci registrar refuses public repositories; CI_RUNNER must stay unset (SC-37, SC-46)."
+  if [ "$gh_ok" -eq 1 ] && public_var="$(gh api "repos/$slug/actions/variables/CI_RUNNER" --jq .value 2>/dev/null)"; then
+    report "  WARNING: CI_RUNNER is set to '$public_var' on public $slug. Remove it:"
+    report "    gh variable delete CI_RUNNER --repo $slug"
+    onboarding_incomplete=1
+  fi
+elif [ "$gh_ok" -ne 1 ]; then
+  report "Private repository (from --private; GitHub not consulted): nexus-ci onboarding NOT checked."
+  report "  1. gh variable set CI_RUNNER --body nexus-ci --repo ${slug:-<owner>/<repo>}"
+  report "  2. map the repo in $REGISTRAR_REPO $REGISTRAR_CONFIG (\"<repo>\": [\"nexus-ci\"]); PR, gate, merge;"
+  report "     apply it on NEXUS (ci-vm/README.md, apply-config)."
+  report "  3. the ci-registrar GitHub App installation must include the repo."
+  report "  Until then its PR jobs ask for ubuntu-latest."
+  onboarding_incomplete=1
+else
+  reg_owner="" reg_mapped="" reg_installation=""
+  if reg="$(gh api -H "Accept: application/vnd.github.raw+json" "repos/$REGISTRAR_REPO/contents/$REGISTRAR_CONFIG" \
+            --jq "[.owner, (.repos | has(\"$repo_name\")), .installation_id] | @tsv" 2>/dev/null)"; then
+    IFS=$'\t' read -r reg_owner reg_mapped reg_installation <<<"$reg" || true
+  fi
+
+  if [ -z "$reg_owner" ] || [ "$reg_owner" = "null" ]; then
+    report "Private repository: could not read $REGISTRAR_REPO $REGISTRAR_CONFIG, so nexus-ci onboarding is NOT checked"
+    report "  and CI_RUNNER was left as it is. Check the registrar mapping, then:"
+    report "    gh variable set CI_RUNNER --body nexus-ci --repo $slug"
+    onboarding_incomplete=1
+  elif [ "$reg_owner" != "$repo_owner" ]; then
+    report "Private repository owned by $repo_owner: the nexus-ci registrar serves $reg_owner only."
+    report "  CI_RUNNER not set; this repo's PR jobs run on ubuntu-latest."
+  else
+    var_err="$(mktemp)"
+    if current="$(gh api "repos/$slug/actions/variables/CI_RUNNER" --jq .value 2>"$var_err")"; then
+      var_state="set"
+    elif grep -q "HTTP 404" "$var_err"; then
+      var_state="unset"
+    else
+      var_state="unknown"
+    fi
+    rm -f "$var_err"
+    case "$var_state" in
+      set)
+        if [ "$current" = "nexus-ci" ]; then
+          report "CI_RUNNER=nexus-ci already set on $slug."
+        else
+          report "WARNING: CI_RUNNER on $slug is '$current', not nexus-ci; left unchanged."
+          onboarding_incomplete=1
+        fi
+        ;;
+      unset)
+        if gh variable set CI_RUNNER --body nexus-ci --repo "$slug" >/dev/null 2>&1 \
+           && [ "$(gh api "repos/$slug/actions/variables/CI_RUNNER" --jq .value 2>/dev/null)" = "nexus-ci" ]; then
+          report "CI_RUNNER=nexus-ci set on $slug (read back from GitHub)."
+        else
+          report "ERROR: could not set CI_RUNNER on $slug. Run:"
+          report "    gh variable set CI_RUNNER --body nexus-ci --repo $slug"
+          onboarding_incomplete=1
+        fi
+        ;;
+      *)
+        report "ERROR: could not read CI_RUNNER on $slug (not a 404); left unchanged. Check it, then:"
+        report "    gh variable set CI_RUNNER --body nexus-ci --repo $slug"
+        onboarding_incomplete=1
+        ;;
+    esac
+    if [ "$reg_mapped" = "true" ]; then
+      report "$repo_name is mapped in the tracked registrar config ($REGISTRAR_REPO $REGISTRAR_CONFIG)."
+      report "  Whether NEXUS has applied it is not checked from here; the apply-config.py dry run answers that."
+    else
+      report "$repo_name is NOT in the tracked registrar config, so nexus-ci serves no job for it yet:"
+      report "  1. add \"$repo_name\": [\"nexus-ci\"] to \"repos\" in $REGISTRAR_REPO $REGISTRAR_CONFIG; PR, gate, merge."
+      report "  2. on NEXUS, from a checkout of merged main (ci-vm/README.md, apply-config):"
+      report "       sudo python3 -I /opt/ci-registrar/apply-config.py ~ohio_/infra/ci-vm/registrar/config.json"
+      report "       sudo python3 -I /opt/ci-registrar/apply-config.py ~ohio_/infra/ci-vm/registrar/config.json --apply --restart"
+      report "       systemctl is-active ci-registrar"
+      onboarding_incomplete=1
+    fi
+    report "The registrar's GitHub App installation ($reg_installation) must include $repo_name, or its"
+    report "  visibility check fails (HTTP 404) and it serves nothing for the repo:"
+    report "  https://github.com/settings/installations/$reg_installation"
+  fi
+fi
+
 echo "Installed into $target"
 echo "  .githooks/commit-msg                  (conventional subject; attribution scrubbed)"
 echo "  .githooks/pre-commit                  (chained dispatcher)"
 echo "  .githooks/pre-commit-size-guard.sh    (>10 MB file guard)"
 echo "  .githooks/pre-commit-secret-scan.sh   (gitleaks)"
 echo "  .githooks/pre-commit-healthcheck-lint.sh  (release-config.yml shape)"
-echo "  runners: $runner_note"
 echo "  .github/workflows/size-guard.yml"
 echo "  .github/workflows/security-audit.yml  (Layer A — always on)"
 echo "  .github/workflows/dep-auto-apply.yml  (Layer B — opt-in)"
@@ -174,3 +347,14 @@ echo "  Any:      go install github.com/zricethezav/gitleaks/v8@latest"
 echo
 echo "Review the files, then:"
 echo "  git add -A && git commit -m 'ci: install dev-standards guards'"
+echo
+if [ "$visibility_source" = "unconfirmed" ]; then
+  echo "CI runner (visibility unconfirmed, treated as public): ubuntu-latest only"
+elif [ "$onboarding_incomplete" -eq 1 ]; then
+  echo "CI runner ($visibility repository): nexus-ci onboarding INCOMPLETE"
+else
+  echo "CI runner ($visibility repository):"
+fi
+for line in "${runner_report[@]}"; do
+  echo "  $line"
+done

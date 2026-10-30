@@ -426,32 +426,137 @@ def test_yarn_is_declined_and_said(tmp_path, shim_path):
     assert "::warning::npm auto-apply declined" in proc.stdout
 
 
+SHARED_BEGIN = "# >>> shared manifest detection"
+SHARED_END = "# <<< shared manifest detection\n"
+
+
+def shared_detection(body: str) -> str:
+    """The marked manifest-detection block of a detect step, markers included."""
+    assert body.count(SHARED_BEGIN) == 1 and body.count(SHARED_END) == 1, "detect must carry one marked shared block"
+    start = body.index(SHARED_BEGIN)
+    return body[start:body.index(SHARED_END, start) + len(SHARED_END)]
+
+
 def test_detect_matches_security_audit(tmp_path, shim_path):
+    # Byte-for-byte, not a few spot strings: #57 (d1a791d) taught
+    # security-audit.yml workspace folding and `python3 -I`, dep-auto-apply.yml
+    # kept the old detection, and spot checks were the only thing that noticed.
     detect = step("detect")["run"]
     audit = yaml.safe_load(AUDIT_TEMPLATE.read_text(encoding="utf-8"))
     [audit_detect] = [s["run"] for s in audit["jobs"]["detect"]["steps"] if s.get("id") == "detect"]
-    # security-audit names its npm list npm_manifest_dirs (workspace folding, #57).
-    for spec in ("dirs_of 'package.json' '**/package.json')",
+    shared = shared_detection(detect)
+    assert shared == shared_detection(audit_detect), "the shared detection block differs between dep-auto-apply.yml and security-audit.yml"
+    for spec in ("npm_manifest_dirs=$(dirs_of 'package.json' '**/package.json')",
                  "go_dirs=$(dirs_of 'go.mod' '**/go.mod')",
                  "python_dirs=$(dirs_of 'pyproject.toml' '**/pyproject.toml' 'requirements*.txt' '**/requirements*.txt')"):
-        assert spec in detect and spec in audit_detect
+        assert spec in shared
+    # Nothing may redefine a shared result between the block and its use.
+    rest = detect[detect.index(SHARED_END) + len(SHARED_END):]
+    for name in ("dirs_of", "npm_dirs", "npm_covered", "go_dirs", "python_dirs"):
+        assert not re.search(rf"(?m)^\s*{name}(=|\(\))", rest), f"{name} is reassigned after the shared block"
 
     repo = git_repo(tmp_path, {
         "console/package.json": "{}", "console/clis/package.json": "{}",
         "svc/go.mod": "module x\n", "api/requirements-dev.txt": "x==1\n",
         "node_modules/dep/package.json": "{}", ".github/workflows/ci.yml": "on: push\n",
         "deploy/Dockerfile": "FROM x\n",
+        # A pnpm workspace: the member is fixed through the root's lockfile.
+        "ws/package.json": "{}", "ws/pnpm-workspace.yaml": "packages:\n  - 'pkgs/*'\n",
+        "ws/pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  pkgs/a: {}\n",
+        "ws/pkgs/a/package.json": "{}",
     })
-    out = tmp_path / "gh_out"
-    out.write_text("", encoding="utf-8")
-    proc = subprocess.run([BASH, "-c", detect], cwd=repo, capture_output=True, text=True,
-                          env={**os.environ, "PATH": shim_path, "GITHUB_OUTPUT": out.as_posix()})
-    assert proc.returncode == 0, proc.stderr
-    o = parse_outputs(out.read_text(encoding="utf-8"))
-    assert o["npm_dirs"] == '["console", "console/clis"]'
+    proc = run_step("detect", repo, shim_path, {})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    o = proc.outputs
+    assert o["npm_dirs"] == '["console", "console/clis", "ws"]'
+    assert o["npm_covered"] == '{"ws/pkgs/a": "ws"}'
     assert o["go_dirs"] == '["svc"]' and o["go_version_file"] == "svc/go.mod"
     assert o["python_dirs"] == '["api"]'
     assert o["has_docker"] == "true" and o["has_actions"] == "true"
+
+
+# ─── workspace coverage: the shared block's claim has a consumer ─────────────
+# The shared detection comment says "the summary lists which root covered which
+# member, and a member is clean only if that root's job succeeded". Gate pass 1
+# on #64 (SC-13, LOW): dep-auto-apply published npm_covered and nothing read it.
+
+COVERAGE_CLAIM = "the summary lists which root covered which"
+SHARED_WORKFLOWS = [TEMPLATE, OWN_COPY, AUDIT_TEMPLATE, ROOT / ".github" / "workflows" / "security-audit.yml"]
+COVERED_REF = re.compile(r"^\$\{\{\s*(steps|needs)\.detect\.outputs\.npm_covered\s*\}\}$")
+
+
+@pytest.mark.parametrize("path", SHARED_WORKFLOWS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_every_shared_block_carrier_reports_covered_members(path):
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    [detect] = [s["run"] for j in wf["jobs"].values() for s in j["steps"] if s.get("id") == "detect"]
+    assert COVERAGE_CLAIM in " ".join(shared_detection(detect).replace("#", " ").split()), \
+        "the claim this test enforces is gone from the shared block; update the test with it"
+    consumers = [s for j in wf["jobs"].values() for s in j["steps"]
+                 if any(COVERED_REF.match(str(v)) for v in s.get("env", {}).values())]
+    assert consumers, f"{path.name}: nothing consumes detect's npm_covered, so the shared block's claim is false"
+    assert any("GITHUB_STEP_SUMMARY" in s.get("run", "") for s in consumers), \
+        f"{path.name}: npm_covered is read but never reaches the run summary"
+
+
+def coverage(tmp_path, shim_path, covered: str, outcome: str, status: str):
+    work = tmp_path / "cov"
+    work.mkdir()
+    return run_step("npm_coverage", work, shim_path, {
+        "steps.detect.outputs.npm_covered": covered,
+        "steps.npm.outcome": outcome,
+        "steps.npm.outputs.root_status": status,
+    })
+
+
+def test_coverage_step_runs_after_a_failed_npm_step():
+    s = step("npm_coverage")
+    assert s["if"].startswith("always() && ")
+    assert "steps.enroll.outputs.enrolled == 'true'" in s["if"]
+    ids = [x.get("id") for x in STEPS]
+    assert ids.index("npm") < ids.index("npm_coverage") < ids.index("package")
+
+
+def test_covered_member_is_clean_only_through_a_clean_root(tmp_path, shim_path):
+    proc = coverage(tmp_path, shim_path, '{"ws/a": "ws", "ws/b": "ws", "x/m": "x", "y/m": "y", "z/m": "z"}', "success",
+                    '{"ws": "bumped, tests passed", "x": "declined (yarn lockfile)", "y": "bumped, tests failed", "z": "no change"}')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = {ln.split("|")[1].strip(" `"): ln for ln in proc.summary.splitlines() if ln.startswith("| `")}
+    assert set(rows) == {"ws/a", "ws/b", "x/m", "y/m", "z/m"}
+    assert "`ws`" in rows["ws/a"] and "clean (root: bumped, tests passed)" in rows["ws/a"]
+    assert "clean (root: no change)" in rows["z/m"]
+    assert "NOT COVERED: root declined (yarn lockfile)" in rows["x/m"]
+    assert "FAILED: root bumped, tests failed" in rows["y/m"]
+    assert "2 member(s) not clean" in proc.summary
+
+
+def test_failed_npm_step_reports_no_member_clean(tmp_path, shim_path):
+    proc = coverage(tmp_path, shim_path, '{"ws/a": "ws"}', "failure", "")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NOT COVERED: npm step failure" in proc.summary and "clean (" not in proc.summary
+
+
+def test_root_without_a_recorded_result_is_not_examined(tmp_path, shim_path):
+    proc = coverage(tmp_path, shim_path, '{"ws/a": "ws"}', "success", '{"other": "no change"}')
+    assert "NOT EXAMINED: no result recorded for the root" in proc.summary and "clean (" not in proc.summary
+
+
+def test_no_covered_members_writes_nothing(tmp_path, shim_path):
+    proc = coverage(tmp_path, shim_path, "{}", "success", '{".": "no change"}')
+    assert proc.returncode == 0 and proc.summary == ""
+
+
+def test_npm_step_records_each_root_outcome(tmp_path, shim_path):
+    repo = git_repo(tmp_path, {"package.json": PKG, "package-lock.json": "{}\n",
+                               "web/package.json": PKG, "web/yarn.lock": "# yarn\n"})
+    proc = run_step("npm", repo, shim_path, npm_values('[".", "web"]'), FAKE_NPM_FIX="bump", FAKE_NPM_TEST_RC="1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.outputs["root_status"]) == {".": "bumped, tests failed", "web": "declined (yarn lockfile)"}
+
+
+def test_npm_step_that_stops_early_records_no_root_outcome(tmp_path, shim_path):
+    repo = git_repo(tmp_path, {"package.json": PKG, "package-lock.json": "{}\n"})
+    proc = run_step("npm", repo, shim_path, npm_values('["."]'), FAKE_NPM_FIX="error")
+    assert proc.returncode != 0 and "root_status" not in proc.outputs
 
 
 # ─── structure ───────────────────────────────────────────────────────────────
