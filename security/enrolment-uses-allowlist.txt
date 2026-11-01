@@ -1,0 +1,31 @@
+# Reviewed third-party actions that do NOT restore a GitHub Actions cache
+# (register SC-52; audit-dev-standards-2026-10-30, gate pass 1 on #73).
+#
+# install.sh refuses to enrol a target in dep-auto-apply while any workflow
+# of its has a `uses:` it cannot classify, and the weekly fleet scan
+# (scripts/repo-hygiene-scan.py) reports one. A `uses:` passes only as a
+# first-party actions/<name> held to the cache rules, a local reusable
+# workflow (read in the same pass), or an exact entry below. Matching is
+# exact on owner/repo[/path] (case-insensitive): an entry never covers a
+# sub-path, so gradle/actions does not admit gradle/actions/setup-gradle.
+# A `cache:` key on a listed action is still refused.
+#
+# Format: one `owner/repo` or `owner/repo/path` per line; `#` starts a
+# comment (whole-line or trailing). Any other line makes install.sh refuse
+# every enrolment and the scan report every enrolled repo, until fixed.
+#
+# Adding an entry is a security review: read the action's action.yml inputs
+# and its bundled code at the pinned ref, confirm it neither restores nor
+# saves an Actions cache by default (no @actions/cache dependency, no
+# cache-service call, no default-on cache input), and record why here.
+# Actions that cache by default (Swatinem/rust-cache, astral-sh/setup-uv,
+# gradle/actions/setup-gradle, ruby/setup-ruby with bundler-cache) must not
+# be listed.
+
+# create-pull-request (dep-auto-apply.yml publish job). Reviewed at
+# 5f6978faf089d4d20b00c7766989d076bb2fc7f1 (v8.0.0): action.yml has no cache
+# input; dependencies are @actions/core, @actions/exec and @octokit/*, with no
+# @actions/cache; dist/index.js names actions/cache only in octokit's REST
+# route catalogue (cache list/usage/delete management endpoints, never
+# called), and it only commits, pushes and opens or updates a pull request.
+peter-evans/create-pull-request

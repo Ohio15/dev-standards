@@ -21,6 +21,7 @@ Run:  python -m pytest scripts/tests -q
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -372,3 +373,424 @@ def test_private_install_is_verbatim_whatever_the_spelling(tmp_path):
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (repo / ".github" / "workflows" / "size-guard.yml").read_text(encoding="utf-8").endswith(suffix)
+
+
+# ─── audit-dev-standards-2026-10-30 MEDIUM (SC-52): cache-restore refusal ────
+# dep-auto-apply's apply job can write the default-branch Actions cache scope,
+# so install.sh refuses a target whose other workflows restore a cache, and
+# the fleet scan reports an enrolled repo that does. ONE fixture table runs
+# through both matchers (install.sh's awk, scripts/cache_restore.py via the
+# scan) and both must report exactly the (line, form) pairs listed, so the
+# twins cannot drift apart.
+
+_SCAN_SCRIPT = ROOT / "scripts" / "repo-hygiene-scan.py"
+_SCAN_SPEC = importlib.util.spec_from_file_location("hygiene_cache", _SCAN_SCRIPT)
+hygiene = importlib.util.module_from_spec(_SCAN_SPEC)
+assert _SCAN_SPEC.loader is not None
+_SCAN_SPEC.loader.exec_module(hygiene)
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+KEY, ACTIONS_CACHE, GHA = "cache: not false", "actions/cache", "type=gha"
+GO, NODE = "setup-go without cache: false", "setup-node without package-manager-cache: false"
+LOCAL, REUSABLE = "local composite action not inspected", "reusable workflow not inspected"
+UNREV = "not on the reviewed allow-list security/enrolment-uses-allowlist.txt"
+MALFORMED = "malformed allow-list entry"
+ALLOWLIST = ROOT / "security" / "enrolment-uses-allowlist.txt"
+ALLOWLIST_REL = "security/enrolment-uses-allowlist.txt"
+
+
+def wf(*steps: str) -> str:
+    """A workflow whose first step line is line 7."""
+    return ("name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + "".join("      " + s + "\n" for s in steps))
+
+
+def job_wf(line: str) -> str:
+    """A workflow whose one job is `line` (a job-level key), at line 5."""
+    return "name: ci\non: push\njobs:\n  call:\n    " + line + "\n"
+
+
+CACHE_RESTORE_CASES: dict[str, tuple[str, list[tuple[int, str]]]] = {
+    # (a) a `cache:` key that is not false
+    "setup-node-cache-npm": (wf(f"- uses: actions/setup-node@{SHA}", "  with:", "    node-version: 22",
+                                "    cache: npm", "    package-manager-cache: false"), [(10, KEY)]),
+    "setup-python-cache-quoted-pip": (wf(f"- uses: actions/setup-python@{SHA}", "  with:",
+                                         "    python-version: '3.12'", "    cache: 'pip'"), [(10, KEY)]),
+    "setup-go-cache-true": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                               "    cache: true"), [(7, GO), (10, KEY)]),
+    "uppercase-key-and-value": (wf("- name: Set up Go", f"  uses: actions/setup-go@{SHA}", "  with:",
+                                   "    Cache: TRUE"), [(8, GO), (10, KEY)]),
+    "flow-mapping-cache": (wf("- {uses: actions/setup-python@" + SHA + ", with: {python-version: '3.12', cache: pip}}"),
+                           [(7, KEY)]),
+    # (b) actions/cache and its sub-actions, any ref
+    "actions-cache": (wf(f"- uses: actions/cache@{SHA}", "  with:", "    path: ~/.npm", "    key: npm"),
+                      [(7, ACTIONS_CACHE)]),
+    "actions-cache-restore": (wf(f"- uses: actions/cache/restore@{SHA}", "  with:", "    path: ~/.npm",
+                                 "    key: npm"), [(7, ACTIONS_CACHE)]),
+    "actions-cache-save-mixed-case": (wf("- uses: Actions/Cache/save@v4", "  with:", "    path: x", "    key: k"),
+                                      [(7, ACTIONS_CACHE)]),
+    # (c) the buildx GitHub Actions cache backend
+    "buildx-type-gha": (wf(f"- uses: docker/build-push-action@{SHA}", "  with:", "    push: false",
+                           "    cache-from: type=gha", "    cache-to: type=gha,mode=max"),
+                        [(7, UNREV), (10, GHA), (11, GHA)]),
+    # (d) setup-go defaults cache ON; (e) setup-node v5+ defaults npm cache ON
+    "setup-go-default-cache": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'"),
+                               [(7, GO)]),
+    "setup-go-no-with": (wf(f"- uses: actions/setup-go@{SHA}", "- run: go test ./..."), [(7, GO)]),
+    "setup-go-false-in-the-next-step": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                                           f"- uses: actions/setup-node@{SHA}", "  with:", "    cache: false",
+                                           "    package-manager-cache: false"), [(7, GO)]),
+    "setup-node-default-cache": (wf(f"- uses: actions/setup-node@{SHA}", "  with:", "    node-version: 22"),
+                                 [(7, NODE)]),
+    "crlf-setup-go-default-cache": (wf(f"- uses: actions/setup-go@{SHA}", "  with:",
+                                       "    go-version: '1.23'").replace("\n", "\r\n"), [(7, GO)]),
+    # accepted: caching explicitly off, or only mentioned in a comment
+    "cache-false-spellings": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                                 "    cache: false", "- name: node", f"  uses: actions/setup-node@{SHA}",
+                                 "  with:", '    cache: "false"   # explicit',
+                                 "    package-manager-cache: 'false'"), []),
+    "setup-go-with-before-uses": (wf("- name: go", "  with:", "    cache: false",
+                                     f"  uses: actions/setup-go@{SHA}"), []),
+    "forms-in-comment-lines": (wf(f"# - uses: actions/cache@{SHA}", "#   cache: npm", "  # cache-from: type=gha",
+                                  f"# - uses: actions/setup-go@{SHA}", "- run: echo ok"), []),
+    "no-cache-anywhere": (wf("- uses: actions/checkout@" + SHA, "- run: make test"), []),
+    # gate pass 1 on #73: positive classification of every `uses:`
+    "swatinem-rust-cache": (wf(f"- uses: Swatinem/rust-cache@{SHA}"), [(7, UNREV)]),
+    "astral-setup-uv": (wf(f"- uses: astral-sh/setup-uv@{SHA}", "  with:", "    python-version: '3.12'"),
+                        [(7, UNREV)]),
+    "gradle-setup-gradle": (wf(f"- uses: gradle/actions/setup-gradle@{SHA}"), [(7, UNREV)]),
+    "ruby-setup-ruby-bundler-cache": (wf(f"- uses: ruby/setup-ruby@{SHA}", "  with:", "    ruby-version: '3.3'",
+                                         "    bundler-cache: true"), [(7, UNREV)]),
+    "local-composite-action": (wf("- uses: ./.github/actions/setup", "- run: make"), [(7, LOCAL)]),
+    "remote-reusable-workflow": (job_wf(f"uses: org/repo/.github/workflows/build.yml@{SHA}"), [(5, REUSABLE)]),
+    "docker-image-action": (wf("- uses: docker://alpine:3.20"), [(7, UNREV)]),
+    "allow-list-entry-is-exact": (wf(f"- uses: peter-evans/create-pull-request/sub@{SHA}"), [(7, UNREV)]),
+    "allow-listed-action-with-cache": (wf(f"- uses: peter-evans/create-pull-request@{SHA}", "  with:",
+                                          "    cache: true"), [(9, KEY)]),
+    "malformed-allow-list": (wf(f"- uses: peter-evans/create-pull-request@{SHA}"), [(3, MALFORMED)]),
+    "allow-listed-action": (wf(f"- uses: peter-evans/create-pull-request@{SHA}", "  with:", "    title: x"), []),
+    "custom-allow-list-entry": (wf(f"- uses: Swatinem/rust-cache@{SHA}"), []),
+    "local-reusable-workflow-is-read": (job_wf("uses: ./.github/workflows/build.yml"), []),
+    "uses-text-in-a-run-line": (wf('- run: echo "uses: evil/x@1"'), []),
+}
+# Rows judged against an allow-list other than the committed one. A
+# MALFORMED hit's line is the allow-list's, not the workflow's.
+CASE_ALLOWLIST = {
+    "custom-allow-list-entry": "# reviewed for this test only\nSwatinem/Rust-Cache   # trailing comment\n",
+    "malformed-allow-list": "# list\npeter-evans/create-pull-request\nhttps://github.com/o/r\n",
+}
+REFUSED = [c for c, (_, want) in CACHE_RESTORE_CASES.items() if want]
+ACCEPTED = [c for c, (_, want) in CACHE_RESTORE_CASES.items() if not want]
+_HIT_RE = re.compile(r"^ERROR: (\S+?):(\d+): (?:restores|cannot be shown not to restore) an Actions cache "
+                     r"\((.+?)\); dep-auto-apply's apply job "
+                     r"can poison the default-branch cache scope, so the target must not restore one "
+                     r"\(SC-52, audit 2026-10-30\)\. Fix the workflow and re-run install\.sh\.$", re.M)
+
+
+_ALLOW_RE = re.compile(r"^ERROR: security/enrolment-uses-allowlist\.txt:(\d+): (malformed allow-list entry) in the "
+                       r"dev-standards checkout \(.+\); nothing installed \(SC-52\)$", re.M)
+
+
+def test_the_fixture_table_covers_every_form():
+    forms = {f for _, want in CACHE_RESTORE_CASES.values() for _, f in want}
+    assert forms == {KEY, ACTIONS_CACHE, GHA, GO, NODE, LOCAL, REUSABLE, UNREV, MALFORMED}
+    assert set(CASE_ALLOWLIST) <= set(CACHE_RESTORE_CASES)
+
+
+def kit_with(tmp_path: Path, *, allowlist: str | None = None, install_text: str | None = None) -> Path:
+    """A copy of the installer and everything it reads, optionally with its
+    allow-list (None: keep; "": delete) or install.sh text replaced."""
+    kit = tmp_path / "kit"
+    kit.mkdir()
+    shutil.copy2(INSTALL, kit / "install.sh")
+    for sub in ("hooks", "security", "templates", "workflows"):
+        shutil.copytree(ROOT / sub, kit / sub)
+    if install_text is not None:
+        (kit / "install.sh").write_bytes(install_text.encode("utf-8"))
+    if allowlist == "":
+        (kit / ALLOWLIST_REL).unlink()
+    elif allowlist is not None:
+        (kit / ALLOWLIST_REL).write_bytes(allowlist.encode("utf-8"))
+    return kit
+
+
+def install_from(kit: Path, repo: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    flags = flags or ("--private", "--no-gh")
+    return subprocess.run([BASH, (kit / "install.sh").as_posix(), *flags, repo.as_posix()],
+                          capture_output=True, text=True)
+
+
+def install_case(tmp_path: Path, case: str, repo: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    if case in CASE_ALLOWLIST:
+        return install_from(kit_with(tmp_path, allowlist=CASE_ALLOWLIST[case]), repo, *flags)
+    return install(repo, *flags)
+
+
+def install_hits(stderr: str, rel: str = ".github/workflows/ci.yml") -> list[tuple[int, str]]:
+    hits = [(int(line), form) for path, line, form in _HIT_RE.findall(stderr) if path == rel]
+    hits += [(int(line), form) for line, form in _ALLOW_RE.findall(stderr)]
+    return sorted(hits)
+
+
+def target_with_workflows(tmp_path: Path, files: dict[str, str]) -> Path:
+    repo = target_repo(tmp_path)
+    for rel, text in files.items():
+        path = repo / ".github" / "workflows" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode("utf-8"))
+    return repo
+
+
+def assert_untouched(repo: Path, files: dict[str, str]) -> None:
+    """A refused install wrote nothing: no file, no config, no index entry."""
+    present = {p.relative_to(repo).as_posix() for p in repo.rglob("*")
+               if p.is_file() and p.relative_to(repo).parts[0] != ".git"}
+    assert present == {f".github/workflows/{rel}" for rel in files}, present
+    for rel, text in files.items():
+        assert (repo / ".github" / "workflows" / rel).read_bytes() == text.encode("utf-8")
+    assert subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath"],
+                          capture_output=True, text=True).returncode != 0
+    assert subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True).stdout == ""
+
+
+@pytest.mark.parametrize("case", REFUSED)
+@pytest.mark.parametrize("flags", [("--private", "--no-gh"), ("--public", "--no-gh")], ids=["private", "public"])
+def test_install_refuses_a_target_that_restores_an_actions_cache(tmp_path, case, flags):
+    text, want = CACHE_RESTORE_CASES[case]
+    files = {"ci.yml": text}
+    repo = target_with_workflows(tmp_path, files)
+    proc = install_case(tmp_path, case, repo, *flags)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert install_hits(proc.stderr) == sorted(want), proc.stderr
+    assert "Installed into" not in proc.stdout
+    assert_untouched(repo, files)
+
+
+@pytest.mark.parametrize("case", ACCEPTED)
+def test_install_accepts_a_target_that_restores_no_cache(tmp_path, case):
+    text, _ = CACHE_RESTORE_CASES[case]
+    repo = target_with_workflows(tmp_path, {"ci.yml": text})
+    proc = install_case(tmp_path, case, repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "an Actions cache" not in proc.stderr
+    assert (repo / ".github" / "workflows" / "ci.yml").read_bytes() == text.encode("utf-8")
+    assert (repo / ".github" / "workflows" / "dep-auto-apply.yml").read_bytes() == DEP_TEMPLATE.read_bytes()
+
+
+def test_install_accepts_a_target_with_no_workflows_dir(tmp_path):
+    repo = target_repo(tmp_path)
+    proc = install(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restores an Actions cache" not in proc.stderr
+
+
+def test_install_refuses_when_the_allow_list_is_unreadable(tmp_path):
+    repo = target_repo(tmp_path)  # no workflows: the allow-list is still required
+    proc = install_from(kit_with(tmp_path, allowlist=""), repo)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "enrolment-uses-allowlist.txt could not be read for the cache-restore check" in proc.stderr
+    assert_untouched(repo, {})
+
+
+def test_install_reports_every_hit_in_every_file_and_still_writes_nothing(tmp_path):
+    files = {"a-clean.yml": CACHE_RESTORE_CASES["no-cache-anywhere"][0],
+             "b-node.yaml": CACHE_RESTORE_CASES["setup-node-cache-npm"][0],
+             "nested/c-go.yml": CACHE_RESTORE_CASES["setup-go-default-cache"][0]}
+    repo = target_with_workflows(tmp_path, files)
+    proc = install(repo)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    got = sorted((p, int(line), f) for p, line, f in _HIT_RE.findall(proc.stderr))
+    assert got == [(".github/workflows/b-node.yaml", 10, KEY), (".github/workflows/nested/c-go.yml", 7, GO)]
+    assert_untouched(repo, files)
+
+
+def test_install_skips_the_workflows_it_replaces(tmp_path):
+    """A stale installed copy (n3xus-notify's security-audit.yml carried
+    `cache: true` on setup-go) is overwritten by this run, so it is not a
+    reason to refuse; the replacement restores no cache."""
+    bad = CACHE_RESTORE_CASES["setup-go-cache-true"][0]
+    repo = target_with_workflows(tmp_path, {n: bad for n in ALL_TEMPLATES})
+    proc = install(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for name, template in ALL_TEMPLATES.items():
+        assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
+
+
+# ── the fleet scan's twin: same table, same answers ──
+
+@pytest.mark.parametrize("name", sorted(ALL_TEMPLATES))
+def test_the_installed_templates_restore_no_cache(name):
+    allowlist, errors = hygiene.cache_restore.load_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
+    assert errors == []
+    assert hygiene.cache_restore.find_cache_restores(ALL_TEMPLATES[name].read_text(encoding="utf-8"), allowlist) == []
+
+
+def test_the_allow_list_is_the_templates_third_party_actions():
+    """Seeded with exactly the third-party actions the fleet templates use."""
+    used = set()
+    for template in ALL_TEMPLATES.values():
+        for v in re.findall(r"^\s*-?\s*uses:\s*([^@\s]+)@", template.read_text(encoding="utf-8"), re.M):
+            if not v.lower().startswith("actions/"):
+                used.add(v.lower())
+    allowlist, errors = hygiene.cache_restore.load_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
+    assert errors == [] and set(allowlist) == used == {"peter-evans/create-pull-request"}
+
+
+def enrolled_repo(tmp_path: Path, files: dict[str, str], *, enrolled: bool = True) -> Path:
+    repo = target_with_workflows(tmp_path, files)
+    if enrolled:
+        (repo / ".github" / "auto-apply-enabled").write_text("", encoding="utf-8")
+    return repo
+
+
+def scan_case(module, tmp_path: Path, case: str) -> list[dict]:
+    text, _ = CACHE_RESTORE_CASES[case]
+    allow = ALLOWLIST
+    if case in CASE_ALLOWLIST:
+        allow = tmp_path / "allowlist.txt"
+        allow.write_bytes(CASE_ALLOWLIST[case].encode("utf-8"))
+    return module.scan_cache_restore(enrolled_repo(tmp_path, {"ci.yml": text}), allow)
+
+
+def scan_hits(findings: list[dict]) -> list[tuple[int, str]]:
+    return sorted((i["line"], i["form"]) for f in findings for i in f["items"]
+                  if i["path"] in (".github/workflows/ci.yml", ALLOWLIST_REL))
+
+
+@pytest.mark.parametrize("case", list(CACHE_RESTORE_CASES))
+def test_scan_matches_the_installer_on_every_fixture(tmp_path, case):
+    _, want = CACHE_RESTORE_CASES[case]
+    findings = scan_case(hygiene, tmp_path, case)
+    if not want:
+        assert findings == []
+        return
+    [finding] = findings
+    assert finding["severity"] == "MEDIUM" and finding["code"] == "auto-apply-cache-restore"
+    assert scan_hits(findings) == sorted(want) and finding["count"] == len(want)
+
+
+def test_scan_reports_an_unreadable_allow_list(tmp_path):
+    repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["no-cache-anywhere"][0]})
+    [finding] = hygiene.scan_cache_restore(repo, tmp_path / "missing.txt")
+    [item] = finding["items"]
+    assert item["path"] == ALLOWLIST_REL and item["form"].startswith("allow-list unreadable")
+
+
+def test_scan_does_not_judge_a_repo_not_enrolled(tmp_path):
+    repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["actions-cache"][0]}, enrolled=False)
+    assert hygiene.scan_cache_restore(repo) == []
+
+
+def test_scan_reads_the_installed_copies_too(tmp_path):
+    """Unlike install.sh (which is about to replace them), the scan judges the
+    installed templates as they are: a stale copy that caches is drift."""
+    repo = enrolled_repo(tmp_path, {"security-audit.yml": CACHE_RESTORE_CASES["setup-go-cache-true"][0],
+                                    "sub/x.yaml": CACHE_RESTORE_CASES["actions-cache"][0]})
+    [finding] = hygiene.scan_cache_restore(repo)
+    assert sorted((i["path"], i["line"], i["form"]) for i in finding["items"]) == [
+        (".github/workflows/security-audit.yml", 7, GO), (".github/workflows/security-audit.yml", 10, KEY),
+        (".github/workflows/sub/x.yaml", 7, ACTIONS_CACHE)]
+
+
+def test_scan_repo_reports_the_finding(tmp_path):
+    repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["buildx-type-gha"][0]})
+    codes = {f["code"] for f in hygiene.scan_repo(repo, 7)["findings"]}
+    assert "auto-apply-cache-restore" in codes
+
+
+# ── SC-14 mutation battery: the refusal tests must kill a broken guard ──
+# Same mechanism as test_docker_release_helper.py: each mutant is an exact
+# count==1 replace on a temp copy, and the refusal rows of the shared table
+# are run against the copy. A mutant that leaves them green "survived".
+
+PY_MUTANTS = [
+    ("py-allowlist-membership-flipped", "    if path in allowlist:\n        return None",
+     "    if path not in allowlist:\n        return None"),
+    ("py-local-composite-accepted", "        return FORM_LOCAL\n", "        return None\n"),
+    ("py-reusable-accepted", "        return FORM_REUSABLE\n", "        return None\n"),
+    ("py-unreviewed-accepted", "    return FORM_UNREVIEWED\n\n\ndef find", "    return None\n\n\ndef find"),
+    ("py-malformed-entry-ignored", "            errors.append((n, FORM_ALLOWLIST_MALFORMED))", "            pass"),
+]
+SH_MUTANTS = [
+    ("sh-allowlist-membership-flipped", '  if (p in ALLOW) return ""', '  if (!(p in ALLOW)) return ""'),
+    ("sh-local-composite-accepted", '    return "local composite action not inspected"', '    return ""'),
+    ("sh-reusable-accepted", '  if (p ~ /\\.ya?ml$/) return "reusable workflow not inspected"',
+     '  if (p ~ /\\.ya?ml$/) return ""'),
+    ("sh-refusal-neutralised", '[ "$cache_refused" -eq 0 ] || exit 1', "true"),
+    ("sh-malformed-entry-ignored", '  else print "allowlist\\t" FNR "\\tmalformed allow-list entry"', "  else a = a"),
+]
+CACHE_RESTORE_PY = ROOT / "scripts" / "cache_restore.py"
+
+
+def apply_cache_mutant(text: str, old: str, new: str) -> str:
+    count = text.count(old)
+    assert count == 1, f"mutant pattern matched {count} times: {old!r}"
+    return text.replace(old, new)
+
+
+def scan_battery_failures(module_text: str, tmp: Path) -> list[str]:
+    """Every refusal row through a scan whose cache_restore.py is module_text."""
+    work = tmp / "scan"
+    work.mkdir()
+    shutil.copy2(_SCAN_SCRIPT, work / "repo-hygiene-scan.py")
+    (work / "cache_restore.py").write_bytes(module_text.encode("utf-8"))
+    spec = importlib.util.spec_from_file_location("hygiene_mutant", work / "repo-hygiene-scan.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    failures = []
+    for n, case in enumerate(REFUSED):
+        row = tmp / f"row{n}"
+        row.mkdir()
+        got = scan_hits(scan_case(module, row, case))
+        if got != sorted(CACHE_RESTORE_CASES[case][1]):
+            failures.append(f"{case}: {got}")
+    return failures
+
+
+def install_battery_failures(install_text: str, tmp: Path) -> list[str]:
+    """Every refusal row through an install.sh whose text is install_text: the
+    committed-allow-list rows as files of one target, then the malformed one."""
+    failures = []
+    rows = [c for c in REFUSED if c not in CASE_ALLOWLIST]
+    files = {f"{c}.yml": CACHE_RESTORE_CASES[c][0] for c in rows}
+    (tmp / "a").mkdir()
+    repo = target_with_workflows(tmp / "a", files)
+    proc = install_from(kit_with(tmp / "a", install_text=install_text), repo)
+    if proc.returncode != 1:
+        failures.append(f"default allow-list: exit {proc.returncode}")
+    for c in rows:
+        got = install_hits(proc.stderr, f".github/workflows/{c}.yml")
+        if got != sorted(CACHE_RESTORE_CASES[c][1]):
+            failures.append(f"{c}: {got}")
+    try:
+        assert_untouched(repo, files)
+    except AssertionError as exc:
+        failures.append(f"default allow-list: target written: {exc}")
+    for c in [c for c in REFUSED if c in CASE_ALLOWLIST]:
+        (tmp / c).mkdir()
+        files = {"ci.yml": CACHE_RESTORE_CASES[c][0]}
+        repo = target_with_workflows(tmp / c, files)
+        proc = install_from(kit_with(tmp / c, allowlist=CASE_ALLOWLIST[c], install_text=install_text), repo)
+        if proc.returncode != 1 or install_hits(proc.stderr) != sorted(CACHE_RESTORE_CASES[c][1]):
+            failures.append(f"{c}: exit {proc.returncode}, {install_hits(proc.stderr)}")
+    return failures
+
+
+def test_the_shipped_matchers_pass_the_battery(tmp_path):
+    (tmp_path / "py").mkdir()
+    (tmp_path / "sh").mkdir()
+    assert scan_battery_failures(CACHE_RESTORE_PY.read_text(encoding="utf-8"), tmp_path / "py") == []
+    assert install_battery_failures(INSTALL.read_text(encoding="utf-8"), tmp_path / "sh") == []
+
+
+@pytest.mark.parametrize("name,old,new", PY_MUTANTS, ids=[m[0] for m in PY_MUTANTS])
+def test_scan_matcher_mutant_is_killed(tmp_path, name, old, new):
+    mutated = apply_cache_mutant(CACHE_RESTORE_PY.read_text(encoding="utf-8"), old, new)
+    assert scan_battery_failures(mutated, tmp_path), f"mutant {name} survived: the refusal rows stayed green"
+
+
+@pytest.mark.parametrize("name,old,new", SH_MUTANTS, ids=[m[0] for m in SH_MUTANTS])
+def test_install_matcher_mutant_is_killed(tmp_path, name, old, new):
+    mutated = apply_cache_mutant(INSTALL.read_text(encoding="utf-8"), old, new)
+    assert install_battery_failures(mutated, tmp_path), f"mutant {name} survived: the refusal rows stayed green"
