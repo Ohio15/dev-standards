@@ -1,0 +1,39 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    # dev-standards is a public repo: its own workflows carry the hosted
+    # literal (SC-37), never the guarded nexus-ci predicate the templates ship.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # SHA-pinned (SC-25), same refs as every other workflow in this repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache of any kind: a restored cache is state another run wrote
+      # (dep-auto-apply.yml header, audit 2026-10-27 R-C), and setup-python
+      # caches only when `cache` names a manager, so `cache` is never set.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"  # the minor the suite is verified on locally
+
+      - name: Install the pinned test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input -r requirements-dev.txt
+
+      - name: Run the suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs -p no:cacheprovider scripts/tests
