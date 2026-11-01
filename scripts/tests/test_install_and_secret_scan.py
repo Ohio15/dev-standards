@@ -532,3 +532,52 @@ def test_install_skips_the_workflows_it_replaces(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     for name, template in ALL_TEMPLATES.items():
         assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
+
+
+# ── the fleet scan's twin: same table, same answers ──
+
+@pytest.mark.parametrize("name", sorted(ALL_TEMPLATES))
+def test_the_installed_templates_restore_no_cache(name):
+    assert hygiene.cache_restore.find_cache_restores(ALL_TEMPLATES[name].read_text(encoding="utf-8")) == []
+
+
+def enrolled_repo(tmp_path: Path, files: dict[str, str], *, enrolled: bool = True) -> Path:
+    repo = target_with_workflows(tmp_path, files)
+    if enrolled:
+        (repo / ".github" / "auto-apply-enabled").write_text("", encoding="utf-8")
+    return repo
+
+
+@pytest.mark.parametrize("case", list(CACHE_RESTORE_CASES))
+def test_scan_matches_the_installer_on_every_fixture(tmp_path, case):
+    text, want = CACHE_RESTORE_CASES[case]
+    findings = hygiene.scan_cache_restore(enrolled_repo(tmp_path, {"ci.yml": text}))
+    if not want:
+        assert findings == []
+        return
+    [finding] = findings
+    assert finding["severity"] == "MEDIUM" and finding["code"] == "auto-apply-cache-restore"
+    got = sorted((i["line"], i["form"]) for i in finding["items"] if i["path"] == ".github/workflows/ci.yml")
+    assert got == sorted(want) and finding["count"] == len(want)
+
+
+def test_scan_does_not_judge_a_repo_not_enrolled(tmp_path):
+    repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["actions-cache"][0]}, enrolled=False)
+    assert hygiene.scan_cache_restore(repo) == []
+
+
+def test_scan_reads_the_installed_copies_too(tmp_path):
+    """Unlike install.sh (which is about to replace them), the scan judges the
+    installed templates as they are: a stale copy that caches is drift."""
+    repo = enrolled_repo(tmp_path, {"security-audit.yml": CACHE_RESTORE_CASES["setup-go-cache-true"][0],
+                                    "sub/x.yaml": CACHE_RESTORE_CASES["actions-cache"][0]})
+    [finding] = hygiene.scan_cache_restore(repo)
+    assert sorted((i["path"], i["line"], i["form"]) for i in finding["items"]) == [
+        (".github/workflows/security-audit.yml", 7, GO), (".github/workflows/security-audit.yml", 10, KEY),
+        (".github/workflows/sub/x.yaml", 7, ACTIONS_CACHE)]
+
+
+def test_scan_repo_reports_the_finding(tmp_path):
+    repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["buildx-type-gha"][0]})
+    codes = {f["code"] for f in hygiene.scan_repo(repo, 7)["findings"]}
+    assert "auto-apply-cache-restore" in codes
