@@ -307,3 +307,68 @@ def test_github_answer_decides_without_a_flag(tmp_path, private, want_hosted):
         for name, template in ALL_TEMPLATES.items():
             assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
         assert "CI runner (private repository)" in proc.stdout
+
+
+# ─── audit-dev-standards-2026-10-30 LOW (SC-20): the hosted-literal guard ────
+# classifies runs-on positively. The old regex recognised only the one-line
+# `runs-on: <value>` spelling, so a block-form, quoted, aliased or escaped
+# runs-on in a template would have been installed into a public repository.
+
+def kit_with_size_guard_suffix(tmp_path: Path, suffix: str) -> Path:
+    """A copy of the installer and everything it reads, with `suffix`
+    appended to workflows/size-guard.yml."""
+    kit = tmp_path / "kit"
+    kit.mkdir()
+    shutil.copy2(INSTALL, kit / "install.sh")
+    for sub in ("hooks", "security", "templates", "workflows"):
+        shutil.copytree(ROOT / sub, kit / sub)
+    guard = kit / "workflows" / "size-guard.yml"
+    guard.write_bytes(guard.read_bytes() + suffix.encode("utf-8"))
+    return kit
+
+
+UNCLASSIFIABLE_RUNS_ON = {
+    "block-sequence": "  extra:\n    runs-on:\n      - self-hosted\n",
+    "block-group": "  extra:\n    runs-on:\n      group: nexus\n",
+    "block-labels": "  extra:\n    runs-on:\n      labels: [self-hosted]\n",
+    "double-quoted-key": '  extra:\n    "runs-on": self-hosted\n',
+    "single-quoted-key": "  extra:\n    'runs-on': nexus-ci\n",
+    "alias": "  extra:\n    runs-on: *runner\n",
+    "flow-mapping": "  extra: {runs-on: self-hosted, steps: []}\n",
+    "lookalike-label": "  extra:\n    runs-on: ubuntu-latest-gpu\n",
+    "escaped-key": '  extra:\n    "runs\\u002don": self-hosted\n',
+}
+
+
+@pytest.mark.parametrize("spelling", UNCLASSIFIABLE_RUNS_ON)
+def test_hosted_install_refuses_a_runs_on_it_cannot_classify(tmp_path, spelling):
+    kit = kit_with_size_guard_suffix(tmp_path, UNCLASSIFIABLE_RUNS_ON[spelling])
+    repo = target_repo(tmp_path)
+    proc = subprocess.run([BASH, (kit / "install.sh").as_posix(), "--public", "--no-gh", repo.as_posix()],
+                          capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not the guarded predicate or the hosted literal" in proc.stderr, proc.stderr
+    assert not (repo / ".github" / "workflows" / "size-guard.yml").exists()
+
+
+def test_hosted_install_accepts_the_literal_and_comments(tmp_path):
+    kit = kit_with_size_guard_suffix(
+        tmp_path, "  extra:\n    # runs-on: self-hosted would be refused\n    runs-on: ubuntu-latest  \n")
+    repo = target_repo(tmp_path)
+    proc = subprocess.run([BASH, (kit / "install.sh").as_posix(), "--public", "--no-gh", repo.as_posix()],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    installed = (repo / ".github" / "workflows" / "size-guard.yml").read_text(encoding="utf-8")
+    assert installed.endswith("    runs-on: ubuntu-latest  \n")
+
+
+def test_private_install_is_verbatim_whatever_the_spelling(tmp_path):
+    """The classification guards the public/unconfirmed copy only; a private
+    repository gets the template byte for byte."""
+    suffix = UNCLASSIFIABLE_RUNS_ON["block-sequence"]
+    kit = kit_with_size_guard_suffix(tmp_path, suffix)
+    repo = target_repo(tmp_path)
+    proc = subprocess.run([BASH, (kit / "install.sh").as_posix(), "--private", "--no-gh", repo.as_posix()],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (repo / ".github" / "workflows" / "size-guard.yml").read_text(encoding="utf-8").endswith(suffix)

@@ -137,9 +137,23 @@ install_workflow() {
   content="${content%x}"
   content="${content//"$CANON_RUNS_ON"/"$HOSTED_RUNS_ON"}"
   content="${content//"$TOGGLE_RUNS_ON"/"$HOSTED_RUNS_ON"}"
-  # shellcheck disable=SC2016  # the pattern matches the literal text `${{`; no expansion wanted
-  if printf '%s' "$content" | grep -Eq '^[[:space:]]*runs-on:.*(\$\{\{|vars\.|nexus-ci|self-hosted)'; then
-    echo "ERROR: $src has a runs-on that is not the guarded predicate; refusing to install it into a repository not confirmed private" >&2
+  # Positive classification, not a deny-list (audit 2026-10-30, SC-20): after
+  # the substitution, every line that names runs-on outside a comment must be
+  # exactly the hosted literal. Block form (`runs-on:` then `- label`,
+  # `group:` or `labels:` lines), a quoted key, an alias, a tag, a flow
+  # mapping or any other spelling is refused. A double-quoted key with a
+  # backslash escape (`"runs-on":`) could spell runs-on without the
+  # text appearing at all, so it is refused too.
+  local unclassified
+  unclassified="$(printf '%s\n' "$content" | grep -nE 'runs-on' \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE '^[0-9]+:[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' || true)"
+  if [ -z "$unclassified" ]; then
+    unclassified="$(printf '%s\n' "$content" \
+      | grep -nE '^[[:space:]]*([?-][[:space:]]+)*"[^"]*\\[^"]*"[[:space:]]*:' || true)"
+  fi
+  if [ -n "$unclassified" ]; then
+    echo "ERROR: $src has a runs-on that is not the guarded predicate or the hosted literal (line ${unclassified%%:*}); refusing to install it into a repository not confirmed private" >&2
     exit 1
   fi
   printf '%s' "$content" >"$dst"
