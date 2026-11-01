@@ -198,8 +198,11 @@ name: Dependency Auto-Apply (Layer B)
 #   (full topic URL). The URL must be exactly https://ntfy.nexus/<topic>
 #   (SC-11: the host is an allow-listed literal in the step, not taken from
 #   the variable); anything else fails the notify job and nothing is posted.
-#   ntfy.nexus is on the NEXUS LAN, reachable from nexus-ci, not from hosted
-#   runners. Bearer headers reach curl on stdin (-K -), never argv.
+#   ntfy.nexus is on the NEXUS LAN: hosted runners cannot reach it, and
+#   nexus-ci's egress fence currently drops it too (audit 2026-10-30). A
+#   delivery that does not return 2xx FAILS the notify job (curl error or
+#   HTTP code in the ::error::), never a warning. Bearer headers reach curl
+#   on stdin (-K -), never argv.
 #   shared-brain ingest on PR open (Bearer SHARED_BRAIN_TOKEN; gracefully
 #   skipped if the secret isn't set).
 #
@@ -2733,21 +2736,25 @@ jobs:
             body="Weekly auto-apply could not examine every ecosystem. Run: ${run_url}"
             tags="rotating_light,auto-apply-failed"
             prio="urgent"
+            kind="run failed"
           elif [ "$PUBLISH_RESULT" = "failure" ]; then
             title="auto-apply REFUSED: ${REPO}"
             body="The publish job refused or could not open the auto-apply PR (patch validation or PR step failed). Run: ${run_url}"
             tags="rotating_light,auto-apply-failed"
             prio="urgent"
+            kind="publish refused"
           elif [ -n "$broken_url" ]; then
             title="auto-apply BROKEN: ${REPO}"
             body="Tests failed on weekly auto-apply. Draft PR: ${broken_url}"
             tags="warning,auto-apply-broken"
             prio="urgent"
+            kind="tests failed"
           elif [ -n "$ok_url" ]; then
             title="auto-apply PR: ${REPO}"
             body="Weekly auto-apply opened a PR: ${ok_url}"
             tags="white_check_mark,auto-apply"
             prio="default"
+            kind="PR opened"
           else
             echo "::warning::nothing valid to notify about"
             exit "$scope_rc"
@@ -2762,13 +2769,26 @@ jobs:
           }
           cfg=""
           if [ -n "${NTFY_TOKEN:-}" ]; then cfg=$(bearer_config "$NTFY_TOKEN") || exit 0; fi
-          printf '%s\n' "$cfg" | curl -K - -fsS -X POST \
+          # Fail loud (Inbox ae86d275): the variable being set means the owner
+          # expects this alert, so an undelivered one fails the job instead of
+          # a warning nobody reads. -f is off so a 4xx/5xx still yields its
+          # code; curl's own failure (DNS, connect, TLS) yields its exit code.
+          http_code=""
+          curl_rc=0
+          http_code=$(printf '%s\n' "$cfg" | curl -K - -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Title: ${title}" \
             -H "Tags: ${tags}" \
             -H "Priority: ${prio}" \
             -d "${body}" \
-            "$NTFY_URL" || \
-            echo "::warning::ntfy publish failed (non-fatal)"
+            "$NTFY_URL") || curl_rc=$?
+          if [ "$curl_rc" -ne 0 ]; then
+            echo "::error::ntfy delivery failed (curl exit ${curl_rc}): the \"${kind}\" alert was NOT delivered"
+            exit 1
+          fi
+          if ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::ntfy delivery failed (HTTP ${http_code:-no status}): the \"${kind}\" alert was NOT delivered"
+            exit 1
+          fi
           exit "$scope_rc"
 
       - name: Brain ingest (PR opened only)
