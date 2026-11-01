@@ -298,7 +298,7 @@ allow-list), or run in a public repository, can never resolve to a
 self-hosted runner. `&&`/`||` return an operand, so there the expression is
 the literal `ubuntu-latest` whatever `CI_RUNNER` holds. Same-repo pull-request
 code does run on the self-hosted runner; the registrar's run-trust check
-(ci-registrar 0.4.0+) is the server-side control. Trust is a separate,
+(ci-registrar 0.4.1+) is the server-side control. Trust is a separate,
 narrower predicate: `TRUSTED_EVENT` is true only for a schedule, or a push /
 workflow_dispatch of the default branch (merged code), so it is false on
 every pull request whichever runner it lands on, and on an untrusted event
