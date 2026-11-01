@@ -285,9 +285,14 @@ fi
 cache_refused=0
 if [ -d "$target/.github/workflows" ]; then
   wf_list="$(mktemp)"
-  trap 'rm -f "$wf_list"' EXIT
+  wf_sorted="$(mktemp)"
+  trap 'rm -f "$wf_list" "$wf_sorted"' EXIT
   if ! find -H "$target/.github/workflows" \( -type f -o -type l \) \( -name '*.yml' -o -name '*.yaml' \) -print0 >"$wf_list"; then
     echo "ERROR: could not list $target/.github/workflows for the cache-restore check (SC-52); nothing installed" >&2
+    exit 1
+  fi
+  if ! LC_ALL=C sort -z "$wf_list" >"$wf_sorted"; then
+    echo "ERROR: could not sort the workflow list for the cache-restore check (SC-52); nothing installed" >&2
     exit 1
   fi
   while IFS= read -r -d '' wf; do
@@ -309,7 +314,16 @@ if [ -d "$target/.github/workflows" ]; then
       echo "ERROR: $rel:$hit_line: $hit_verb ($hit_form); dep-auto-apply's apply job can poison the default-branch cache scope, so the target must not restore one (SC-52, audit 2026-10-30). Fix the workflow and re-run install.sh." >&2
       cache_refused=1
     done <<<"$hits"
-  done < <(LC_ALL=C sort -z "$wf_list")
+  done <"$wf_sorted"
+  # The sort's status is checked (a failed sort would otherwise yield an
+  # empty list and an install that scanned nothing: fail-open, gate pass 2
+  # note on #73), and the sorted list must hold every entry find produced.
+  n_found="$(tr -cd ' ' <"$wf_list" | wc -c)"
+  n_sorted="$(tr -cd ' ' <"$wf_sorted" | wc -c)"
+  if [ "$n_found" -ne "$n_sorted" ]; then
+    echo "ERROR: the workflow list for the cache-restore check lost entries ($n_sorted of $n_found); nothing installed" >&2
+    exit 1
+  fi
 fi
 [ "$cache_refused" -eq 0 ] || exit 1
 
