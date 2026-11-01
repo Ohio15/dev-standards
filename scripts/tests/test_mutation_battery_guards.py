@@ -64,6 +64,8 @@ SEL_INCOMPAT = "go_mod_incompatible_is_refused"
 SEL_QUOTE = "flow_map_refuses_quotes_yaml_reads_differently or mid_scalar_quote_is_refused"
 SEL_RUNS_ON = "hosted_install_refuses_a_runs_on_it_cannot_classify"
 SEL_CONFIG = "untrusted_config_that_steers_the_audit_is_not_examined"
+SEL_NTFY_HTTP = "ntfy_non_2xx_fails_the_notify_step"
+SEL_NTFY_CURL = "ntfy_curl_failure_fails_the_notify_step"
 
 MUTANTS = [
     # (a) publish validator
@@ -91,6 +93,15 @@ MUTANTS = [
            'die(f"{path}: {key!r} resolution {value!r} has a quote inside a plain scalar")',
            'pass  # die(f"{path}: {key!r} resolution {value!r} has a quote inside a plain scalar")',
            DEP_TESTS, SEL_QUOTE),
+    # (d) dep-auto-apply notify step: a failed ntfy delivery must fail the job
+    Mutant("d1-ntfy-non-2xx-accepted", DEP_AUTO_APPLY,
+           'if ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then',
+           "if false; then",
+           DEP_TESTS, SEL_NTFY_HTTP),
+    Mutant("d2-ntfy-curl-error-accepted", DEP_AUTO_APPLY,
+           'if [ "$curl_rc" -ne 0 ]; then',
+           "if false; then",
+           DEP_TESTS, SEL_NTFY_CURL),
     # (b) install.sh runs-on classifier
     Mutant("b1-unclassified-runs-on-installed", INSTALL,
            '  if [ -n "$unclassified" ]; then\n',
