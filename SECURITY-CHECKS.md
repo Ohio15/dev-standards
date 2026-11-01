@@ -641,7 +641,7 @@ github.repository`), which is exactly what the canonical predicate admits.
 policy `68d983a4`). Before this, any variable-selected runner on a
 PR-reachable job was a finding. A same-repo `pull_request` in a private,
 registrar-served repository is now CLEAR under conditions 1 to 3 above.
-**Amended (PROPOSED, pending Ron's approval; audit-dev-standards-2026-10-27,
+**Amended (approved by Ron 2026-11-01; audit-dev-standards-2026-10-27,
 PR #62).** The guarded literal toggle is ALSO canonical, and is THE canonical
 text for dev-standards fleet templates (which install.sh may copy into any
 repository). Token for token (whitespace aside), Linux:

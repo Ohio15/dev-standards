@@ -276,7 +276,7 @@ Reusable release workflows pick their runner as
 from tag pushes only (see the caller shape above). Synced guard workflows
 (`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it
 with the guarded SC-37 predicate (audit-dev-standards-2026-10-27; register
-amendment PROPOSED on #62):
+amendment approved by Ron 2026-11-01 on #62):
 `${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'merge_group' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && github.event.repository.private && vars.CI_RUNNER == 'nexus-ci' && 'nexus-ci' || 'ubuntu-latest' }}`:
 `nexus-ci` for push, schedule, workflow_dispatch, release, merge_group and a
 SAME-REPO pull request (runner policy amended 2026-10-27, STANDARDS.md), and
