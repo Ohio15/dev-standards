@@ -195,6 +195,11 @@ def inspect(repo: Path, root: Path, canonical: bytes | None) -> dict:
         "has_config": cfg is not None,
         "test_cmd": cfg["test_cmd"] if cfg else None,
         "test_timeout": cfg["test_timeout"] if cfg else None,
+        # Every command the hook executes is reported: TEST_CLEANUP_CMD runs on
+        # every commit whatever the suite's outcome, and TEST_PATHS decides
+        # whether the suite runs at all (audit 2026-10-30, SC-08).
+        "test_cleanup_cmd": cfg["test_cleanup_cmd"] if cfg else None,
+        "test_paths": cfg["test_paths"] if cfg else None,
         "config_problems": cfg["problems"] if cfg else [],
         "detected_test_cmd": detect_test_command(repo),
     }
@@ -215,7 +220,7 @@ def render_markdown(rows: list[dict]) -> str:
         f"{counts['no-hook']} no hook\n\n"
     )
     cols = ["repo", "status", "hook", "identical", "core.hooksPath", ".pre-commit-tests",
-            "TEST_CMD", "TIMEOUT", "detected"]
+            "TEST_CMD", "TEST_CLEANUP_CMD", "TEST_PATHS", "TIMEOUT", "detected"]
     lines = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
     for r in rows:
         cfg = _cell(r["has_config"])
@@ -225,7 +230,8 @@ def render_markdown(rows: list[dict]) -> str:
         lines.append("| " + " | ".join([
             _cell(r["path"]), r["status"], _cell(r["has_hook"]),
             _cell(r["hook_identical_to_canonical"]), _cell(r["hooks_path"]), _cell(cfg),
-            _cell(r["test_cmd"]), _cell(r["test_timeout"]), _cell(r["detected_test_cmd"]),
+            _cell(r["test_cmd"]), _cell(r["test_cleanup_cmd"]), _cell(r["test_paths"]),
+            _cell(r["test_timeout"]), _cell(r["detected_test_cmd"]),
         ]) + " |")
     return head + "\n".join(lines) + "\n"
 
