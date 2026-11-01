@@ -159,6 +159,106 @@ install_workflow() {
   printf '%s' "$content" >"$dst"
 }
 
+# Cache-restore refusal (register SC-52; audit-dev-standards-2026-10-30,
+# MEDIUM). dep-auto-apply.yml's apply job runs dependency code on the default
+# branch and can write that branch's Actions cache scope, so a repository that
+# carries it must not restore an Actions cache in ANY workflow. Checked before
+# anything is written, so a refused target is left exactly as it was. The
+# three workflows this run writes are skipped: they are about to be replaced
+# by templates the dev-standards suite already holds to the rule. There is no
+# bypass: the target fixes its workflow. Every *.yml/*.yaml under
+# .github/workflows (recursively) is read.
+#
+# CACHE_RESTORE_AWK prints "<line>\t<form>" per hit. It is the awk twin of
+# scripts/cache_restore.py (the fleet scan's matcher): see that file for the
+# forms and their reasons. One fixture table in
+# scripts/tests/test_install_and_secret_scan.py runs through both and asserts
+# identical hits, so change them together.
+CACHE_RESTORE_AWK="$(cat <<'AWK'
+function ind(s) { match(s, /^ */); return RLENGTH }
+function code(s) { return s !~ /^[ \t]*(#|$)/ }
+function isfalse(v) {
+  sub(/[ \t]+#.*$/, "", v); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+  return v == "false" || v == "'false'" || v == "\"false\""
+}
+function cachekey(s,   rest) {
+  if (!match(s, /(^[ \t]*(-[ \t]+)?|[{,][ \t]*)["']?cache["']?[ \t]*:/)) return 0
+  rest = substr(s, RSTART + RLENGTH)
+  if (rest != "" && rest !~ /^[ \t]/) return 0
+  if (substr(s, RSTART, 1) ~ /[{,]/) sub(/[,}].*$/, "", rest)
+  return !isfalse(rest)
+}
+function switched_off(i, key,   u, start, dash, j, e, w, wc, k, rest) {
+  u = ind(L[i]); start = 0
+  if (L[i] ~ /^ *-[ \t]/) { start = i; dash = u }
+  else for (j = i - 1; j >= 1; j--) {
+    if (!code(L[j])) continue
+    if (ind(L[j]) < u) { if (L[j] ~ /^ *-[ \t]/) { start = j; dash = ind(L[j]) }; break }
+  }
+  if (!start) return 0
+  e = start + 1
+  while (e <= n && !(code(L[e]) && ind(L[e]) <= dash)) e++
+  for (w = start; w < e; w++) {
+    if (!match(L[w], /^ *(-[ \t]+)?["']?with["']?[ \t]*:[ \t]*(#.*)?$/)) continue
+    match(L[w], /^ *(-[ \t]+)?/); wc = RLENGTH
+    for (k = w + 1; k < e; k++) {
+      if (!code(L[k])) continue
+      if (ind(L[k]) <= wc) break
+      if (match(L[k], "^ *[\"']?" key "[\"']?[ \t]*:")) {
+        rest = substr(L[k], RSTART + RLENGTH)
+        if ((rest == "" || rest ~ /^[ \t]/) && isfalse(rest)) return 1
+      }
+    }
+  }
+  return 0
+}
+{ sub(/\r$/, ""); L[NR] = tolower($0) }
+END {
+  n = NR
+  for (i = 1; i <= n; i++) {
+    s = L[i]
+    if (!code(s)) continue
+    if (cachekey(s)) print i "\tcache: not false"
+    if (index(s, "actions/cache@") || index(s, "actions/cache/")) print i "\tactions/cache"
+    if (index(s, "type=gha")) print i "\ttype=gha"
+    if (match(s, /(^|[ \t{,-])["']?uses["']?[ \t]*:[ \t]*["']?actions\/setup-(go|node)@/)) {
+      if (substr(s, RSTART, RLENGTH) ~ /setup-go@$/) {
+        if (!switched_off(i, "cache")) print i "\tsetup-go without cache: false"
+      } else if (!switched_off(i, "package-manager-cache")) {
+        print i "\tsetup-node without package-manager-cache: false"
+      }
+    }
+  }
+}
+AWK
+)"
+
+cache_refused=0
+if [ -d "$target/.github/workflows" ]; then
+  wf_list="$(mktemp)"
+  trap 'rm -f "$wf_list"' EXIT
+  if ! find -H "$target/.github/workflows" \( -type f -o -type l \) \( -name '*.yml' -o -name '*.yaml' \) -print0 >"$wf_list"; then
+    echo "ERROR: could not list $target/.github/workflows for the cache-restore check (SC-52); nothing installed" >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' wf; do
+    rel="${wf#"$target/"}"
+    case "$rel" in
+      .github/workflows/size-guard.yml|.github/workflows/security-audit.yml|.github/workflows/dep-auto-apply.yml) continue ;;
+    esac
+    if ! hits="$(awk "$CACHE_RESTORE_AWK" "$wf")"; then
+      echo "ERROR: $rel: could not be read for the cache-restore check (SC-52); nothing installed" >&2
+      exit 1
+    fi
+    while IFS=$'\t' read -r hit_line hit_form; do
+      [ -n "$hit_line" ] || continue
+      echo "ERROR: $rel:$hit_line: restores an Actions cache ($hit_form); dep-auto-apply's apply job can poison the default-branch cache scope, so the target must not restore one (SC-52, audit 2026-10-30). Fix the workflow and re-run install.sh." >&2
+      cache_refused=1
+    done <<<"$hits"
+  done < <(LC_ALL=C sort -z "$wf_list")
+fi
+[ "$cache_refused" -eq 0 ] || exit 1
+
 mkdir -p "$target/.githooks" "$target/.github/workflows"
 
 # Chained dispatcher + sub-hooks. Each sub-hook is independently executable so

@@ -21,6 +21,7 @@ Run:  python -m pytest scripts/tests -q
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -372,3 +373,162 @@ def test_private_install_is_verbatim_whatever_the_spelling(tmp_path):
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (repo / ".github" / "workflows" / "size-guard.yml").read_text(encoding="utf-8").endswith(suffix)
+
+
+# ─── audit-dev-standards-2026-10-30 MEDIUM (SC-52): cache-restore refusal ────
+# dep-auto-apply's apply job can write the default-branch Actions cache scope,
+# so install.sh refuses a target whose other workflows restore a cache, and
+# the fleet scan reports an enrolled repo that does. ONE fixture table runs
+# through both matchers (install.sh's awk, scripts/cache_restore.py via the
+# scan) and both must report exactly the (line, form) pairs listed, so the
+# twins cannot drift apart.
+
+_SCAN_SCRIPT = ROOT / "scripts" / "repo-hygiene-scan.py"
+_SCAN_SPEC = importlib.util.spec_from_file_location("hygiene_cache", _SCAN_SCRIPT)
+hygiene = importlib.util.module_from_spec(_SCAN_SPEC)
+assert _SCAN_SPEC.loader is not None
+_SCAN_SPEC.loader.exec_module(hygiene)
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+KEY, ACTIONS_CACHE, GHA = "cache: not false", "actions/cache", "type=gha"
+GO, NODE = "setup-go without cache: false", "setup-node without package-manager-cache: false"
+
+
+def wf(*steps: str) -> str:
+    """A workflow whose first step line is line 7."""
+    return ("name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + "".join("      " + s + "\n" for s in steps))
+
+
+CACHE_RESTORE_CASES: dict[str, tuple[str, list[tuple[int, str]]]] = {
+    # (a) a `cache:` key that is not false
+    "setup-node-cache-npm": (wf(f"- uses: actions/setup-node@{SHA}", "  with:", "    node-version: 22",
+                                "    cache: npm", "    package-manager-cache: false"), [(10, KEY)]),
+    "setup-python-cache-quoted-pip": (wf(f"- uses: actions/setup-python@{SHA}", "  with:",
+                                         "    python-version: '3.12'", "    cache: 'pip'"), [(10, KEY)]),
+    "setup-go-cache-true": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                               "    cache: true"), [(7, GO), (10, KEY)]),
+    "uppercase-key-and-value": (wf("- name: Set up Go", f"  uses: actions/setup-go@{SHA}", "  with:",
+                                   "    Cache: TRUE"), [(8, GO), (10, KEY)]),
+    "flow-mapping-cache": (wf("- {uses: actions/setup-python@" + SHA + ", with: {python-version: '3.12', cache: pip}}"),
+                           [(7, KEY)]),
+    # (b) actions/cache and its sub-actions, any ref
+    "actions-cache": (wf(f"- uses: actions/cache@{SHA}", "  with:", "    path: ~/.npm", "    key: npm"),
+                      [(7, ACTIONS_CACHE)]),
+    "actions-cache-restore": (wf(f"- uses: actions/cache/restore@{SHA}", "  with:", "    path: ~/.npm",
+                                 "    key: npm"), [(7, ACTIONS_CACHE)]),
+    "actions-cache-save-mixed-case": (wf("- uses: Actions/Cache/save@v4", "  with:", "    path: x", "    key: k"),
+                                      [(7, ACTIONS_CACHE)]),
+    # (c) the buildx GitHub Actions cache backend
+    "buildx-type-gha": (wf(f"- uses: docker/build-push-action@{SHA}", "  with:", "    push: false",
+                           "    cache-from: type=gha", "    cache-to: type=gha,mode=max"), [(10, GHA), (11, GHA)]),
+    # (d) setup-go defaults cache ON; (e) setup-node v5+ defaults npm cache ON
+    "setup-go-default-cache": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'"),
+                               [(7, GO)]),
+    "setup-go-no-with": (wf(f"- uses: actions/setup-go@{SHA}", "- run: go test ./..."), [(7, GO)]),
+    "setup-go-false-in-the-next-step": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                                           f"- uses: actions/setup-node@{SHA}", "  with:", "    cache: false",
+                                           "    package-manager-cache: false"), [(7, GO)]),
+    "setup-node-default-cache": (wf(f"- uses: actions/setup-node@{SHA}", "  with:", "    node-version: 22"),
+                                 [(7, NODE)]),
+    "crlf-setup-go-default-cache": (wf(f"- uses: actions/setup-go@{SHA}", "  with:",
+                                       "    go-version: '1.23'").replace("\n", "\r\n"), [(7, GO)]),
+    # accepted: caching explicitly off, or only mentioned in a comment
+    "cache-false-spellings": (wf(f"- uses: actions/setup-go@{SHA}", "  with:", "    go-version: '1.23'",
+                                 "    cache: false", "- name: node", f"  uses: actions/setup-node@{SHA}",
+                                 "  with:", '    cache: "false"   # explicit',
+                                 "    package-manager-cache: 'false'"), []),
+    "setup-go-with-before-uses": (wf("- name: go", "  with:", "    cache: false",
+                                     f"  uses: actions/setup-go@{SHA}"), []),
+    "forms-in-comment-lines": (wf(f"# - uses: actions/cache@{SHA}", "#   cache: npm", "  # cache-from: type=gha",
+                                  f"# - uses: actions/setup-go@{SHA}", "- run: echo ok"), []),
+    "no-cache-anywhere": (wf("- uses: actions/checkout@" + SHA, "- run: make test"), []),
+}
+REFUSED = [c for c, (_, want) in CACHE_RESTORE_CASES.items() if want]
+ACCEPTED = [c for c, (_, want) in CACHE_RESTORE_CASES.items() if not want]
+_HIT_RE = re.compile(r"^ERROR: (\S+?):(\d+): restores an Actions cache \((.+?)\); dep-auto-apply's apply job "
+                     r"can poison the default-branch cache scope, so the target must not restore one "
+                     r"\(SC-52, audit 2026-10-30\)\. Fix the workflow and re-run install\.sh\.$", re.M)
+
+
+def test_the_fixture_table_covers_every_form():
+    forms = {f for _, want in CACHE_RESTORE_CASES.values() for _, f in want}
+    assert forms == {KEY, ACTIONS_CACHE, GHA, GO, NODE}
+
+
+def target_with_workflows(tmp_path: Path, files: dict[str, str]) -> Path:
+    repo = target_repo(tmp_path)
+    for rel, text in files.items():
+        path = repo / ".github" / "workflows" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode("utf-8"))
+    return repo
+
+
+def assert_untouched(repo: Path, files: dict[str, str]) -> None:
+    """A refused install wrote nothing: no file, no config, no index entry."""
+    present = {p.relative_to(repo).as_posix() for p in repo.rglob("*")
+               if p.is_file() and p.relative_to(repo).parts[0] != ".git"}
+    assert present == {f".github/workflows/{rel}" for rel in files}, present
+    for rel, text in files.items():
+        assert (repo / ".github" / "workflows" / rel).read_bytes() == text.encode("utf-8")
+    assert subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath"],
+                          capture_output=True, text=True).returncode != 0
+    assert subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True).stdout == ""
+
+
+@pytest.mark.parametrize("case", REFUSED)
+@pytest.mark.parametrize("flags", [("--private", "--no-gh"), ("--public", "--no-gh")], ids=["private", "public"])
+def test_install_refuses_a_target_that_restores_an_actions_cache(tmp_path, case, flags):
+    text, want = CACHE_RESTORE_CASES[case]
+    files = {"ci.yml": text}
+    repo = target_with_workflows(tmp_path, files)
+    proc = install(repo, *flags)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    got = sorted((int(line), form) for path, line, form in _HIT_RE.findall(proc.stderr)
+                 if path == ".github/workflows/ci.yml")
+    assert got == sorted(want), proc.stderr
+    assert "Installed into" not in proc.stdout
+    assert_untouched(repo, files)
+
+
+@pytest.mark.parametrize("case", ACCEPTED)
+def test_install_accepts_a_target_that_restores_no_cache(tmp_path, case):
+    text, _ = CACHE_RESTORE_CASES[case]
+    repo = target_with_workflows(tmp_path, {"ci.yml": text})
+    proc = install(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restores an Actions cache" not in proc.stderr
+    assert (repo / ".github" / "workflows" / "ci.yml").read_bytes() == text.encode("utf-8")
+    assert (repo / ".github" / "workflows" / "dep-auto-apply.yml").read_bytes() == DEP_TEMPLATE.read_bytes()
+
+
+def test_install_accepts_a_target_with_no_workflows_dir(tmp_path):
+    repo = target_repo(tmp_path)
+    proc = install(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restores an Actions cache" not in proc.stderr
+
+
+def test_install_reports_every_hit_in_every_file_and_still_writes_nothing(tmp_path):
+    files = {"a-clean.yml": CACHE_RESTORE_CASES["no-cache-anywhere"][0],
+             "b-node.yaml": CACHE_RESTORE_CASES["setup-node-cache-npm"][0],
+             "nested/c-go.yml": CACHE_RESTORE_CASES["setup-go-default-cache"][0]}
+    repo = target_with_workflows(tmp_path, files)
+    proc = install(repo)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    got = sorted((p, int(line), f) for p, line, f in _HIT_RE.findall(proc.stderr))
+    assert got == [(".github/workflows/b-node.yaml", 10, KEY), (".github/workflows/nested/c-go.yml", 7, GO)]
+    assert_untouched(repo, files)
+
+
+def test_install_skips_the_workflows_it_replaces(tmp_path):
+    """A stale installed copy (n3xus-notify's security-audit.yml carried
+    `cache: true` on setup-go) is overwritten by this run, so it is not a
+    reason to refuse; the replacement restores no cache."""
+    bad = CACHE_RESTORE_CASES["setup-go-cache-true"][0]
+    repo = target_with_workflows(tmp_path, {n: bad for n in ALL_TEMPLATES})
+    proc = install(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for name, template in ALL_TEMPLATES.items():
+        assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
