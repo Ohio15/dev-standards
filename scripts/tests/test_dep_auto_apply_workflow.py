@@ -1100,7 +1100,7 @@ NOTIFY_STEPS = ["id:ref_guard", "id:notify", "id:brain"]
 RUN_SHA256 = {
     "publish": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "verify": "54a50f5a2d821932c2c17d7c51c0c9c55aa6cd83bd3cfa6d28ce0697d61eb562",
+        "verify": "12f71fc60c5b576d8bb4ad74bba8c0e471fa7015d9f21a6e2d564f4ff7213f2e",
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
@@ -1470,12 +1470,13 @@ def test_pnpm_specifier_allow_list_refuses(tmp_path, shim_path, spec):
 
 @pytest.mark.parametrize("spec", ["^1.2.0", "'~1.2.3'", '">=1.0.0 <2.0.0"', "1.2.3", "npm:@scope/pkg@^1.2.0", "latest",
                                   "1.x", "'*'", "^1.0.0 || ^2.0.0", "1.0.0 - 2.0.0", "1.0.0-beta.1", "npm:pkg@~2.1.0"])
-def test_pnpm_specifier_allow_list_accepts(tmp_path, shim_path, spec):
-    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
-    checkout = fresh_checkout(tmp_path, repo)
-    write(repo, "pnpm-lock.yaml", PNPM.replace("specifier: ^1.0.0", "specifier: " + spec))
-    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
-    assert v.returncode == 0, v.stdout + v.stderr
+def test_pnpm_specifier_allow_list_accepts(spec):
+    # The LINE allow-list admits every specifier grammar; whether a changed
+    # specifier is an acceptable MOVE is judged separately (range_move, audit
+    # 2026-10-30), so this exercises check_lock_lines on its own.
+    ns = _validator_namespace()
+    ns["die"] = lambda msg: (_ for _ in ()).throw(AssertionError(msg))
+    ns["check_lock_lines"]("pnpm-lock.yaml", PNPM, ["        specifier: " + spec])
 
 
 # ─── discovery 80017686 (OpenOBD gate 2026-10-25): SC-11, SC-29 plan limit, SC-37 ──
@@ -1742,9 +1743,6 @@ def test_requirements_name_spelling_is_one_project(tmp_path, shim_path):
      + "==, tarball: https://registry.npmjs.org/c/-/c-1.0.0.tgz}\n", "set of package names in packages changed"),
     (PNPM.replace("      local:\n", "      c:\n        specifier: ^1.0.0\n        version: 1.0.0\n      local:\n"),
      "importer '.' dependencies changed"),
-    (PNPM.replace("tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n",
-                  "tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n    requiresBuild: true\n"),
-     "gains requiresBuild"),
     (PNPM.replace("{integrity: sha512-" + "A" * 86 + "==, tarball: https://registry.npmjs.org/a/-/a-1.0.0.tgz}",
                   "{integrity: sha512-" + "A" * 86 + "==, type: custom}"), "is not a registry tarball"),
 ])
@@ -1919,10 +1917,29 @@ def test_pnpm_odd_but_consistent_indent_is_read_and_bound(tmp_path, shim_path, s
             expect="is not the registry tarball of a@1.0.1")
 
 
-def test_pnpm_requires_build_at_an_odd_indent_is_seen(tmp_path, shim_path):
-    block = "  a@1.0.1:\n       resolution: {integrity: %s, tarball: %s}\n       requiresBuild: true\n" % (INTEG, GOOD_TB)
-    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
-            lambda r: write(r, "pnpm-lock.yaml", pnpm_bumped_with_packages(block)), expect="gains requiresBuild")
+def test_pnpm_dependency_map_at_an_odd_indent_is_read_and_bound(tmp_path, shim_path):
+    """Was the requiresBuild odd-indent case; pnpm computes install scripts
+    from the fetched package, so that guard is gone (audit 2026-10-30 LOW)
+    and the odd-indent read is proven on a dependency edge instead."""
+    base = PNPM_EDGES.replace("    dependencies:\n      jsonwebtoken: 9.0.2\n",
+                              "       dependencies:\n            jsonwebtoken: 9.0.2\n")
+    assert base != PNPM_EDGES
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": base},
+            lambda r: write(r, "pnpm-lock.yaml", base.replace("            jsonwebtoken: 9.0.2",
+                                                              "            jsonwebtoken: evil-dev@1.0.0")),
+            expect="(an alias the base lockfile never had)")
+
+
+def test_pnpm_requires_build_is_not_judged_and_not_claimed(tmp_path, shim_path):
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", pnpm_bumped_with_packages(
+        "  a@1.0.1:\n    resolution: {integrity: %s, tarball: %s}\n    requiresBuild: true\n" % (INTEG, GOOD_TB)))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+    body = Path(v.outputs["body_path"]).read_text(encoding="utf-8")
+    assert "cannot see install scripts of pnpm packages" in body
+    assert "requiresBuild" not in publish_step("verify")["run"]
 
 
 @pytest.mark.parametrize("block,expect", [
@@ -1951,12 +1968,15 @@ def test_pnpm_odd_but_consistent_indent_accepts_a_real_bump(tmp_path, shim_path)
     assert v.returncode == 0, v.stdout + v.stderr
 
 
-@pytest.mark.parametrize("version", ["9.9.9", "evil@1.0.1"])
-def test_pnpm_importer_version_must_name_a_package_record(tmp_path, shim_path, version):
+@pytest.mark.parametrize("version,expect", [
+    ("9.9.9", "names no package record"),
+    ("evil@1.0.1", "(an alias the base lockfile never had)"),
+])
+def test_pnpm_importer_version_must_name_a_package_record(tmp_path, shim_path, version, expect):
     refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
             lambda r: write(r, "pnpm-lock.yaml",
                             PNPM.replace("        version: 1.0.0\n", "        version: %s\n" % version)),
-            expect="names no package record")
+            expect=expect)
 
 
 def test_yaml_blocks_reads_relative_nesting():
@@ -1964,3 +1984,333 @@ def test_yaml_blocks_reads_relative_nesting():
     ns["die"] = lambda msg: (_ for _ in ()).throw(AssertionError(msg))
     doc = ns["yaml_blocks"]("x", "a:\n   b: 1\n   c:\n         - x\n         - 'y'\nd: {}\n")
     assert doc == {"a": {"b": "1", "c": ["x", "y"]}, "d": "{}"}
+
+
+# ─── audit-dev-standards-2026-10-30 HIGH: every pnpm dependency EDGE is bound ─
+# to a package of its own name. The audit's proof of concept was a one-line
+# lockfile edit, specifier and package.json untouched, that publish accepted
+# (`verified 1 file(s): pnpm-lock.yaml`, rc=0): an importer `version:` or a
+# snapshot dependency pointed at another package already in the lockfile.
+
+def _sri(ch: str) -> str:
+    return "sha512-" + ch * 86 + "=="
+
+
+PNPM_EDGES = (
+    "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n"
+    "      express:\n        specifier: ^4.18.2\n        version: 4.18.2\n"
+    "      jsonwebtoken:\n        specifier: ^9.0.0\n        version: 9.0.2\n"
+    "    devDependencies:\n      evil-dev:\n        specifier: ^1.0.0\n        version: 1.0.0\n"
+    "\npackages:\n\n"
+    "  evil-dev@1.0.0:\n    resolution: {integrity: %s}\n\n"
+    "  express@4.18.2:\n    resolution: {integrity: %s}\n\n"
+    "  jsonwebtoken@9.0.2:\n    resolution: {integrity: %s}\n"
+    "\nsnapshots:\n\n"
+    "  evil-dev@1.0.0: {}\n\n"
+    "  express@4.18.2:\n    dependencies:\n      jsonwebtoken: 9.0.2\n\n"
+    "  jsonwebtoken@9.0.2: {}\n"
+) % (_sri("E"), _sri("X"), _sri("J"))
+
+PNPM_V6_EDGES = (
+    "lockfileVersion: '6.0'\n\ndependencies:\n"
+    "  express:\n    specifier: ^4.18.2\n    version: 4.18.2\n"
+    "  jsonwebtoken:\n    specifier: ^9.0.0\n    version: 9.0.2\n"
+    "\ndevDependencies:\n  evil-dev:\n    specifier: ^1.0.0\n    version: 1.0.0\n"
+    "\npackages:\n\n"
+    "  /evil-dev@1.0.0:\n    resolution: {integrity: %s}\n    dev: true\n\n"
+    "  /express@4.18.2:\n    resolution: {integrity: %s}\n    dependencies:\n      jsonwebtoken: 9.0.2\n    dev: false\n\n"
+    "  /jsonwebtoken@9.0.2:\n    resolution: {integrity: %s}\n    dev: false\n"
+) % (_sri("E"), _sri("X"), _sri("J"))
+
+
+def test_pnpm_importer_alias_redirect_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_EDGES.replace(
+                "        version: 9.0.2\n", "        version: evil-dev@1.0.0\n")),
+            expect="importer '.' dependencies.jsonwebtoken = 'evil-dev@1.0.0' resolves to another package, evil-dev")
+
+
+@pytest.mark.parametrize("alias", ["evil-dev@1.0.0", "/evil-dev@1.0.0", "/evil-dev/1.0.0",
+                                   "evil-dev@1.0.0(react@18.0.0)", "'evil-dev@1.0.0'"])
+def test_pnpm_snapshot_edge_alias_redirect_is_refused(tmp_path, shim_path, alias):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_EDGES.replace(
+                "      jsonwebtoken: 9.0.2\n", "      jsonwebtoken: %s\n" % alias)),
+            expect="snapshots record express dependencies.jsonwebtoken")
+
+
+def test_pnpm_snapshot_edge_alias_message_names_the_alias(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_EDGES.replace(
+                "      jsonwebtoken: 9.0.2\n", "      jsonwebtoken: evil-dev@1.0.0\n")),
+            expect="resolves to another package, evil-dev (an alias the base lockfile never had)")
+
+
+def test_pnpm_v6_packages_record_edge_alias_redirect_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_V6_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_V6_EDGES.replace(
+                "      jsonwebtoken: 9.0.2\n", "      jsonwebtoken: /evil-dev@1.0.0\n")),
+            expect="packages record express dependencies.jsonwebtoken = '/evil-dev@1.0.0' resolves to another package")
+
+
+def test_pnpm_v6_importer_alias_redirect_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_V6_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_V6_EDGES.replace(
+                "    version: 9.0.2\n", "    version: /evil-dev@1.0.0\n")),
+            expect="resolves to another package, evil-dev")
+
+
+def test_pnpm_snapshot_edge_to_an_absent_record_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM_EDGES.replace(
+                "      jsonwebtoken: 9.0.2\n", "      jsonwebtoken: 9.0.3\n")),
+            expect="snapshots record express dependencies.jsonwebtoken = '9.0.3' names no package record")
+
+
+def test_pnpm_edges_bumped_together_are_accepted(tmp_path, shim_path):
+    """The positive case: jsonwebtoken 9.0.2 -> 9.0.3 in packages, snapshots,
+    the importer and express's snapshot edge."""
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": PNPM_EDGES})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", PNPM_EDGES.replace("9.0.2", "9.0.3").replace(_sri("J"), _sri("K")))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_pnpm_alias_the_base_already_had_may_move_forward(tmp_path, shim_path):
+    base = PNPM_EDGES.replace("      jsonwebtoken: 9.0.2\n", "      jsonwebtoken: evil-dev@1.0.0\n")
+    repo = base_repo(tmp_path, {"pnpm-lock.yaml": base})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "pnpm-lock.yaml", base.replace("1.0.0", "1.0.1").replace("specifier: ^1.0.1", "specifier: ^1.0.0")
+          .replace(_sri("E"), _sri("F")))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+# ─── audit-dev-standards-2026-10-30 MEDIUM: versions move forward, within the ─
+# major and the declared range; removing a pin is a change ────────────────────
+
+def _npm_a(version: str, **drop) -> dict:
+    rec = {"version": version, "resolved": f"https://registry.npmjs.org/a/-/a-{version}.tgz",
+           "integrity": sri(f"a-{version}")}
+    for k in drop:
+        rec.pop(k)
+    return rec
+
+
+@pytest.mark.parametrize("base,new,expect", [
+    (_npm_a("1.2.0"), _npm_a("1.1.0"), "version: 1.1.0 is not newer than the base version 1.2.0"),
+    # The audit's probe: a major drop with resolved and integrity deleted.
+    (_npm_a("1.0.0"), _npm_a("0.1.0", resolved=1, integrity=1), "version: 0.1.0 changes the major version"),
+])
+def test_npm_lock_downgrade_is_refused(tmp_path, shim_path, base, new, expect):
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock(**{"node_modules/a": base})},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"node_modules/a": new})), expect=expect)
+
+
+@pytest.mark.parametrize("field", ["integrity", "resolved"])
+def test_npm_lock_pin_removal_is_refused(tmp_path, shim_path, field):
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock()},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"node_modules/a": _npm_a("1.0.1", **{field: 1})})),
+            expect=f"drops its `{field}`")
+
+
+def test_npm_lock_pin_removal_on_a_hoisted_position_is_refused(tmp_path, shim_path):
+    nested = "node_modules/a/node_modules/@s/b"
+    rec = {"version": "2.0.0", "resolved": "https://registry.npmjs.org/@s/b/-/b-2.0.0.tgz", "integrity": sri("b-2.0.0")}
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock(**{"node_modules/@s/b": None, nested: rec})},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"node_modules/@s/b": {
+                "version": "2.0.0", "resolved": "https://registry.npmjs.org/@s/b/-/b-2.0.0.tgz"}})),
+            expect="drops its `integrity`")
+
+
+def test_npm_lock_top_level_version_outside_the_root_range_is_refused(tmp_path, shim_path):
+    root = {"name": "t", "version": "1.0.0", "dependencies": {"a": "~1.0.0", "@s/b": "^2.0.0"}}
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock(**{"": root})},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"": root, "node_modules/a": _npm_a("1.1.0")})),
+            expect="1.1.0 is outside the declared range '~1.0.0'")
+
+
+def test_npm_lock_root_spec_widening_is_refused(tmp_path, shim_path):
+    root = {"name": "t", "version": "1.0.0", "dependencies": {"a": "*", "@s/b": "^2.0.0"}}
+    refused(tmp_path, shim_path, {"package-lock.json": npm_lock()},
+            lambda r: write(r, "package-lock.json", npm_lock(**{"": root})),
+            expect="'^1.0.0' -> '*': only a ^, ~, >=, = or exact X.Y.Z range may move")
+
+
+PKG_LODASH = '{\n  "name": "t",\n  "version": "1.0.0",\n  "dependencies": {"lodash": "%s"}\n}\n'
+
+
+@pytest.mark.parametrize("old,new,expect", [
+    ("^4.17.21", "*", "'^4.17.21' -> '*': only a ^, ~, >=, = or exact X.Y.Z range may move"),
+    ("^4.17.21", ">=0.0.1", "changes the range operator"),
+    ("^9.0.0", "^8.0.0", "8.0.0 changes the major version"),
+    ("^4.17.21", "^4.17.20", "4.17.20 is not newer than the base version 4.17.21"),
+    ("~1.2.3", "~1.3.0", "'~1.3.0' leaves the base range '~1.2.3'"),
+    ("^4.17.21", "^4.17.21 || ^5.0.0", "only a ^, ~"),
+])
+def test_package_json_range_must_move_forward(tmp_path, shim_path, old, new, expect):
+    refused(tmp_path, shim_path, {"package.json": PKG_LODASH % old},
+            lambda r: write(r, "package.json", PKG_LODASH % new), expect=expect)
+
+
+@pytest.mark.parametrize("old,new", [("^4.17.21", "^4.17.22"), ("~1.2.3", "~1.2.9"), ("4.17.21", "4.18.0"),
+                                     (">=1.0.0", ">=1.4.0")])
+def test_package_json_forward_range_is_accepted(tmp_path, shim_path, old, new):
+    repo = base_repo(tmp_path, {"package.json": PKG_LODASH % old})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "package.json", PKG_LODASH % new)
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_pnpm_importer_version_outside_its_specifier_is_refused(tmp_path, shim_path):
+    base = PNPM.replace("specifier: ^1.0.0", "specifier: ~1.0.0")
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": base},
+            lambda r: write(r, "pnpm-lock.yaml", base.replace("1.0.0", "1.1.0").replace("~1.1.0", "~1.0.0")),
+            expect="importer '.' dependencies.a: 1.1.0 is outside the declared range '~1.0.0'")
+
+
+def test_pnpm_downgrade_under_an_unchanged_specifier_is_refused(tmp_path, shim_path):
+    """The audit's pnpm probe shape: jsonwebtoken 9.0.2 -> 0.1.0, specifier ^9.0.0 kept."""
+    new = (PNPM_EDGES.replace("9.0.2", "0.1.0").replace("specifier: ^0.1.0", "specifier: ^9.0.0")
+           .replace(_sri("J"), _sri("Q")))
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM_EDGES},
+            lambda r: write(r, "pnpm-lock.yaml", new), expect="0.1.0 changes the major version")
+
+
+def test_pnpm_same_major_downgrade_is_refused(tmp_path, shim_path):
+    base = PNPM_EDGES.replace("9.0.2", "9.0.5")
+    new = base.replace("9.0.5", "9.0.2").replace(_sri("J"), _sri("Q"))
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": base},
+            lambda r: write(r, "pnpm-lock.yaml", new), expect="9.0.2 is not newer than the base version 9.0.5")
+
+
+def test_pnpm_specifier_widening_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", PNPM.replace("specifier: ^1.0.0", "specifier: '*'")),
+            expect="only a ^, ~, >=, = or exact X.Y.Z range may move")
+
+
+def test_go_mod_downgrade_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"go.mod": GOMOD},
+            lambda r: write(r, "go.mod", GOMOD.replace("v0.3.5", "v0.3.4")),
+            expect="require golang.org/x/text: v0.3.4 is not newer than the base version v0.3.5")
+
+
+def test_go_mod_major_change_is_refused(tmp_path, shim_path):
+    base = GOMOD.replace("golang.org/x/text v0.3.5", "github.com/o/m v1.4.2")
+    refused(tmp_path, shim_path, {"go.mod": base},
+            lambda r: write(r, "go.mod", base.replace("v1.4.2", "v0.9.0")), expect="v0.9.0 changes the major version")
+
+
+@pytest.mark.parametrize("new,expect", [
+    ("requests==2.30.0\n", "requests: 2.30.0 is not newer than the base version 2.31.0"),
+    ("requests==3.0.0\n", "requests: 3.0.0 changes the major version"),
+    ("requests~=2.31.0\n", "changes the operator, not the version"),
+    ("requests==2.31.0rc1\n", "2.31.0rc1 is not newer than the base version 2.31.0"),
+])
+def test_requirements_downgrade_is_refused(tmp_path, shim_path, new, expect):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests==2.31.0\n"},
+            lambda r: write(r, "requirements.txt", new), expect=expect)
+
+
+def test_requirements_leaving_a_base_compatible_release_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"requirements.txt": "requests~=2.31.0\n"},
+            lambda r: write(r, "requirements.txt", "requests==2.33.0\n"),
+            expect="requests ==2.33.0 leaves the base specifier ~=2.31.0")
+
+
+# ─── audit-dev-standards-2026-10-30 MEDIUM: no Go pseudo-version or ──────────
+# +incompatible unless the base already used that form for the module ────────
+
+@pytest.mark.parametrize("new,expect", [
+    ("v0.3.6-0.20261030000000-abcdef123456", "is a pseudo-version"),
+    ("v0.0.0-20261030000000-abcdef123456", "is a pseudo-version"),
+    ("v0.3.6-pre.0.20261030000000-abcdef123456", "is a pseudo-version"),
+])
+def test_go_mod_pseudo_version_is_refused(tmp_path, shim_path, new, expect):
+    refused(tmp_path, shim_path, {"go.mod": GOMOD},
+            lambda r: write(r, "go.mod", GOMOD.replace("v0.3.5", new)), expect=expect)
+
+
+def test_go_mod_incompatible_is_refused(tmp_path, shim_path):
+    base = GOMOD.replace("golang.org/x/text v0.3.5", "github.com/o/m v1.4.2")
+    refused(tmp_path, shim_path, {"go.mod": base},
+            lambda r: write(r, "go.mod", base.replace("v1.4.2", "v2.0.0+incompatible")),
+            expect="is +incompatible; the base did not use that form")
+
+
+@pytest.mark.parametrize("old,new", [
+    ("v0.0.0-20250101000000-aaaaaaaaaaaa", "v0.0.0-20261030000000-bbbbbbbbbbbb"),
+    ("v2.0.0+incompatible", "v2.1.0+incompatible"),
+])
+def test_go_mod_form_the_base_already_used_may_move_forward(tmp_path, shim_path, old, new):
+    base = GOMOD.replace("golang.org/x/text v0.3.5", "github.com/o/m " + old)
+    repo = base_repo(tmp_path, {"go.mod": base})
+    checkout = fresh_checkout(tmp_path, repo)
+    write(repo, "go.mod", base.replace(old, new))
+    v = run_verify(tmp_path, shim_path, checkout, forged_artifact(tmp_path, repo, raw_patch(repo)))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+# ─── audit-dev-standards-2026-10-30 LOW: flow_map opens a quote only at the ──
+# start of a scalar, as YAML does ─────────────────────────────────────────────
+
+def _raising_namespace() -> dict:
+    ns = _validator_namespace()
+    ns["die"] = lambda msg: (_ for _ in ()).throw(AssertionError(msg))
+    return ns
+
+
+@pytest.mark.parametrize("value,expect", [
+    ('{integrity: a"b, tarball: https://evil/x.tgz, c: d"e}', "quote inside a plain scalar"),
+    ("{integrity: a'b, c: d'e}", "quote inside a plain scalar"),
+    ("{integrity: 'a'b, tarball: x}", "text after a quoted scalar"),
+])
+def test_flow_map_refuses_quotes_yaml_reads_differently(value, expect):
+    with pytest.raises(AssertionError, match=expect):
+        _raising_namespace()["flow_map"]("p", "k", value)
+
+
+@pytest.mark.parametrize("value,want", [
+    ("{'it''s': x, \"t\": 'y'}", {"it's": "x", "t": "y"}),
+    ('{"integrity":"a","tarball":"b"}', {"integrity": "a", "tarball": "b"}),
+    ("{integrity: a, 'tarball': 'b'}", {"integrity": "a", "tarball": "b"}),
+])
+def test_flow_map_still_reads_quoted_scalars(value, want):
+    assert _raising_namespace()["flow_map"]("p", "k", value) == want
+
+
+def test_pnpm_resolution_with_a_mid_scalar_quote_is_refused(tmp_path, shim_path):
+    refused(tmp_path, shim_path, {"pnpm-lock.yaml": PNPM},
+            lambda r: write(r, "pnpm-lock.yaml", pnpm_with_resolution(
+                '{integrity: %s"x, tarball: %s, c: d"e}' % (INTEG, GOOD_TB))),
+            expect="quote inside a plain scalar")
+
+
+# ─── the version grammar itself (no third-party library) ─────────────────────
+
+@pytest.mark.parametrize("ver,rng,want", [
+    ("1.2.4", "^1.2.3", True), ("2.0.0", "^1.2.3", False), ("0.2.0", "^0.1.0", False),
+    ("0.0.4", "^0.0.3", False), ("1.3.0", "~1.2.3", False), ("1.2.9", "~1.2.3", True),
+    ("5.0.0", "*", True), ("1.2.4-beta", "^1.2.3", False), ("1.2.3-beta.2", "^1.2.3-beta.1", True),
+    ("1.5.0", "1.0.0 - 2.0.0", True), ("2.0.1", "1.0.0 - 2.0.0", False), ("2.9.0", "1.0.0 - 2", True),
+    ("2.0.0", "1.x", False), ("1.0.0", ">= 1.0.0 < 2", True), ("3.1.0", "^1.0.0 || ^3.0.0", True),
+    ("1.1.9", ">1.1", False), ("1.2.0", "<=1.1", False),
+])
+def test_semver_range_semantics(ver, rng, want):
+    ns = _raising_namespace()
+    assert ns["semver_satisfies"](ns["semver"](ver), ns["semver_range"](rng)) is want
+
+
+def test_semver_and_pep440_order():
+    ns = _raising_namespace()
+    sv = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0"]
+    keys = [ns["semver_key"](ns["semver"](v)) for v in sv]
+    assert keys == sorted(keys) and len(set(keys)) == len(keys)
+    pv = ["1.0.dev1", "1.0a1", "1.0a2.dev1", "1.0a2", "1.0b1", "1.0rc1", "1.0", "1.0.post1.dev1", "1.0.post1",
+          "1.0.1", "1!0.1"]
+    pkeys = [ns["pep440"](v)[0] for v in pv]
+    assert pkeys == sorted(pkeys) and len(set(pkeys)) == len(pkeys)
+    assert ns["pep440"]("2.31")[0] == ns["pep440"]("2.31.0")[0]
