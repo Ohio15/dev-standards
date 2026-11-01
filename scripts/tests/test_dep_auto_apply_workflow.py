@@ -124,11 +124,14 @@ case "$1" in
 esac
 echo "go shim: unexpected $*" >&2; exit 99
 ''',
-    # Records what curl was given: argv one per line, stdin verbatim.
+    # Records what curl was given: argv one per line, stdin verbatim. Prints
+    # FAKE_CURL_HTTP (the `-w '%{http_code}'` the notify step reads, 200 by
+    # default) and exits FAKE_CURL_RC (a transport failure, 0 by default).
     "curl": r'''
 printf '%s\n' "$@" > "$CURL_ARGV"
 cat > "$CURL_STDIN"
-exit 0
+printf '%s' "${FAKE_CURL_HTTP-200}"
+exit "${FAKE_CURL_RC:-0}"
 ''',
     "jq": "echo '{}'\n",
     "pip-audit": r'''
@@ -1104,7 +1107,7 @@ RUN_SHA256 = {
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "notify": "8b71d3da86776f0e4551e7379618011acc7e2af5d58ef114a9a0a631f54bdcbb",
+        "notify": "ae15569d57b0a19e9c44da7fe52c55ba11e1efb019ad8864779ca89b6bb6d259",
         "brain": "41baad8a408cec76b3652fea4e6a7a84ae4a75feb09c5988d423bfd3c1ec897e",
     },
 }
@@ -1430,6 +1433,60 @@ def test_notify_reports_a_refused_publish(tmp_path, shim_path):
     proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="", **env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Title: auto-apply REFUSED: o/r" in argv
+
+
+# Inbox ae86d275: with DEP_AUTO_APPLY_NTFY_URL set, an undelivered alert fails
+# the notify step; it is never a warning plus exit 0.
+NOTIFY_KINDS = [
+    ({"APPLY_RESULT": "failure", "PR_OK_URL": ""}, "run failed"),
+    ({"PUBLISH_RESULT": "failure", "PR_OK_URL": ""}, "publish refused"),
+    ({"PR_OK_URL": "", "PR_BROKEN_URL": "https://github.com/o/r/pull/2"}, "tests failed"),
+    ({}, "PR opened"),
+]
+
+
+@pytest.mark.parametrize("http", ["500", "404", "301", "000", ""])
+@pytest.mark.parametrize("override,kind", NOTIFY_KINDS, ids=[k for _, k in NOTIFY_KINDS])
+def test_ntfy_non_2xx_fails_the_notify_step(tmp_path, shim_path, override, kind, http):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="",
+                                          FAKE_CURL_HTTP=http, **{**NOTIFY_ENV, **override})
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert argv is not None, "the POST must have been attempted"
+    want = f'::error::ntfy delivery failed (HTTP {http or "no status"}): the "{kind}" alert was NOT delivered'
+    assert want in proc.stdout, proc.stdout
+    assert "::warning::ntfy" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("rc", ["6", "7", "28", "35"])
+def test_ntfy_curl_failure_fails_the_notify_step(tmp_path, shim_path, rc):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="",
+                                          FAKE_CURL_RC=rc, FAKE_CURL_HTTP="000", **NOTIFY_ENV)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f'::error::ntfy delivery failed (curl exit {rc}): the "PR opened" alert was NOT delivered' in proc.stdout
+
+
+@pytest.mark.parametrize("http", ["200", "201", "204"])
+def test_ntfy_2xx_is_delivered(tmp_path, shim_path, http):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="",
+                                          FAKE_CURL_HTTP=http, **NOTIFY_ENV)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "::error::" not in proc.stdout
+    args = argv.split("\n")
+    assert "-w" in args and "%{http_code}" in args and "-f" not in args and "-fsS" not in args
+
+
+def test_ntfy_delivery_failure_does_not_mask_the_token_scope_failure(tmp_path, shim_path):
+    """A 2xx on a private repo without the attestation still fails (scope_rc)."""
+    env = {**NOTIFY_ENV, "REPO_PRIVATE": "true", "ENV_PROTECTED": ""}
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=SECRET, **env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ntfy delivery failed" not in proc.stdout
+
+
+def test_ntfy_stays_off_unless_the_variable_is_set():
+    [notify] = [s for s in JOBS["notify"]["steps"] if s.get("id") == "notify"]
+    assert notify["if"] == "vars.DEP_AUTO_APPLY_NTFY_URL != ''"
+    assert "non-fatal" not in notify["run"] and "::warning::ntfy" not in notify["run"]
 
 
 # SC-19: the authority is checked before urlsplit; pnpm specifiers are an
