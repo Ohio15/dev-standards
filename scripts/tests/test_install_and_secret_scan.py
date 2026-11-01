@@ -696,3 +696,101 @@ def test_scan_repo_reports_the_finding(tmp_path):
     repo = enrolled_repo(tmp_path, {"ci.yml": CACHE_RESTORE_CASES["buildx-type-gha"][0]})
     codes = {f["code"] for f in hygiene.scan_repo(repo, 7)["findings"]}
     assert "auto-apply-cache-restore" in codes
+
+
+# ── SC-14 mutation battery: the refusal tests must kill a broken guard ──
+# Same mechanism as test_docker_release_helper.py: each mutant is an exact
+# count==1 replace on a temp copy, and the refusal rows of the shared table
+# are run against the copy. A mutant that leaves them green "survived".
+
+PY_MUTANTS = [
+    ("py-allowlist-membership-flipped", "    if path in allowlist:\n        return None",
+     "    if path not in allowlist:\n        return None"),
+    ("py-local-composite-accepted", "        return FORM_LOCAL\n", "        return None\n"),
+    ("py-reusable-accepted", "        return FORM_REUSABLE\n", "        return None\n"),
+    ("py-unreviewed-accepted", "    return FORM_UNREVIEWED\n\n\ndef find", "    return None\n\n\ndef find"),
+    ("py-malformed-entry-ignored", "            errors.append((n, FORM_ALLOWLIST_MALFORMED))", "            pass"),
+]
+SH_MUTANTS = [
+    ("sh-allowlist-membership-flipped", '  if (p in ALLOW) return ""', '  if (!(p in ALLOW)) return ""'),
+    ("sh-local-composite-accepted", '    return "local composite action not inspected"', '    return ""'),
+    ("sh-reusable-accepted", '  if (p ~ /\\.ya?ml$/) return "reusable workflow not inspected"',
+     '  if (p ~ /\\.ya?ml$/) return ""'),
+    ("sh-refusal-neutralised", '[ "$cache_refused" -eq 0 ] || exit 1', "true"),
+    ("sh-malformed-entry-ignored", '  else print "allowlist\\t" FNR "\\tmalformed allow-list entry"', "  else a = a"),
+]
+CACHE_RESTORE_PY = ROOT / "scripts" / "cache_restore.py"
+
+
+def apply_cache_mutant(text: str, old: str, new: str) -> str:
+    count = text.count(old)
+    assert count == 1, f"mutant pattern matched {count} times: {old!r}"
+    return text.replace(old, new)
+
+
+def scan_battery_failures(module_text: str, tmp: Path) -> list[str]:
+    """Every refusal row through a scan whose cache_restore.py is module_text."""
+    work = tmp / "scan"
+    work.mkdir()
+    shutil.copy2(_SCAN_SCRIPT, work / "repo-hygiene-scan.py")
+    (work / "cache_restore.py").write_bytes(module_text.encode("utf-8"))
+    spec = importlib.util.spec_from_file_location("hygiene_mutant", work / "repo-hygiene-scan.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    failures = []
+    for n, case in enumerate(REFUSED):
+        row = tmp / f"row{n}"
+        row.mkdir()
+        got = scan_hits(scan_case(module, row, case))
+        if got != sorted(CACHE_RESTORE_CASES[case][1]):
+            failures.append(f"{case}: {got}")
+    return failures
+
+
+def install_battery_failures(install_text: str, tmp: Path) -> list[str]:
+    """Every refusal row through an install.sh whose text is install_text: the
+    committed-allow-list rows as files of one target, then the malformed one."""
+    failures = []
+    rows = [c for c in REFUSED if c not in CASE_ALLOWLIST]
+    files = {f"{c}.yml": CACHE_RESTORE_CASES[c][0] for c in rows}
+    (tmp / "a").mkdir()
+    repo = target_with_workflows(tmp / "a", files)
+    proc = install_from(kit_with(tmp / "a", install_text=install_text), repo)
+    if proc.returncode != 1:
+        failures.append(f"default allow-list: exit {proc.returncode}")
+    for c in rows:
+        got = install_hits(proc.stderr, f".github/workflows/{c}.yml")
+        if got != sorted(CACHE_RESTORE_CASES[c][1]):
+            failures.append(f"{c}: {got}")
+    try:
+        assert_untouched(repo, files)
+    except AssertionError as exc:
+        failures.append(f"default allow-list: target written: {exc}")
+    for c in [c for c in REFUSED if c in CASE_ALLOWLIST]:
+        (tmp / c).mkdir()
+        files = {"ci.yml": CACHE_RESTORE_CASES[c][0]}
+        repo = target_with_workflows(tmp / c, files)
+        proc = install_from(kit_with(tmp / c, allowlist=CASE_ALLOWLIST[c], install_text=install_text), repo)
+        if proc.returncode != 1 or install_hits(proc.stderr) != sorted(CACHE_RESTORE_CASES[c][1]):
+            failures.append(f"{c}: exit {proc.returncode}, {install_hits(proc.stderr)}")
+    return failures
+
+
+def test_the_shipped_matchers_pass_the_battery(tmp_path):
+    (tmp_path / "py").mkdir()
+    (tmp_path / "sh").mkdir()
+    assert scan_battery_failures(CACHE_RESTORE_PY.read_text(encoding="utf-8"), tmp_path / "py") == []
+    assert install_battery_failures(INSTALL.read_text(encoding="utf-8"), tmp_path / "sh") == []
+
+
+@pytest.mark.parametrize("name,old,new", PY_MUTANTS, ids=[m[0] for m in PY_MUTANTS])
+def test_scan_matcher_mutant_is_killed(tmp_path, name, old, new):
+    mutated = apply_cache_mutant(CACHE_RESTORE_PY.read_text(encoding="utf-8"), old, new)
+    assert scan_battery_failures(mutated, tmp_path), f"mutant {name} survived: the refusal rows stayed green"
+
+
+@pytest.mark.parametrize("name,old,new", SH_MUTANTS, ids=[m[0] for m in SH_MUTANTS])
+def test_install_matcher_mutant_is_killed(tmp_path, name, old, new):
+    mutated = apply_cache_mutant(INSTALL.read_text(encoding="utf-8"), old, new)
+    assert install_battery_failures(mutated, tmp_path), f"mutant {name} survived: the refusal rows stayed green"
