@@ -30,11 +30,20 @@ name: Dependency Auto-Apply (Layer B)
 #            receives the same runtime token, so the cache service is
 #            reachable from there as well (audit 2026-10-30). The
 #            restore-side rule is the control on every runner, and it binds
-#            every repository this workflow is installed into: install.sh
-#            refuses to enrol a target any of whose other workflows restores
-#            an Actions cache, and the weekly fleet scan
-#            (scripts/repo-hygiene-scan.py) reports an enrolled repository
-#            that restores one later (SC-52, audit 2026-10-30).
+#            every repository this workflow is installed into (SC-52, audit
+#            2026-10-30; gate pass 1 on #73). Before enrolling a target,
+#            install.sh classifies every `uses:` in its other workflows: a
+#            first-party actions/<name> passes only under the cache rules
+#            (no actions/cache, no `cache:` other than false, setup-go with
+#            cache: false, setup-node with package-manager-cache: false, no
+#            type=gha); a third-party action passes only as an exact entry on
+#            the reviewed allow-list security/enrolment-uses-allowlist.txt;
+#            a local reusable workflow passes because it is read too.
+#            Everything else (a local composite action, a remote reusable
+#            workflow, any unreviewed action) is refused, as is a `cache:`
+#            key that is not false on any step. The weekly fleet scan
+#            (scripts/repo-hygiene-scan.py) reports the same classes for an
+#            enrolled repository later.
 #   publish  contents: write, pull-requests: write. NO secrets: it runs a
 #            third-party action (create-pull-request), and an action release
 #            can poison $GITHUB_PATH/$GITHUB_ENV for every later step of its

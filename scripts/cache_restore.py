@@ -1,10 +1,12 @@
-"""Find workflow lines that restore a GitHub Actions cache (register SC-52).
+"""Classify workflow lines that restore, or may restore, a GitHub Actions
+cache (register SC-52).
 
 dep-auto-apply.yml's `apply` job runs dependency-controlled code on the
 default branch with a runtime token that reaches the Actions cache service, so
 it can write the default-branch cache scope ("Cacheract", audit 2026-10-27).
 The control is on the restore side: a repository enrolled in auto-apply must
-not restore an Actions cache anywhere (audit-dev-standards-2026-10-30, MEDIUM).
+not restore an Actions cache anywhere (audit-dev-standards-2026-10-30, MEDIUM;
+gate pass 1 on #73: positive classification, not a list of known spellings).
 
 This module is the Python matcher, used by scripts/repo-hygiene-scan.py.
 install.sh carries the same matcher in awk (CACHE_RESTORE_AWK). The two are
@@ -13,13 +15,25 @@ scripts/tests/test_install_and_secret_scan.py, which runs every case through
 both and asserts the same (line, form) hits.
 
 Line-based on purpose (no YAML parser; the scan is stdlib-only and the
-installer is bash). Every rule errs towards a hit. A comment line (`#` after
-optional whitespace) is never a hit. Matching is case-insensitive. The forms:
+installer is bash). A comment line (`#` after optional whitespace) is never a
+hit. Matching is case-insensitive.
 
+Every `uses:` (a step's or a job's) is CLASSIFIED; it passes only as:
+  - a first-party `actions/<name>@<ref>`, held to the cache rules below;
+  - an exact `owner/repo[/path]` on the reviewed allow-list
+    security/enrolment-uses-allowlist.txt (third-party actions read and found
+    not to restore a cache; a `cache:` on one is still a hit);
+  - `./.github/workflows/<file>.yml|yaml`, a local reusable workflow, which
+    is itself read in the same pass.
+Everything else is a hit with its own form:
+  local composite action not inspected   `uses: ./...` (or ../...)
+  reusable workflow not inspected        `owner/repo/<path>.yml@ref`
+  not on the reviewed allow-list ...     any other action, a docker:// image
+                                         or an unparseable value
+The cache rules (restore forms), on every line:
   cache: not false        a `cache:` key (block, quoted or flow-mapping
                           spelling) whose value is not false / 'false' /
-                          "false": setup-node `cache: npm`, setup-python
-                          `cache: pip`, setup-go `cache: true`, ...
+                          "false"
   actions/cache           `actions/cache@` or `actions/cache/` anywhere (the
                           action and its restore/save sub-actions, any ref)
   type=gha                the GitHub Actions cache backend of buildx
@@ -30,10 +44,13 @@ optional whitespace) is never a hit. Matching is case-insensitive. The forms:
   setup-node without package-manager-cache: false
                           actions/setup-node v5+ caches npm by default
                           (Dependabot moves a v4 pin to v5 unprompted)
-
 A setup-go/setup-node step counts as switched off only when its own block
 `with:` mapping holds the key with a false value; any other spelling (a flow
 mapping step, a key outside `with:`) is a hit.
+
+The allow-list: one `owner/repo` or `owner/repo/path` per line, `#` comments
+(whole-line or trailing). Any other non-comment line is a "malformed
+allow-list entry", and a caller must then refuse rather than classify.
 
 Stdlib only. Python 3.8+.
 """
@@ -46,13 +63,24 @@ FORM_ACTIONS_CACHE = "actions/cache"
 FORM_GHA_BACKEND = "type=gha"
 FORM_SETUP_GO = "setup-go without cache: false"
 FORM_SETUP_NODE = "setup-node without package-manager-cache: false"
+FORM_LOCAL = "local composite action not inspected"
+FORM_REUSABLE = "reusable workflow not inspected"
+FORM_UNREVIEWED = "not on the reviewed allow-list security/enrolment-uses-allowlist.txt"
+FORM_ALLOWLIST_MALFORMED = "malformed allow-list entry"
+# Not a restore seen, but a `uses:` that cannot be shown not to be one.
+UNCLASSIFIED_FORMS = (FORM_LOCAL, FORM_REUSABLE, FORM_UNREVIEWED)
 
 _COMMENT_OR_BLANK = re.compile(r"^[ \t]*(#|$)")
 _CACHE_KEY = re.compile(r"""(^[ \t]*(-[ \t]+)?|[{,][ \t]*)["']?cache["']?[ \t]*:""")
-_SETUP_USES = re.compile(r"""(^|[ \t{,-])["']?uses["']?[ \t]*:[ \t]*["']?actions/setup-(go|node)@""")
+_USES_KEY = re.compile(r"""(^[ \t]*(-[ \t]+)?|[{,][ \t]*)["']?uses["']?[ \t]*:[ \t]*["']?""")
+_USES_VALUE = re.compile(r"""[^ \t"',}#]*""")
+_LOCAL_REUSABLE = re.compile(r"^\./\.github/workflows/[^/]+\.ya?ml$")
+_ALLOW_ENTRY = re.compile(r"^[a-z0-9_.-]+/[a-z0-9_.-]+(/[a-z0-9_.-]+)*$")
+_DOT_SEGMENT = re.compile(r"(^|/)\.\.?(/|$)")
 _SEQ_ITEM = re.compile(r"^ *-[ \t]")
 _WITH_KEY = re.compile(r"""^ *(-[ \t]+)?["']?with["']?[ \t]*:[ \t]*(#.*)?$""")
-_SETUP_OFF_KEY = {"go": ("cache", FORM_SETUP_GO), "node": ("package-manager-cache", FORM_SETUP_NODE)}
+_SETUP_OFF_KEY = {"actions/setup-go": ("cache", FORM_SETUP_GO),
+                  "actions/setup-node": ("package-manager-cache", FORM_SETUP_NODE)}
 
 
 def _is_code(line: str) -> bool:
@@ -118,8 +146,45 @@ def _setup_step_switched_off(lines: list[str], i: int, key: str) -> bool:
     return False
 
 
-def find_cache_restores(text: str) -> list[tuple[int, str]]:
-    """Every (1-based line, form) in a workflow's text that restores a cache."""
+def load_allowlist(text: str) -> tuple[frozenset[str], list[tuple[int, str]]]:
+    """(entries, errors): the reviewed `owner/repo[/path]` entries, lowercased,
+    and a (1-based line, FORM_ALLOWLIST_MALFORMED) per line that is neither a
+    comment, blank, nor a well-formed entry."""
+    entries: set[str] = set()
+    errors: list[tuple[int, str]] = []
+    for n, raw in enumerate(text.split("\n"), 1):
+        line = (raw[:-1] if raw.endswith("\r") else raw).lower()
+        if not _is_code(line):
+            continue
+        line = re.sub(r"[ \t]+#.*$", "", line).strip(" \t")
+        if _ALLOW_ENTRY.match(line) and not _DOT_SEGMENT.search(line):
+            entries.add(line)
+        else:
+            errors.append((n, FORM_ALLOWLIST_MALFORMED))
+    return frozenset(entries), errors
+
+
+def _classify_uses(value: str, allowlist: frozenset[str]) -> str | None:
+    """None when the `uses:` value passes classification, else its form."""
+    if value.startswith("./") or value.startswith("../"):
+        if _LOCAL_REUSABLE.match(value):
+            return None  # read in the same pass as every other workflow
+        return FORM_LOCAL
+    path, at, _ = value.partition("@")
+    if not at:
+        return FORM_UNREVIEWED
+    if path.endswith(".yml") or path.endswith(".yaml"):
+        return FORM_REUSABLE
+    if path.startswith("actions/"):
+        return None  # first-party: the cache rules judge it
+    if path in allowlist:
+        return None
+    return FORM_UNREVIEWED
+
+
+def find_cache_restores(text: str, allowlist: frozenset[str]) -> list[tuple[int, str]]:
+    """Every (1-based line, form) in a workflow's text that restores a cache
+    or is a `uses:` that cannot be classified as not restoring one."""
     # Lowercased: Actions resolves `Actions/Cache@`, input names are
     # case-insensitive (INPUT_<NAME>) and getBooleanInput takes False/FALSE.
     lines = [(ln[:-1] if ln.endswith("\r") else ln).lower() for ln in text.split("\n")]
@@ -133,9 +198,13 @@ def find_cache_restores(text: str) -> list[tuple[int, str]]:
             hits.append((i + 1, FORM_ACTIONS_CACHE))
         if "type=gha" in line:
             hits.append((i + 1, FORM_GHA_BACKEND))
-        m = _SETUP_USES.search(line)
+        m = _USES_KEY.search(line)
         if m:
-            key, form = _SETUP_OFF_KEY[m.group(2)]
-            if not _setup_step_switched_off(lines, i, key):
+            value = _USES_VALUE.match(line, m.end()).group(0)
+            form = _classify_uses(value, allowlist)
+            if form:
                 hits.append((i + 1, form))
+            setup = _SETUP_OFF_KEY.get(value.partition("@")[0])
+            if setup and not _setup_step_switched_off(lines, i, setup[0]):
+                hits.append((i + 1, setup[1]))
     return hits

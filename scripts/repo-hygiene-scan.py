@@ -19,7 +19,10 @@ Findings (severity-tagged):
             installed at all (hook-missing) — re-run install.sh
     MEDIUM  auto-apply-cache-restore: a repo enrolled in dep-auto-apply
             (.github/auto-apply-enabled) has a workflow that restores an
-            Actions cache (register SC-52; matcher scripts/cache_restore.py)
+            Actions cache, or a `uses:` that is not first-party, not on the
+            reviewed allow-list security/enrolment-uses-allowlist.txt, or a
+            local composite / remote reusable one (register SC-52; matcher
+            scripts/cache_restore.py)
     LOW     last commit older than 30 days (idle warning)
     LOW     noise files (.DS_Store, *.swp, Thumbs.db) tracked or
             untracked
@@ -83,6 +86,8 @@ _CR_SPEC = importlib.util.spec_from_file_location(
 assert _CR_SPEC is not None and _CR_SPEC.loader is not None
 cache_restore = importlib.util.module_from_spec(_CR_SPEC)
 _CR_SPEC.loader.exec_module(cache_restore)
+ENROLMENT_USES_ALLOWLIST = Path(__file__).resolve().parent.parent / "security" / "enrolment-uses-allowlist.txt"
+ENROLMENT_USES_ALLOWLIST_REL = "security/enrolment-uses-allowlist.txt"
 
 LEGACY_HOOKSPATH = "D:/Projects/git-hooks"
 # --- Hook drift (dev-standards #5) -----------------------------------------
@@ -563,7 +568,7 @@ def scan_hook_drift(repo: Path, canonical_dir: Path = CANONICAL_HOOKS_DIR) -> li
     return findings
 
 
-def scan_cache_restore(repo: Path) -> list[dict[str, Any]]:
+def scan_cache_restore(repo: Path, allowlist_path: Path = ENROLMENT_USES_ALLOWLIST) -> list[dict[str, Any]]:
     """MEDIUM `auto-apply-cache-restore` for a repo enrolled in auto-apply.
 
     Read-only. dep-auto-apply's apply job can write the default branch's
@@ -572,7 +577,10 @@ def scan_cache_restore(repo: Path) -> list[dict[str, Any]]:
     2026-10-30). install.sh refuses such a target at enrolment; this is the
     drift side, for a workflow added or edited afterwards. Every *.yml/*.yaml
     under .github/workflows (recursively), including the installed templates,
-    is read; one that cannot be read is reported, never passed.
+    is read; one that cannot be read is reported, never passed. Every
+    `uses:` is classified against the reviewed allow-list in this checkout
+    (scripts/cache_restore.py); an unreadable or malformed allow-list is
+    reported for every enrolled repo instead of classifying against it.
     """
     if not (repo / ".github" / "auto-apply-enabled").exists():
         return []
@@ -580,7 +588,13 @@ def scan_cache_restore(repo: Path) -> list[dict[str, Any]]:
     if not wf_dir.is_dir():
         return []
     items: list[dict[str, Any]] = []
-    for path in sorted(p for p in wf_dir.rglob("*") if p.suffix in (".yml", ".yaml")):
+    try:
+        allowlist, allow_errors = cache_restore.load_allowlist(allowlist_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        allowlist, allow_errors = frozenset(), [(None, f"allow-list unreadable: {exc}")]
+    items.extend({"path": ENROLMENT_USES_ALLOWLIST_REL, "line": line, "form": form} for line, form in allow_errors)
+    paths = [] if allow_errors else sorted(p for p in wf_dir.rglob("*") if p.suffix in (".yml", ".yaml"))
+    for path in paths:
         if path.is_dir():
             continue
         rel = path.relative_to(repo).as_posix()
@@ -589,7 +603,7 @@ def scan_cache_restore(repo: Path) -> list[dict[str, Any]]:
         except OSError as exc:
             items.append({"path": rel, "line": None, "form": f"unreadable: {exc.strerror or exc}"})
             continue
-        for line, form in cache_restore.find_cache_restores(text):
+        for line, form in cache_restore.find_cache_restores(text, allowlist):
             items.append({"path": rel, "line": line, "form": form})
     if not items:
         return []
@@ -598,8 +612,9 @@ def scan_cache_restore(repo: Path) -> list[dict[str, Any]]:
         "code": "auto-apply-cache-restore",
         "count": len(items),
         "items": items[:20],
-        "note": "auto-apply-enrolled repo restores an Actions cache that dep-auto-apply's apply job "
-                "can poison (SC-52); remove the cache restore, then re-run install.sh",
+        "note": "auto-apply-enrolled repo restores, or has a uses: that cannot be shown not to restore, "
+                "an Actions cache that dep-auto-apply's apply job can poison (SC-52); remove it or have the "
+                "action reviewed onto security/enrolment-uses-allowlist.txt, then re-run install.sh",
     }]
 
 
