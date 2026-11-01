@@ -909,6 +909,50 @@ agent (ssh-agent, op) so the key never reaches a file at all.
 **Origin.** audit-infra-2026-10-29 (LOW latent; proposed there as SC-46;
 approved by Ron 2026-10-29).
 
+### SC-51 · A dependency change validator that checks the SHAPE of a version but not its direction, range or release status
+**Shape.** A gate that admits an automated dependency bump when the new version
+merely matches a version grammar (`PLAIN_VERSION`, `GO_VERSION`, a range
+regex) without requiring that it be greater than the base version, satisfy the
+base range or specifier, and name a RELEASED artifact (no Go pseudo-version or
+`+incompatible`, no removed `integrity`/`resolved` pin) unless the base already
+had that form. The PR or doc meanwhile calls the result "safe", "non-major" or
+"patch/minor". dev-standards 2026-10-30: dep-auto-apply `publish` (MEDIUM, 3/3
+reviewers; Go pseudo-versions MEDIUM, 1/3).
+**Check.** For every validator that compares a changed dependency version to
+the base: `grep -nE "PLAIN_VERSION|GO_VERSION|REQ_SPEC|DEP_SPEC|fullmatch\(.*version"`
+and confirm each hit is followed by a comparison against the base version and
+range (semver compare, not regex) and a refusal of pseudo-version /
+`+incompatible` / removed-pin forms. Any claim of "safe", "non-major",
+"patch/minor" in the PR body or docs without such a comparison is a sibling.
+**Fix form.** Monotonic version check against the base plus range
+satisfaction; treat a removed pin as a change; refuse unreleased version forms
+unless pre-existing; or drop the safety wording.
+**Since.** approved 2026-11-01.
+**Origin.** audit-dev-standards-2026-10-30 (MEDIUM; approved by Ron 2026-11-01;
+fix form shipped in dev-standards PR #62).
+
+### SC-52 · A control stated as a rule for consumers but enforced only in the producer repository
+**Shape.** A shared workflow, template or hook documents that its safety
+depends on a property of the CONSUMING repository (for example "never restore
+an Actions cache in a release workflow", "the repo must be private", "the
+registrar must be >= X"), the producer's own tests enforce that property on the
+producer's files, and the install/enrolment path copies the artifact into
+consumers without checking the property there. dev-standards 2026-10-30:
+dep-auto-apply's "never restore an Actions cache" control is tested only on
+dev-standards' workflows while `install.sh` enrols any repo; n3xus-notify (enrolled)
+still has `cache: true` (MEDIUM, 2/3 reviewers).
+**Check.** For every "MUST"/"never"/"the control is" statement in a template or
+shared-workflow header that names a property of the consumer, find the
+install/enrolment code path (`install.sh`, a preflight step, a fleet scan) and
+confirm it probes that property in the TARGET and refuses or reports when it
+is absent. A statement with no target-side probe is a FINDING; each enrolled
+consumer lacking the property is a sibling.
+**Fix form.** Enrolment-time or preflight check in the target repository that
+fails closed, plus a fleet scan that reports drift.
+**Since.** approved 2026-11-01.
+**Origin.** audit-dev-standards-2026-10-30 (MEDIUM; approved by Ron 2026-11-01;
+enrolment-time check is dev-standards PR fix/enrol-cache-restore-check, in flight).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -925,7 +969,8 @@ and renumbered because those numbers were already graduated), approved
 2026-10-10. SC-43..SC-46 (audit-sentinel-2026-10-26), approved
 2026-10-26. SC-47..SC-50 (audit-infra-2026-10-29, proposed there as
 SC-43..SC-46 and renumbered because those numbers were already graduated),
-approved 2026-10-29. SC-37 amended 2026-10-27 (same-repo pull requests on
+approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
+approved 2026-11-01. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.
