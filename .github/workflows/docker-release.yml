@@ -412,8 +412,9 @@ jobs:
             ${{ matrix.image.name }}:v${{ needs.gates.outputs.version }}
             ${{ matrix.image.name }}:latest
             ${{ matrix.image.name }}:${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          # No Actions cache (audit 2026-10-27, R-C): dep-auto-apply runs
+          # unreviewed dependency code on the default branch, whose cache
+          # scope every tag build would restore. A released image is built cold.
           platforms: linux/amd64
 
   deploy:

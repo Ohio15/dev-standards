@@ -96,7 +96,8 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-          cache: npm
+          # No Actions cache in a release path (audit 2026-10-27, R-C).
+          package-manager-cache: false
 
       - name: Verify NPM_TOKEN is configured
         shell: bash

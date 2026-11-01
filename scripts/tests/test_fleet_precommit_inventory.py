@@ -40,7 +40,8 @@ def fleet(tmp_path: Path) -> Path:
     root = tmp_path / "Projects"
     root.mkdir()
     make_repo(root / "gated", hook=canon,
-              config="# c\nTEST_CMD=python -m pytest -q\nTEST_TIMEOUT = 60\n",
+              config="# c\nTEST_CMD=python -m pytest -q\nTEST_TIMEOUT = 60\n"
+                     "TEST_PATHS= src/** | tests/** \nTEST_CLEANUP_CMD=python t.py --restore\n",
               files={"pytest.ini": "[pytest]\n"})
     make_repo(root / "inert", hook=canon + b"# drift\n",
               files={"package.json": json.dumps({"scripts": {"test": "vitest"}})})
@@ -72,7 +73,24 @@ def test_gated_repo(fleet):
     assert r["status"] == "gated"
     assert r["hook_identical_to_canonical"] is True
     assert (r["test_cmd"], r["test_timeout"]) == ("python -m pytest -q", "60")
+    # Every command the hook runs is reported (audit 2026-10-30, SC-08):
+    # TEST_CLEANUP_CMD runs on every commit, TEST_PATHS decides whether the
+    # suite runs at all. TEST_PATHS is reported as the hook reads it (spaces
+    # around `|` dropped).
+    assert r["test_cleanup_cmd"] == "python t.py --restore"
+    assert r["test_paths"] == "src/**|tests/**"
     assert r["detected_test_cmd"] == "python -m pytest"
+
+
+def test_repo_without_cleanup_or_paths_reports_them_unset(fleet):
+    # Unset keys are the empty string, as the hook sees them; the markdown
+    # cell is `-`. A repo with no config at all reports None.
+    rows = by_path(run(fleet))
+    assert (rows["ns/inner"]["test_cleanup_cmd"], rows["ns/inner"]["test_paths"]) == ("", "")
+    assert (rows["inert"]["test_cleanup_cmd"], rows["inert"]["test_paths"]) == (None, None)
+    md = inv.render_markdown(list(rows.values()))
+    inner = next(line for line in md.splitlines() if line.startswith("| ns/inner |"))
+    assert "| cargo test | - | - | 300 |" in inner
 
 
 def test_hook_present_but_inert(fleet):
@@ -124,8 +142,18 @@ def test_cli_markdown_and_json(fleet):
     md = subprocess.run(base, capture_output=True, text=True, check=True).stdout
     assert md.startswith("4 repos: 2 gated, 1 inert, 1 no hook")
     assert "| ns/inner | gated |" in md
+    header = md.splitlines()[2]
+    assert "| TEST_CMD | TEST_CLEANUP_CMD | TEST_PATHS | TIMEOUT |" in header
+    gated_row = next(line for line in md.splitlines() if line.startswith("| gated |"))
+    # The cleanup command and the paths are cells of the gated row; `|` in
+    # TEST_PATHS is escaped so the table keeps its column count.
+    assert "| python t.py --restore | src/**\\|tests/** | 60 |" in gated_row
+    assert gated_row.replace("\\|", "").count("|") == header.count("|")
     data = json.loads(subprocess.run(base + ["--json"], capture_output=True, text=True, check=True).stdout)
     assert [r["path"] for r in data["repos"]] == ["gated", "inert", "nohook", "ns/inner"]
+    gated = data["repos"][0]
+    assert gated["test_cleanup_cmd"] == "python t.py --restore"
+    assert gated["test_paths"] == "src/**|tests/**"
 
 
 # --- CRLF / BOM: parsed as the hook parses them --------------------------------
