@@ -159,6 +159,174 @@ install_workflow() {
   printf '%s' "$content" >"$dst"
 }
 
+# Cache-restore refusal (register SC-52; audit-dev-standards-2026-10-30,
+# MEDIUM). dep-auto-apply.yml's apply job runs dependency code on the default
+# branch and can write that branch's Actions cache scope, so a repository that
+# carries it must not restore an Actions cache in any workflow. That is
+# checked by POSITIVE classification (gate pass 1 on #73), not by a list of
+# known spellings: every `uses:` passes only as a first-party actions/<name>
+# held to the cache rules, a local reusable workflow (read in the same pass),
+# or an exact entry on the reviewed allow-list
+# security/enrolment-uses-allowlist.txt, read from this checkout; a local
+# composite action, a remote reusable workflow and any other action are
+# refused. An unreadable or malformed allow-list refuses every target.
+# Checked before anything is written, so a refused target is left exactly as
+# it was. The three workflows this run writes are skipped: they are about to
+# be replaced by templates the dev-standards suite already holds to the rule.
+# There is no bypass: the target fixes its workflow (or the action is
+# reviewed onto the allow-list). Every *.yml/*.yaml under .github/workflows
+# (recursively) is read.
+#
+# CACHE_RESTORE_AWK takes the allow-list, then one workflow, and prints
+# "allowlist|workflow<TAB><line><TAB><form>" per hit. It is the awk twin of
+# scripts/cache_restore.py (the fleet scan's matcher): see that file for the
+# forms and their reasons. One fixture table in
+# scripts/tests/test_install_and_secret_scan.py runs through both and asserts
+# identical hits, so change them together.
+CACHE_RESTORE_AWK="$(cat <<'AWK'
+function ind(s) { match(s, /^ */); return RLENGTH }
+function code(s) { return s !~ /^[ \t]*(#|$)/ }
+function isfalse(v) {
+  sub(/[ \t]+#.*$/, "", v); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+  return v == "false" || v == "'false'" || v == "\"false\""
+}
+function cachekey(s,   rest) {
+  if (!match(s, /(^[ \t]*(-[ \t]+)?|[{,][ \t]*)["']?cache["']?[ \t]*:/)) return 0
+  rest = substr(s, RSTART + RLENGTH)
+  if (rest != "" && rest !~ /^[ \t]/) return 0
+  if (substr(s, RSTART, 1) ~ /[{,]/) sub(/[,}].*$/, "", rest)
+  return !isfalse(rest)
+}
+function switched_off(i, key,   u, start, dash, j, e, w, wc, k, rest) {
+  u = ind(L[i]); start = 0
+  if (L[i] ~ /^ *-[ \t]/) { start = i; dash = u }
+  else for (j = i - 1; j >= 1; j--) {
+    if (!code(L[j])) continue
+    if (ind(L[j]) < u) { if (L[j] ~ /^ *-[ \t]/) { start = j; dash = ind(L[j]) }; break }
+  }
+  if (!start) return 0
+  e = start + 1
+  while (e <= n && !(code(L[e]) && ind(L[e]) <= dash)) e++
+  for (w = start; w < e; w++) {
+    if (!match(L[w], /^ *(-[ \t]+)?["']?with["']?[ \t]*:[ \t]*(#.*)?$/)) continue
+    match(L[w], /^ *(-[ \t]+)?/); wc = RLENGTH
+    for (k = w + 1; k < e; k++) {
+      if (!code(L[k])) continue
+      if (ind(L[k]) <= wc) break
+      if (match(L[k], "^ *[\"']?" key "[\"']?[ \t]*:")) {
+        rest = substr(L[k], RSTART + RLENGTH)
+        if ((rest == "" || rest ~ /^[ \t]/) && isfalse(rest)) return 1
+      }
+    }
+  }
+  return 0
+}
+function classify(v,   at, p) {
+  if (substr(v, 1, 2) == "./" || substr(v, 1, 3) == "../") {
+    if (v ~ /^\.\/\.github\/workflows\/[^\/]+\.ya?ml$/) return ""
+    return "local composite action not inspected"
+  }
+  at = index(v, "@")
+  if (!at) return UNREVIEWED
+  p = substr(v, 1, at - 1)
+  if (p ~ /\.ya?ml$/) return "reusable workflow not inspected"
+  if (substr(p, 1, 8) == "actions/") return ""
+  if (p in ALLOW) return ""
+  return UNREVIEWED
+}
+BEGIN { UNREVIEWED = "not on the reviewed allow-list security/enrolment-uses-allowlist.txt" }
+FILENAME == ARGV[1] {
+  sub(/\r$/, ""); a = tolower($0)
+  if (!code(a)) next
+  sub(/[ \t]+#.*$/, "", a); sub(/^[ \t]+/, "", a); sub(/[ \t]+$/, "", a)
+  if (a ~ /^[a-z0-9_.-]+\/[a-z0-9_.-]+(\/[a-z0-9_.-]+)*$/ && a !~ /(^|\/)\.\.?(\/|$)/) ALLOW[a] = 1
+  else print "allowlist\t" FNR "\tmalformed allow-list entry"
+  next
+}
+{ sub(/\r$/, ""); L[++n] = tolower($0) }
+END {
+  for (i = 1; i <= n; i++) {
+    s = L[i]
+    if (!code(s)) continue
+    if (cachekey(s)) print "workflow\t" i "\tcache: not false"
+    if (index(s, "actions/cache@") || index(s, "actions/cache/")) print "workflow\t" i "\tactions/cache"
+    if (index(s, "type=gha")) print "workflow\t" i "\ttype=gha"
+    if (match(s, /(^[ \t]*(-[ \t]+)?|[{,][ \t]*)["']?uses["']?[ \t]*:[ \t]*["']?/)) {
+      rest = substr(s, RSTART + RLENGTH)
+      match(rest, /^[^ \t"',}#]*/)
+      v = substr(rest, 1, RLENGTH)
+      f = classify(v)
+      if (f != "") print "workflow\t" i "\t" f
+      at = index(v, "@")
+      p = at ? substr(v, 1, at - 1) : v
+      if (p == "actions/setup-go" && !switched_off(i, "cache")) print "workflow\t" i "\tsetup-go without cache: false"
+      if (p == "actions/setup-node" && !switched_off(i, "package-manager-cache")) print "workflow\t" i "\tsetup-node without package-manager-cache: false"
+    }
+  }
+}
+AWK
+)"
+
+# The allow-list comes from this checkout, like the register; it is checked
+# on every run (a target with no workflows included), fail-closed.
+uses_allowlist="$here/security/enrolment-uses-allowlist.txt"
+if [ ! -f "$uses_allowlist" ] || [ ! -r "$uses_allowlist" ] \
+   || ! allow_hits="$(awk "$CACHE_RESTORE_AWK" "$uses_allowlist" /dev/null)"; then
+  echo "ERROR: $uses_allowlist could not be read for the cache-restore check (SC-52); nothing installed" >&2
+  exit 1
+fi
+if [ -n "$allow_hits" ]; then
+  while IFS=$'\t' read -r _ hit_line hit_form; do
+    echo "ERROR: security/enrolment-uses-allowlist.txt:$hit_line: $hit_form in the dev-standards checkout ($uses_allowlist); nothing installed (SC-52)" >&2
+  done <<<"$allow_hits"
+  exit 1
+fi
+
+cache_refused=0
+if [ -d "$target/.github/workflows" ]; then
+  wf_list="$(mktemp)"
+  wf_sorted="$(mktemp)"
+  trap 'rm -f "$wf_list" "$wf_sorted"' EXIT
+  if ! find -H "$target/.github/workflows" \( -type f -o -type l \) \( -name '*.yml' -o -name '*.yaml' \) -print0 >"$wf_list"; then
+    echo "ERROR: could not list $target/.github/workflows for the cache-restore check (SC-52); nothing installed" >&2
+    exit 1
+  fi
+  if ! LC_ALL=C sort -z "$wf_list" >"$wf_sorted"; then
+    echo "ERROR: could not sort the workflow list for the cache-restore check (SC-52); nothing installed" >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' wf; do
+    rel="${wf#"$target/"}"
+    case "$rel" in
+      .github/workflows/size-guard.yml|.github/workflows/security-audit.yml|.github/workflows/dep-auto-apply.yml) continue ;;
+    esac
+    if ! hits="$(awk "$CACHE_RESTORE_AWK" "$uses_allowlist" "$wf")"; then
+      echo "ERROR: $rel: could not be read for the cache-restore check (SC-52); nothing installed" >&2
+      exit 1
+    fi
+    while IFS=$'\t' read -r hit_src hit_line hit_form; do
+      [ "$hit_src" = "workflow" ] || continue
+      case "$hit_form" in
+        "local composite action not inspected"|"reusable workflow not inspected"|"not on the reviewed allow-list"*)
+          hit_verb="cannot be shown not to restore an Actions cache" ;;
+        *) hit_verb="restores an Actions cache" ;;
+      esac
+      echo "ERROR: $rel:$hit_line: $hit_verb ($hit_form); dep-auto-apply's apply job can poison the default-branch cache scope, so the target must not restore one (SC-52, audit 2026-10-30). Fix the workflow and re-run install.sh." >&2
+      cache_refused=1
+    done <<<"$hits"
+  done <"$wf_sorted"
+  # The sort's status is checked (a failed sort would otherwise yield an
+  # empty list and an install that scanned nothing: fail-open, gate pass 2
+  # note on #73), and the sorted list must hold every entry find produced.
+  n_found="$(tr -cd ' ' <"$wf_list" | wc -c)"
+  n_sorted="$(tr -cd ' ' <"$wf_sorted" | wc -c)"
+  if [ "$n_found" -ne "$n_sorted" ]; then
+    echo "ERROR: the workflow list for the cache-restore check lost entries ($n_sorted of $n_found); nothing installed" >&2
+    exit 1
+  fi
+fi
+[ "$cache_refused" -eq 0 ] || exit 1
+
 mkdir -p "$target/.githooks" "$target/.github/workflows"
 
 # Chained dispatcher + sub-hooks. Each sub-hook is independently executable so
