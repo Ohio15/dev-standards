@@ -26,11 +26,17 @@ jobs:
         with:
           python-version: "3.14"  # the minor the suite is verified on locally
 
-      - name: Install the pinned test dependencies
+      # Hash-checking mode: requirements-dev.txt is pip-compile output with a
+      # --hash for every release, transitive ones included, so a substituted
+      # artifact for a pinned version is refused before it is unpacked.
+      # --no-deps makes the manifest the whole install: pip may not resolve
+      # anything the hashed file does not name.
+      - name: Install the pinned, hash-checked test dependencies
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check --no-input -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --no-deps -r requirements-dev.txt
 
       - name: Run the suite
         shell: bash
