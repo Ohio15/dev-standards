@@ -1,0 +1,7 @@
+# Source of requirements-dev.txt. Regenerate with:
+#   pip-compile --generate-hashes --allow-unsafe --output-file requirements-dev.txt requirements-dev.in
+# Keep every version pinned here; the .txt adds the artifact hashes.
+pytest==9.1.1
+PyYAML==6.0.3
+packaging==26.3
+pip-requirements-parser==32.0.1
