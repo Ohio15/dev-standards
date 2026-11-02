@@ -2762,13 +2762,22 @@ jobs:
           # The bearer header goes to curl as a config on stdin (-K -), never
           # in argv, which any process on the runner can read.
           bearer_config() {
-            case "$1" in *$'\n'*|*$'\r'*) echo "::warning::token contains a line break; not sending it" >&2; return 1 ;; esac
+            case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
             local esc=${1//\\/\\\\}
             esc=${esc//\"/\\\"}
             printf 'header = "Authorization: Bearer %s"\n' "$esc"
           }
           cfg=""
-          if [ -n "${NTFY_TOKEN:-}" ]; then cfg=$(bearer_config "$NTFY_TOKEN") || exit 0; fi
+          # A token with a line break is a configuration error, not a reason to
+          # skip quietly (Inbox ecc1fe03, SC-07 shape): the owner set the secret
+          # and expects this alert, so the step fails like any other undelivered
+          # notification. Nothing is posted (the header would be forgeable).
+          if [ -n "${NTFY_TOKEN:-}" ]; then
+            if ! cfg=$(bearer_config "$NTFY_TOKEN"); then
+              echo "::error::DEP_AUTO_APPLY_NTFY_TOKEN contains a line break (configuration error): the \"${kind}\" alert was NOT delivered"
+              exit 1
+            fi
+          fi
           # Fail loud (Inbox ae86d275): the variable being set means the owner
           # expects this alert, so an undelivered one fails the job instead of
           # a warning nobody reads. -f is off so a 4xx/5xx still yields its

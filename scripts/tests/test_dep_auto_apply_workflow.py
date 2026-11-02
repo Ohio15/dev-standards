@@ -1107,7 +1107,7 @@ RUN_SHA256 = {
     },
     "notify": {
         "ref_guard": "f944f58d7d43bca488268dd06ecf86470697f3f4c4e0c1be968269f97cb7dd5e",
-        "notify": "ae15569d57b0a19e9c44da7fe52c55ba11e1efb019ad8864779ca89b6bb6d259",
+        "notify": "032c3f3d33703645ee77fdb4ff28f00b1b916e4f6198528aeb8f9a810c0391d4",  # ecc1fe03: malformed token fails the step
         "brain": "41baad8a408cec76b3652fea4e6a7a84ae4a75feb09c5988d423bfd3c1ec897e",
     },
 }
@@ -1388,10 +1388,26 @@ def test_brain_token_is_sent_on_stdin_not_argv(tmp_path, shim_path):
     assert stdin.strip() == 'header = "Authorization: Bearer tk_s3cret\\"q\\\\z"'
 
 
-def test_a_token_with_a_line_break_is_never_sent(tmp_path, shim_path):
-    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN="a\nheader = x", **NOTIFY_ENV)
-    assert proc.returncode == 0
+# Inbox ecc1fe03 (SC-07 shape): a token with a line break is a configuration
+# error. Nothing is posted (the header would be forgeable) AND the step fails,
+# so the alert the owner configured is never silently dropped.
+@pytest.mark.parametrize("token", ["a\nheader = x", "a\rheader = x"], ids=["LF", "CR"])
+def test_a_token_with_a_line_break_fails_the_notify_step(tmp_path, shim_path, token):
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "notify", NTFY_TOKEN=token, **NOTIFY_ENV)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert argv is None and stdin is None, "nothing may be posted with a malformed token"
+    assert ('::error::DEP_AUTO_APPLY_NTFY_TOKEN contains a line break (configuration error): '
+            'the "PR opened" alert was NOT delivered') in proc.stdout, proc.stdout
+    assert "::warning::" not in proc.stdout + proc.stderr
+
+
+def test_brain_token_with_a_line_break_is_skipped_non_fatally(tmp_path, shim_path):
+    """Brain ingest is informational (its curl failure is already non-fatal), so
+    the same malformed-token guard skips it with a warning and exit 0."""
+    proc, argv, stdin = run_with_curl_spy(tmp_path, shim_path, "brain", BRAIN_TOKEN="a\nheader = x", **BRAIN_ENV)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert argv is None and stdin is None
+    assert "::warning::token contains a line break" in proc.stdout + proc.stderr
 
 
 # SC-25: this repo's own pins are kept current.
