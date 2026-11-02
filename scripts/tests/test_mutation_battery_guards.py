@@ -66,6 +66,7 @@ SEL_RUNS_ON = "hosted_install_refuses_a_runs_on_it_cannot_classify"
 SEL_CONFIG = "untrusted_config_that_steers_the_audit_is_not_examined"
 SEL_NTFY_HTTP = "ntfy_non_2xx_fails_the_notify_step"
 SEL_NTFY_CURL = "ntfy_curl_failure_fails_the_notify_step"
+SEL_NTFY_TOKEN = "token_with_a_line_break_fails_the_notify_step"
 
 MUTANTS = [
     # (a) publish validator
@@ -102,6 +103,10 @@ MUTANTS = [
            'if [ "$curl_rc" -ne 0 ]; then',
            "if false; then",
            DEP_TESTS, SEL_NTFY_CURL),
+    Mutant("d3-ntfy-malformed-token-skips-quietly", DEP_AUTO_APPLY,
+           '            if ! cfg=$(bearer_config "$NTFY_TOKEN"); then\n',
+           "            if false; then\n",
+           DEP_TESTS, SEL_NTFY_TOKEN),
     # (b) install.sh runs-on classifier
     Mutant("b1-unclassified-runs-on-installed", INSTALL,
            '  if [ -n "$unclassified" ]; then\n',
