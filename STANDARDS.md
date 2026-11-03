@@ -1,6 +1,6 @@
 # Ron's Dev/Deployment Standards
 
-**Scope:** Canonical reference for how code moves from author keystrokes to production-validated state across all Ron-owned repos. Covers memory conventions, repo hygiene, versioning, release gates, reusable-workflow promotion, build provenance, deploy contracts, observability, maintenance cadences, cleanup, incident protocols, and explicit open questions.
+**Scope:** Canonical reference for how code moves from author keystrokes to production-validated state across all Ron-owned repos. Covers memory conventions, repo hygiene, versioning, release gates, reusable-workflow promotion, build provenance, deploy contracts, observability, maintenance cadences, cleanup, incident protocols, explicit open questions, the application independence floor, discovered-issue triage, session objectives, shared services, and ownership of code and infra (sections 13-17).
 
 **Audience:** Ron, future supervisors of any AI session, and any human collaborator inheriting a Ron-owned project.
 
@@ -666,6 +666,69 @@ The filing session sets the severity from this rubric and cites the evidence in 
 | Session rule in global `CLAUDE.md` | every AI session | ACTIVE 2026-10-28 |
 | cortex-hooks SessionStart nudge (`hooks/session-objective-core.ts`, a priority-0 bootstrap block on both bootstrap paths) | every AI session | ACTIVE 2026-10-28 (cortex-hooks v0.91.0) |
 | cortex-hooks decision register row DR-036, tier `norm` (whether a response states an objective is prose; whether a launch serves it is intent). Audit signal: a session with no `session_objectives` row, or one that kept working after its row went `met`. | journal + routine audit | ACTIVE 2026-10-28 |
+
+## 16. Shared Services (no duplication)
+
+**Ratified 2026-11-03 (Ron):** "if we already have something that could or should be utilized more broadly, and that is an industry standard/best practice approach, we need to go that route... I want this added into global rules and procedures as the standard approach." Work item `b8c7a556`, decision memory `5fac39a9`.
+
+**Motivating case (Steward P1 verifier, 2026-11-03):** the Steward P1 verifier plan proposed its own WebAuthn approval page. n3xus-identity, an identity provider, already existed in the estate (merged, not deployed). The plan's Survey never listed it, so the plan forked a cross-cutting capability that one service should own. Ron's resolution (decision memory `663c6f59`) is the worked example for this section and §17: finish n3xus-identity and widen it to OIDC with multiple audiences as the **estate identity provider**. The Steward verifier itself verifies OpenSSH `sshsig` signatures from a FIDO2 security key; n3xus-identity is the viewer and IdP for Steward, **never the verifier**. Each concern has exactly one owner.
+
+**Rule:** do not duplicate services, elements or components that can or should be shared. A **cross-cutting capability** (identity and authentication, notifications, secrets brokerage, logging, a governance ledger, an approval surface) is built **once**, as its own service, to industry standard and best practice, and every consumer (Steward, APM, Sentinel, Shared-Brain, cortex, n3xus-*) uses it.
+
+1. **Inventory first.** The Survey section of every plan lists, for each cross-cutting need the plan touches, the existing estate service that covers it and its state: **deployed**, **held**, or **merged-only**.
+2. **Consume or extend by default.** The recommendation consumes or extends the shared service. If that service needs work first (deploy it, unblock it, extend it), that work **is part of the plan and its `SPEND:`**, never a reason to fork.
+3. **A per-project copy needs an explicit, cited reason** in the plan (for example, a hard isolation requirement the shared service cannot meet, with the evidence). Convenience, the shared service not being deployed yet, or it lacking a feature is not a reason; those are §16.2 work items.
+
+### 16.1 Estate services and their anchors
+
+| Capability | The one service | Industry anchor |
+|------------|-----------------|-----------------|
+| Identity and authentication | **n3xus-identity** (estate IdP; OIDC, multiple audiences) | NIST SP 800-63-4 federation model; OpenID Connect; passes the OpenID conformance suite |
+| Notifications | **n3xus-notify** (one notification router) | §8 notification and observability |
+| Secrets brokerage | **op-proxy** (one secrets broker, 1Password-backed) | §11 rotation; §13 AI-7 |
+
+New cross-cutting services join this table by PR when they are ratified. A capability with no row is a §16 question for the plan's Survey, not permission to build per project.
+
+### 16.2 What this changes in practice
+
+1. **A shared service that is not ready is a work item, not a wall.** Held or merged-only services are deployed or extended inside the consuming plan, consistent with the build-option rule, and their cost is in that plan's `SPEND:`.
+2. **Boundaries are drawn by concern.** When two services touch one flow (Steward approves; n3xus-identity authenticates the viewer), the plan names which service owns each concern. Neither re-implements the other's.
+3. **The shared service meets the standard.** Building it once means building it to the industry anchor in §16.1; a shared service below standard is fixed in place, not routed around.
+
+### 16.3 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Session rule in global `CLAUDE.md` + framework `feedback_no-duplicate-shared-services.md` | every AI session | ACTIVE 2026-11-03 |
+| Rigor-format Survey: the cross-cutting inventory (service + deployed / held / merged-only) is a required Survey element in every plan. Audit signal: a plan that introduces a per-project identity, notification, secrets, ledger or approval component with no inventory row and no cited reason. | every plan, routine audit | ACTIVE 2026-11-03 (norm; judgement of intent, no tool boundary carries it) |
+
+## 17. Own the Code and Infra
+
+**Ratified 2026-11-03 (Ron, restating an existing rule):** "finish n3xus-identity and widen - this is the own the code and infra rule that I know exists as well." Precedent decision memories `663c6f59` (estate identity) and `47310e89` (Steward lives on Ron's hardware).
+
+**Motivating case (estate identity, 2026-11-03):** the identity decision offered two routes: adopt a third-party IdP (Pocket ID or Kanidm), or finish n3xus-identity and widen it to OIDC with multiple audiences. Ron chose the owned route (`663c6f59`). The result still has to meet the standard: OIDC, the NIST SP 800-63-4 federation model, and the OpenID conformance suite. The Steward verifier stays OpenSSH `sshsig` from a FIDO2 security key, on Ron's hardware (`47310e89`); n3xus-identity is its viewer and IdP, never its verifier.
+
+**Rule:** estate-level platform components are **Ron-owned code on Ron-owned infrastructure**. When a shared capability is needed (§16), the default is to **finish and widen the Ron-owned implementation** rather than adopt a vendor product, provided the result **meets the industry standard and passes conformance and audit**.
+
+1. **Owned route first.** When §16 points at a capability gap, the build option is the Ron-owned repo, not a vendor install. The plan presents the owned route first and names the standard it must meet (for identity: OIDC, NIST SP 800-63-4, the OpenID conformance suite).
+2. **Ownership never lowers the bar.** "We own it" is not a substitute for conformance. The owned implementation passes the same conformance suite or audit a vendor product would be held to, and the §4 gates and the security review model (`/security-gate`, `/security-audit`) apply to it in full.
+3. **Substitutable third parties only where §13 AI-6 already permits them** (GitHub, Cloudflare, a registrar), each named in the runbook with its replacement path. Anything else third-party on a platform path needs Ron's explicit decision, recorded as a decision memory.
+
+### 17.1 Interaction with other rules
+
+| Rule | How §17 applies it |
+|------|--------------------|
+| §13 Application Independence Floor | §13 keeps AI vendors out of runtime and release paths; §17 keeps platform components owned. AI-6 is the single list of allowed substitutable third parties for both. |
+| §16 Shared Services | §16 says build it once; §17 says the once is Ron-owned code on Ron-owned infra, to standard. |
+| Capability gap = build option | The build option for an estate capability is the owned repo. |
+| Correct over easy | A vendor install is not presented as equivalent to the owned route; if it is the only viable move, it is labelled as debt with a replacement path. |
+
+### 17.2 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Session rule in global `CLAUDE.md` + framework `feedback_own-the-code-and-infra.md` | every AI session | ACTIVE 2026-11-03 |
+| Plan review: a recommendation to adopt a vendor product for an estate platform component, without Ron's recorded decision and outside the §13 AI-6 list, is non-conforming. Audit signal: such a recommendation, or an owned component shipped without its conformance or audit evidence. | every plan, routine audit | ACTIVE 2026-11-03 (norm) |
 
 ---
 
