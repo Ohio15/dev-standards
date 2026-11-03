@@ -137,9 +137,15 @@ lib:
 
 ## Versioning rules
 
-- **Source of truth**: the version in `package.json` (or `pyproject.toml` /
-  `Cargo.toml` / `release-config.yml:version` for non-npm repos). The CI
-  asserts that the pushed tag matches this value: `v${pkg.version}`.
+- **Source of truth**: the version in `package.json`; for non-npm repos the
+  first of `pyproject.toml`, `Cargo.toml` (`package.version`), the root
+  `version.json` (STANDARDS section 3) and `release-config.yml:version`, in
+  that order. The CI asserts that the pushed tag matches this value:
+  `v${pkg.version}`.
+- **Rust toolchain**: a repo with `Cargo.toml` commits `rust-toolchain.toml`
+  with `[toolchain] channel = "<exact version>"`; the `tests` gate installs
+  exactly that toolchain (pinned rustup-init, SHA-256 verified) and refuses a
+  missing file or a floating channel.
 - **Bump policy**: Conventional Commits since the previous tag drive the
   bump. `fix:` → patch, `feat:` → minor, `BREAKING CHANGE:` footer or `!`
   in the type → major. The Dependabot tier matrix already in shared-brain
@@ -157,7 +163,7 @@ Runs in parallel jobs; any failure aborts the release.
 
 | Gate | What it does | Bypassable? |
 |---|---|---|
-| `tests` | Runs `npm test` (or `test_command` override). Coverage threshold not enforced at this layer. | Per-repo by setting `gates.tests: false` (rare; usually done only for documentation-only repos). |
+| `tests` | Runs `npm test` (or `test_command` override). Node is set up and `npm ci` runs only when `package.json` exists; the pinned Rust toolchain is installed only when `Cargo.toml` exists. Coverage threshold not enforced at this layer. | Per-repo by setting `gates.tests: false` (rare; usually done only for documentation-only repos). |
 | `gitleaks` | Re-runs the gitleaks scan on the full tagged commit (not just diff). The pre-commit hook scans staged diffs only; this is the belt-and-suspenders catch. | No. |
 | `size_guard` | Same logic as `workflows/size-guard.yml` but enforced at release time. | Per-file via `.large-files-allowlist`. |
 | `npm_audit` | Runs `npm audit --json` against `gates.npm_audit` severity floor. | Per-repo by setting `npm_audit: off` (discouraged). |
