@@ -124,12 +124,52 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Toolchain per surface (release/SPEC.md "Pre-release gates"): Node when
+      # the repo has package.json, Rust when it has Cargo.toml, both when it
+      # has both, neither otherwise (test_command then runs on the runner's
+      # own tools). Before 2026-11-03 the Node steps were unconditional and a
+      # Cargo-only repo failed at setup-node ("Dependencies lock file is not
+      # found"; steward-governance v0.1.0, run 41692008392).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: hashFiles('package.json') != ''
         with:
           node-version: ${{ inputs.node_version }}
           # No Actions cache in a release path (audit 2026-10-27, R-C).
           package-manager-cache: false
       - run: npm ci
+        if: hashFiles('package.json') != ''
+      # The nexus-ci golden image carries no Rust toolchain (infra Inbox
+      # d8620c58). rustup-init is fetched by version and verified against its
+      # published SHA-256 before it runs; the toolchain version comes from the
+      # consumer's committed rust-toolchain.toml (refused when absent: a
+      # release must not float on whatever "stable" means today). No cache of
+      # any kind (SC-52).
+      - name: Install the pinned Rust toolchain
+        if: hashFiles('Cargo.toml') != ''
+        shell: bash
+        env:
+          RUSTUP_VERSION: "1.29.2"
+          RUSTUP_INIT_SHA256: "5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4"
+        run: |
+          set -euo pipefail
+          if [ ! -f rust-toolchain.toml ]; then
+            echo "::error::Cargo.toml present but no rust-toolchain.toml: commit one with [toolchain] channel = \"<exact version>\" (release/SPEC.md)"
+            exit 1
+          fi
+          RUST_TOOLCHAIN=$(yq '.toolchain.channel // ""' -p toml rust-toolchain.toml)
+          if ! [[ "$RUST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::rust-toolchain.toml channel must be an exact version (got '${RUST_TOOLCHAIN}')"
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+            -o /tmp/rustup-init
+          echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod 0755 /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal \
+            --default-toolchain "${RUST_TOOLCHAIN}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
       - name: Run tests
         run: ${{ needs.read-config.outputs.test_command }}
 
@@ -253,14 +293,23 @@ jobs:
             exit 1
           fi
 
-          # Source of truth precedence: package.json -> pyproject.toml ->
-          # release-config.yml:version.
+          # Source of truth precedence (release/SPEC.md "Versioning rules"):
+          # package.json -> pyproject.toml -> Cargo.toml -> version.json ->
+          # release-config.yml:version. Cargo.toml and the root version.json
+          # (STANDARDS section 3; what docker-release's deploy health reads)
+          # were missing until 2026-11-03, so a Rust repo had no source at all.
           if [ -f package.json ]; then
             PKG_VERSION=$(jq -r .version package.json)
             SOURCE=package.json
           elif [ -f pyproject.toml ]; then
             PKG_VERSION=$(yq '.project.version // .tool.poetry.version' -p toml pyproject.toml)
             SOURCE=pyproject.toml
+          elif [ -f Cargo.toml ]; then
+            PKG_VERSION=$(yq '.package.version // ""' -p toml Cargo.toml)
+            SOURCE=Cargo.toml
+          elif [ -f version.json ]; then
+            PKG_VERSION=$(jq -r '.version // ""' version.json)
+            SOURCE=version.json
           else
             PKG_VERSION=$(yq '.version // ""' release-config.yml)
             SOURCE=release-config.yml
@@ -670,10 +719,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # cargo-audit ships as a static binary via rustsec releases.
-          CA_VERSION=0.21.1
-          curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CA_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}.tgz" \
-            | tar -xz -C /tmp
+          # cargo-audit ships as a static binary via rustsec releases. The
+          # archive is verified against its SHA-256 before anything in it runs.
+          # 0.21.1 could not parse newer advisory-db entries (RUSTSEC-2026-0320
+          # TOML parse error, steward-governance run 41692008392, 2026-11-03),
+          # which reported as "found advisories" when none were found.
+          CA_VERSION=0.22.2
+          CA_SHA256=7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CA_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}.tgz" \
+            -o /tmp/cargo-audit.tgz
+          echo "${CA_SHA256}  /tmp/cargo-audit.tgz" | sha256sum -c -
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp
           install -m 0755 "/tmp/cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}/cargo-audit" /usr/local/bin/cargo-audit
           cargo-audit --version
 
