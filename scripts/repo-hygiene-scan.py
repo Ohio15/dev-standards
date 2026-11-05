@@ -909,6 +909,38 @@ def severity_filter(report: dict[str, Any], min_sev: str | None) -> dict[str, An
     return report
 
 
+# Item fields printed bare after the location; every other field is key=value.
+_ITEM_BARE_FIELDS = ("form", "reason")
+
+
+def render_item(item: Any) -> str:
+    """One finding item as a markdown bullet body.
+
+    Items are strings or dicts whose shape varies by finding: {path, reason},
+    {path, line, form}, {path, line, host}, {path, kind, reason}, or path-less
+    {hook, canonical, installed}. Every field is printed, so a new item shape
+    can never render as a bare `path: ` (2026-11-05: auto-apply-cache-restore
+    lost its line and form that way). A dict with a path renders
+    `path[:line] <form|reason> key=value...`; one without renders key=value.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    rest = dict(item)
+    path = rest.pop("path", None)
+    line = rest.pop("line", None)
+    parts: list[str] = []
+    if path is not None:
+        parts.append(f"{path}:{line}" if line is not None else str(path))
+    elif line is not None:
+        parts.append(f"line={line}")
+    for key in _ITEM_BARE_FIELDS:
+        value = rest.pop(key, None)
+        if value not in (None, ""):
+            parts.append(str(value))
+    parts.extend(f"{key}={value}" for key, value in rest.items())
+    return " ".join(parts) if parts else "(empty item)"
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(f"# Repo hygiene scan — {report['scan_date']}")
@@ -948,10 +980,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             if "note" in f:
                 lines.append(f"    note: {f['note']}")
             for item in f.get("items", [])[:5]:
-                if isinstance(item, dict):
-                    lines.append(f"    - {item.get('path', item)}: {item.get('reason', '')}")
-                else:
-                    lines.append(f"    - {item}")
+                lines.append(f"    - {render_item(item)}")
             if f.get("count", 0) > 5:
                 lines.append(f"    ... +{f['count'] - 5} more")
         lines.append("")
