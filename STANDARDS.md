@@ -643,7 +643,51 @@ The filing session sets the severity from this rubric and cites the evidence in 
 
 **SLA** from the item's `created_at`: critical **7 days**, high **30 days**, medium **90 days**, low **none**. It is computed at read time (`sla_due_at`), never stored.
 
-**Order on the board:** items Ron has ranked come first, in his order. Then severity, then overdue, then due date, then age. **Ron's rank always beats severity.** Ron may change a severity only with a recorded reason (`severity_source: ron`). **P0-P3 is not used.**
+**Order on the board:** items Ron has ranked come first, in his order. Then severity, then overdue, then due date, then age. **Ron's rank always beats severity.** Ron may change a severity only with a recorded reason (`severity_source: ron`). **P0-P3 is not used.** The proposed order for unranked items comes from the ranking rubric in §14.6.
+
+### 14.6 Ranking rubric (Steward-owned)
+
+**Ratified 2026-11-05 (Ron):** "a rubric for ranking that can be utilized for consistency ... starts with applying industry standards or best practices and then re-evaluating against my defined goals and objectives ... driven and owned by Steward." Proposal memory `3248ce2d`.
+
+**Why:** on 2026-11-05 a sample of 60 open items had 46 unranked items, all at `high` (mostly unrated security). Severity alone no longer separates the board, and every session ranked by feel.
+
+**Stage 1, industry standards.** Each item is rated on four factors:
+
+| Factor | Source standard | Scale |
+|---|---|---|
+| Impact | ITIL 4 impact; NIST SP 800-30 impact levels. Security impact comes from the finding's rating (security-gate / audit) or a CVSS v4 base score | 1 (cosmetic, hygiene) to 5 (production break, data loss, exploitable HIGH+) |
+| Urgency | ITIL 4 urgency | 1 (no time pressure) to 5 (happening now, or deadline inside 7 days) |
+| Unblocks | SAFe WSJF risk reduction / opportunity enablement | 1 (nothing waits on it) to 5 (several items or a goal wait on it) |
+| Effort | WSJF job size | 1, 2, 3, 5, 8, 13 |
+
+- **Band** (ITIL impact x urgency matrix): Impact x Urgency >= 20 is `critical`, >= 12 `high`, >= 6 `medium`, else `low`. A live production break or a CRITICAL security finding is `critical` whatever the product.
+- **Score within a band** (WSJF): `(2 x Impact + Urgency + Unblocks) / Effort`. Impact counts double so a small job can't overtake a bigger harm. The band comes first because plain WSJF ranks quick fixes above outages.
+- **Unrated items** take defaults from their severity and are listed as unrated in the report. Unrated security stays `high` (§14.5) until rated. The report lists unrated security items first, because rating them (a CVSS v4 base score, or the gate's own rating) is what stops `high` being a resting state.
+
+**Stage 2, Ron's goals.** The Stage 1 score is multiplied by:
+
+- the **line-of-business weight** from Steward's `governance/ranking/priority-goals.yaml`. Ron's weights at ratification: guardrail 1.5, Patriot 1.0, shared-brain (`cortex-brain`) 0.9, Sentinel 0.8, NEXUS (`nexus-infra`) 0.7, truck 0.5, personal-apps 0.5. AICodeAssistant was dropped (retired 2026-03-24). `guardrail` applies to the guardrail repos listed in that file, in any lane. `unsorted` takes the lowest weight until its lane is set;
+- **1.5** if the item advances a goal Ron has declared (listed in the same file), otherwise 1.0.
+
+**Final order:** Ron's ranked items in his order, then the floor items (production break, CRITICAL security), then band, then the goal-weighted score, then overdue, then age. **Ron's rank always beats the rubric.**
+
+**Ownership (Steward):**
+
+1. Steward re-scores the queue on a schedule and on every filing, with deterministic code (no model on the scoring path, §13).
+2. It proposes, it does not rank: it records a proposed rank and a breakdown of why, and never sets `ranked_by_ron`.
+3. The report lists the new top 5, unrated items, proposed severity changes (band differs from the stored severity), and items where Ron's rank and the rubric disagree widely. A wide disagreement usually means a goal changed; the report asks Ron to update the weights or goals file.
+4. Ron's overrides are kept as labels and the weights are recalibrated quarterly, with Ron approving each change.
+
+The weights and goals file is Ron's: Steward and sessions change it only on his instruction, recorded in the CHANGELOG.
+
+#### 14.6.1 Status
+
+| Mechanism | Status |
+|---|---|
+| Scorer `governance/ranking/rank.py`, weights `priority-goals.yaml`, ratings `ratings.yaml` (Ohio15/steward) | ACTIVE 2026-11-05 (steward v0.2.0), run on a session export |
+| Scheduled re-score and report to Ron | PENDING: needs a read-only shared-brain work-queue principal for Steward (work item `040bd063`). The existing work-queue key carries Ron's board authority and must not be used |
+| Proposed rank written onto queue items | PENDING: needs a shared-brain field and write action that can't set `ranked_by_ron`; gated, and audited before it is switched on |
+| Norm coverage | cortex-hooks DR-032 (§14), tier `norm` |
 
 ## 15. Session Objective
 
