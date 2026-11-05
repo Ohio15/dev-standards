@@ -375,6 +375,43 @@ def test_private_install_is_verbatim_whatever_the_spelling(tmp_path):
     assert (repo / ".github" / "workflows" / "size-guard.yml").read_text(encoding="utf-8").endswith(suffix)
 
 
+# Inbox 98571252: the SC-20 refusal is all-or-nothing. It used to fire inside
+# the per-template install step, after .githooks/ had been copied and
+# `git add`ed, so a refused target kept hooks and index entries. Every
+# template is now classified before the first write, like the SC-52 check.
+KIT_TEMPLATES = {
+    "size-guard.yml": Path("workflows") / "size-guard.yml",
+    "security-audit.yml": Path("templates") / ".github" / "workflows" / "security-audit.yml",
+    "dep-auto-apply.yml": Path("templates") / ".github" / "workflows" / "dep-auto-apply.yml",
+}
+
+
+@pytest.mark.parametrize("template", KIT_TEMPLATES)
+@pytest.mark.parametrize("flags", [("--public", "--no-gh"), ("--no-gh",)], ids=["public", "unconfirmed"])
+def test_sc20_refusal_leaves_the_target_tree_and_index_untouched(tmp_path, template, flags):
+    kit = kit_with_size_guard_suffix(tmp_path, "")
+    poisoned = kit / KIT_TEMPLATES[template]
+    poisoned.write_bytes(poisoned.read_bytes() + UNCLASSIFIABLE_RUNS_ON["block-sequence"].encode("utf-8"))
+    repo = target_repo(tmp_path)
+    proc = subprocess.run([BASH, (kit / "install.sh").as_posix(), *flags, repo.as_posix()],
+                          capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    # Same message as before the fix: ERROR: <template path> has a runs-on ...
+    assert re.fullmatch(rf"ERROR: \S*/{re.escape(template)} has a runs-on that is not the guarded predicate "
+                        r"or the hosted literal \(line \d+\); refusing to install it into a repository not "
+                        r"confirmed private\n", proc.stderr), proc.stderr
+    assert proc.stdout == "", proc.stdout
+    written = [p.relative_to(repo).as_posix() for p in repo.rglob("*") if p.relative_to(repo).parts[0] != ".git"]
+    assert written == [], written
+    assert not (repo / ".githooks").exists()
+    assert subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+                          capture_output=True, text=True, check=True).stdout == ""
+    assert subprocess.run(["git", "-C", str(repo), "ls-files"],
+                          capture_output=True, text=True, check=True).stdout == ""
+    assert subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath"],
+                          capture_output=True, text=True).returncode != 0
+
+
 # ─── audit-dev-standards-2026-10-30 MEDIUM (SC-52): cache-restore refusal ────
 # dep-auto-apply's apply job can write the default-branch Actions cache scope,
 # so install.sh refuses a target whose other workflows restore a cache, and

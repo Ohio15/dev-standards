@@ -123,14 +123,24 @@ else
   visibility_source="unconfirmed"
 fi
 
-# Copy a CI template. Private: verbatim. Public or unconfirmed: every guarded
-# runs-on becomes the hosted literal, and a runs-on that could still select a
-# runner afterwards (an expression, a variable or a self-hosted label) is
-# refused rather than installed.
-install_workflow() {
-  local src="$1" dst="$2" content
+# Render a CI template into the variable named $2, refusing it if it cannot be
+# installed. Private: verbatim (write_workflow copies the file). Public or
+# unconfirmed: every guarded runs-on becomes the hosted literal, and a runs-on
+# that could still select a runner afterwards (an expression, a variable or a
+# self-hosted label) is refused rather than installed.
+#
+# All-or-nothing (Inbox 98571252): every template is rendered and classified
+# BEFORE the first write, like the SC-52 check below, so a refusal leaves the
+# target's tree and index exactly as they were. It used to run per template
+# while installing, after .githooks/ had been copied and staged.
+render_workflow() {
+  local src="$1" out="$2" content
+  if [ ! -f "$src" ] || [ ! -r "$src" ]; then
+    echo "ERROR: $src could not be read; nothing installed" >&2
+    exit 1
+  fi
   if [ "$visibility" = "private" ]; then
-    cp "$src" "$dst"
+    printf -v "$out" '%s' ""
     return
   fi
   content="$(cat "$src"; printf x)"
@@ -156,7 +166,17 @@ install_workflow() {
     echo "ERROR: $src has a runs-on that is not the guarded predicate or the hosted literal (line ${unclassified%%:*}); refusing to install it into a repository not confirmed private" >&2
     exit 1
   fi
-  printf '%s' "$content" >"$dst"
+  printf -v "$out" '%s' "$content"
+}
+
+# Write a template render_workflow has already accepted.
+write_workflow() {
+  local src="$1" dst="$2" content="$3"
+  if [ "$visibility" = "private" ]; then
+    cp "$src" "$dst"
+  else
+    printf '%s' "$content" >"$dst"
+  fi
 }
 
 # Cache-restore refusal (register SC-52; audit-dev-standards-2026-10-30,
@@ -327,6 +347,21 @@ if [ -d "$target/.github/workflows" ]; then
 fi
 [ "$cache_refused" -eq 0 ] || exit 1
 
+# SC-20: classify every CI template now, before anything below writes or
+# stages a file (render_workflow above). Every runs-on follows the repo's
+# visibility: size-guard.yml and security-audit.yml (pull_request-reachable)
+# carry the guarded SC-37 predicate, dep-auto-apply.yml (schedule /
+# workflow_dispatch only) its private-only literal toggle; a public or
+# unconfirmed repo gets the hosted literal in all three.
+wf_size_guard_src="$here/workflows/size-guard.yml"
+wf_security_audit_src="$here/templates/.github/workflows/security-audit.yml"
+wf_dep_auto_apply_src="$here/templates/.github/workflows/dep-auto-apply.yml"
+# Assigned by name (printf -v) inside render_workflow.
+wf_size_guard="" wf_security_audit="" wf_dep_auto_apply=""
+render_workflow "$wf_size_guard_src" wf_size_guard
+render_workflow "$wf_security_audit_src" wf_security_audit
+render_workflow "$wf_dep_auto_apply_src" wf_dep_auto_apply
+
 mkdir -p "$target/.githooks" "$target/.github/workflows"
 
 # Chained dispatcher + sub-hooks. Each sub-hook is independently executable so
@@ -358,14 +393,10 @@ git -C "$target" add --chmod=+x   ".githooks/commit-msg"   ".githooks/pre-commit
 #   security-audit.yml  — Layer A: always-on dep-vuln gate (npm/go/python)
 #   dep-auto-apply.yml  — Layer B: weekly auto-apply cron (per-repo opt-in
 #                         via .github/auto-apply-enabled — NOT created here)
-#   Every runs-on follows the repo's visibility (install_workflow above):
-#   size-guard.yml and security-audit.yml (pull_request-reachable) carry the
-#   guarded SC-37 predicate, dep-auto-apply.yml (schedule/workflow_dispatch
-#   only) its private-only literal toggle; a public or unconfirmed repo gets
-#   the hosted literal in all three.
-install_workflow "$here/workflows/size-guard.yml" "$target/.github/workflows/size-guard.yml"
-install_workflow "$here/templates/.github/workflows/security-audit.yml" "$target/.github/workflows/security-audit.yml"
-install_workflow "$here/templates/.github/workflows/dep-auto-apply.yml" "$target/.github/workflows/dep-auto-apply.yml"
+#   Each was rendered and classified before the first write (SC-20, above).
+write_workflow "$wf_size_guard_src" "$target/.github/workflows/size-guard.yml" "$wf_size_guard"
+write_workflow "$wf_security_audit_src" "$target/.github/workflows/security-audit.yml" "$wf_security_audit"
+write_workflow "$wf_dep_auto_apply_src" "$target/.github/workflows/dep-auto-apply.yml" "$wf_dep_auto_apply"
 
 # Security register (security/REVIEW-MODEL.md): the per-session gate reads
 # <repo>/SECURITY-CHECKS.md and falls back to the canonical copy, reporting
