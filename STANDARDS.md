@@ -594,7 +594,7 @@ The issue gets its **own dedicated background agent ONLY if** one of these holds
 - it is a **security finding rated HIGH or worse** (unrated security counts as HIGH, §14.5);
 - it is a **live production break**.
 
-Everything else waits in the Inbox until Ron ranks it.
+Everything else waits in the Inbox and is **ranked from the session seat** with the §14.6 rubric, in the same session and before it ends (§14.5 "Order on the board"). It is never handed to Ron as an Inbox to rank. Only `kind: decision` items wait for Ron.
 
 ### 14.1 The discovery (discovering session)
 
@@ -613,12 +613,12 @@ Everything else waits in the Inbox until Ron ranks it.
 
 | Rule | How §14 applies it |
 |------|--------------------|
-| Capability gap = build option | The build option is filed as a queue item. It runs now only on an agent trigger, otherwise when Ron ranks it. |
-| Resolve unknowns as they arise | Unknowns about the **current objective** are still resolved now. A discovered issue is resolved by filing it with its evidence, so nothing is lost, and it is worked in Ron's order. |
+| Capability gap = build option | The build option is filed as a queue item. It runs now only on an agent trigger, otherwise in its place on the ranked board (§14.5, §14.6). |
+| Resolve unknowns as they arise | Unknowns about the **current objective** are still resolved now. A discovered issue is resolved by filing it with its evidence, so nothing is lost, and it is worked in board order (Ron's explicit rank first, then the §14.6 rubric). |
 | Don't over-extend scope | Filing instead of launching is the boundary. An agent, when there is one, fixes the issue, never the primary task's scope. |
 | Session objective (§15) | "Blocks the current session objective" is the first agent trigger. A session declares no objective it could stretch to absorb discoveries. |
 | Deferred follow-up (reminder + notification) | A queue item is the self-reminder for an issue. If an assigned agent can't finish in-session or its fix needs a later re-check: `brain_commitments` with a `due_at`, a scheduled trigger, and an n3xus-notify. An open discovery at session end goes into the handoff brief by memory id. |
-| Fan-out is warn-only | No cap. The DR-010 notice asks whether each further agent serves the declared objective or a queue item Ron ranked, and points to the Inbox otherwise. |
+| Fan-out is warn-only | No cap. The DR-010 notice asks whether each further agent serves the declared objective or a ranked queue item (rubric-ranked from the seat or ranked by Ron), and points to the Inbox otherwise. |
 | SPEND line | When an assigned agent's issue feeds a recommendation or plan, the agent's cost goes in its `SPEND:`. |
 | Blocking issues | A blocker of the current objective gets its agent. The main session works the unblocked parts, then waits on the agent's result. |
 
@@ -643,7 +643,7 @@ The filing session sets the severity from this rubric and cites the evidence in 
 
 **SLA** from the item's `created_at`: critical **7 days**, high **30 days**, medium **90 days**, low **none**. It is computed at read time (`sla_due_at`), never stored.
 
-**Order on the board:** items Ron has ranked come first, in his order. Then severity, then overdue, then due date, then age. **Ron's rank always beats severity.** Ron may change a severity only with a recorded reason (`severity_source: ron`). **P0-P3 is not used.** The proposed order for unranked items comes from the ranking rubric in §14.6.
+**Order on the board:** items Ron has ranked come first, in his order. **Ron's explicit rank always beats the rubric**, and the rubric beats severity. Ron may change a severity only with a recorded reason (`severity_source: ron`). **P0-P3 is not used.** Every item Ron has not ranked is ranked **from the session seat** with the §14.6 rubric (Steward `governance/ranking/rank.py` over a board export, the result applied on the APM board) before the session ends; then overdue, then due date, then age. A session never ends by handing Ron the Inbox to rank. Only `kind: decision` items wait for Ron, because the decision itself is his. Until the proposed-rank write ships (§14.6.1, work item `018a4cf5`), a rank written through the APM board key records `ranked_by_ron`, so the session states in its report which ranks it applied from the rubric.
 
 ### 14.6 Ranking rubric (Steward-owned)
 
@@ -688,6 +688,7 @@ The weights and goals file is Ron's: Steward and sessions change it only on his 
 | Scheduled re-score and report to Ron | PENDING: needs a read-only shared-brain work-queue principal for Steward (work item `040bd063`). The existing work-queue key carries Ron's board authority and must not be used |
 | Proposed rank written onto queue items | PENDING: needs a shared-brain field and write action that can't set `ranked_by_ron`; gated, and audited before it is switched on |
 | Norm coverage | cortex-hooks DR-032 (§14), tier `norm` |
+| Seat ranking in the norm text | ALIGNED 2026-11-09 (cortex-hooks v0.95.5; this section, §14, §14.3 and §15). Ron corrected sessions three times (2026-11-02, 2026-11-05, 2026-11-09) for ending by handing him the Inbox to rank: this rubric was ratified, but the governing text still said "until Ron ranks it" and "Ron ranking the board", and sessions followed the text. Lessons `59361a42`, `8d454362` |
 
 ## 15. Session Objective
 
@@ -700,7 +701,7 @@ The weights and goals file is Ron's: Steward and sessions change it only on his 
 1. **Declare.** Every session states its **objective** and its **"done when" criteria** in its first response.
 2. **Done means:** green, committed, version bumped, deployed and verified at the observable boundary, and the work queue updated. Criteria that cannot apply say why (for example, a docs-only repo has no deploy).
 3. **Record.** The session records both with the MCP action `brain_commitments objective_set` and records progress with `objective_update`.
-4. **Stop.** The session stops when the criteria are met. More work comes from **Ron ranking the board** (`brain_commitments next` lists the top queued items), not from what the session found along the way. Those findings go to the Inbox under §14.
+4. **Stop.** The session stops when the criteria are met. More work comes from **the ranked board** (`brain_commitments next` lists the top queued items): Ron's explicit rank first, then the §14.6 rubric applied from the session seat. Not from what the session found along the way: those findings go to the Inbox under §14, and the session ranks them with the rubric before it ends rather than handing them to Ron to rank.
 5. **Continuing sessions.** A resumed or compacted session restates its declared objective and its open criteria before further work. If it had none, it declares one then.
 
 ### 15.1 Enforcement
