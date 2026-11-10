@@ -177,7 +177,8 @@ def test_each_stub_shape_is_a_medium_finding(repo: Path, rel: str, body: str) ->
     tracked = [write(repo, rel, body)]
     f = codes(hygiene.scan_stub_markers(repo, tracked))["stub-marker"]
     assert f["severity"] == "MEDIUM"
-    assert f["items"] == [f"{rel}:2"] if body.count("\n") > 1 else [f"{rel}:1"]
+    expected = [f"{rel}:2"] if body.count("\n") > 1 else [f"{rel}:1"]
+    assert f["items"] == expected
 
 
 @pytest.mark.parametrize("rel,body", [
@@ -371,3 +372,35 @@ def test_cli_rejects_an_unreadable_roster(tmp_path: Path, monkeypatch: pytest.Mo
 def test_render_handles_new_item_shapes(repo: Path) -> None:
     rendered = [hygiene.render_item(i) for i in ({"path": "package.json", "version": "1.0.1"}, "SC-07", "src/a.rs:3")]
     assert rendered == ["package.json version=1.0.1", "SC-07", "src/a.rs:3"]
+
+
+def test_toml_header_parse_is_linear_on_a_long_unterminated_line() -> None:
+    # Security gate pass 1, SC-10: the earlier regex was super-linear here.
+    import time
+    line = "[" + " " * 1_000_000
+    t = time.perf_counter()
+    assert hygiene._toml_table_header(line) is None
+    assert time.perf_counter() - t < 1.0
+    assert hygiene._toml_table_header("[package]") == "package"
+    assert hygiene._toml_table_header("  [ tool.poetry ]  # c") == "tool.poetry"
+    assert hygiene._toml_table_header("[[bin]]") is None
+    assert hygiene._toml_table_header("[a] b") is None
+
+
+def test_py_abstract_detection_is_linear_on_blank_lines() -> None:
+    # Security gate pass 2, SC-10.
+    import time
+    t = time.perf_counter()
+    assert not hygiene._py_declares_abc("\n" * 1_000_000)
+    assert time.perf_counter() - t < 2.0
+    assert hygiene._py_declares_abc("x = 1\n    import abc\n")
+    assert hygiene._py_declares_abc("from abc import ABC\n")
+    assert hygiene._py_declares_abc("class A:\n    @abstractmethod\n    def f(self): ...\n")
+    assert not hygiene._py_declares_abc("import abcd\n")
+
+
+def test_a_failed_ls_files_is_unexamined_not_clean(tmp_path) -> None:
+    # Security gate pass 2, SC-04: not a git repo, so `git ls-files` fails.
+    (tmp_path / "x").mkdir()
+    r = hygiene.scan_repo(tmp_path / "x", 30)
+    assert [f["code"] for f in r["findings"]] == ["tracked-files-unexamined"]

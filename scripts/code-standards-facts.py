@@ -207,7 +207,13 @@ def build_series(
     series: dict[str, list[tuple[str, int]]] = {name: [] for name, _ in METRICS}
     for repo in sorted(roster):
         entry = hygiene.get(repo)
-        scanned = bool(mirror_ok.get(repo)) and entry is not None
+        # A check that could not run on part of the repo (`*-unexamined`) makes
+        # the whole repo not scanned this run: "did not run" must never export
+        # as clean (security gate pass 1, SC-07). Steward reads it as blind-scan.
+        partial = entry is not None and any(
+            isinstance(f, dict) and str(f.get("code", "")).endswith("-unexamined")
+            for f in entry.get("findings", []))
+        scanned = bool(mirror_ok.get(repo)) and entry is not None and not partial
         series["code_standards_repo_scanned"].append((f'{{repo="{repo}"}}', 1 if scanned else 0))
         if not scanned:
             continue

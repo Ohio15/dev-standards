@@ -90,8 +90,7 @@ def standard(estate: Estate) -> None:
         repos=[
             {"name": "steward-core", "path": estate.repo_dir("steward-core"),
              "findings": [finding("stub-marker"), finding("tests-undeclared", "LOW"),
-                          finding("idle-repo", "LOW"), finding("hooks-path-misconfigured"),
-                          finding("stub-marker-unexamined", "LOW")]},
+                          finding("idle-repo", "LOW"), finding("hooks-path-misconfigured")]},
             {"name": "apm", "path": estate.repo_dir("apm", package_json=True),
              "findings": [finding("version-divergence"), finding("independence-runbook-missing", "HIGH")]},
             # present in the report but its mirror refresh failed this run
@@ -267,3 +266,41 @@ def test_write_is_atomic_and_leaves_no_temp(estate: Estate, monkeypatch: pytest.
     assert sorted(p.name for p in estate.out_dir.iterdir()) == ["code_standards.prom"]
     if sys.platform != "win32":
         assert (os.stat(estate.out).st_mode & 0o777) == 0o644
+
+
+@pytest.mark.parametrize("code", ["stub-marker-unexamined", "independence-unexamined", "version-unexamined"])
+def test_a_check_that_did_not_run_exports_the_repo_as_not_scanned(estate: Estate, code: str) -> None:
+    # Security gate pass 1, SC-07: "did not run" must never export as clean.
+    estate.write(
+        roster="steward-core\n",
+        status=f"steward-core ok {SHA}\n",
+        repos=[{"name": "steward-core", "path": estate.repo_dir("steward-core"),
+                "findings": [finding("stub-marker"), finding(code, "LOW")]}],
+    )
+    assert estate.run() == 0
+    body = [line for line in estate.out.read_text(encoding="ascii").splitlines() if not line.startswith("#")]
+    assert 'code_standards_repo_scanned{repo="steward-core"} 0' in body
+    assert not any(line.startswith("code_standards_violation") for line in body)
+
+
+def test_an_npm_error_entry_with_null_counts_reads_as_not_scanned(estate: Estate) -> None:
+    # npm-audit-weekly.sh (fix/audit-unexamined, 2e17bd88): exit 4, status "error", null counts.
+    estate.write(
+        roster="apm" + chr(10) + "web" + chr(10),
+        status=f"apm ok {SHA}" + chr(10) + f"web ok {SHA}" + chr(10),
+        repos=[
+            {"name": "apm", "path": estate.repo_dir("apm", package_json=True), "findings": []},
+            {"name": "web", "path": estate.repo_dir("web", package_json=True), "findings": []},
+        ],
+        npm=[
+            {"repo": "apm", "path": "/x/apm", "status": "error", "reason": "ENOLOCK",
+             "prod_critical": None, "prod_high": None},
+            {"repo": "web", "path": "/x/web", "status": "ok", "prod_critical": 0, "prod_high": 1},
+        ],
+    )
+    assert estate.run() == 0
+    body = [line for line in estate.out.read_text(encoding="ascii").splitlines() if not line.startswith("#")]
+    assert 'code_standards_deps_scanned{repo="apm"} 0' in body
+    assert 'code_standards_deps_scanned{repo="web"} 1' in body
+    assert 'code_standards_deps_prod_vulns{repo="web",severity="high"} 1' in body
+    assert not any('deps_prod_vulns{repo="apm"' in line for line in body)

@@ -211,7 +211,27 @@ MAX_RUNTIME_SOURCE_BYTES = 1024 * 1024  # skip anything bigger; not hand-written
 # §3 single source of version truth. Root declarations compared with each
 # other, plus every nested version.json against the root one (the APM scar).
 VERSION_NESTED_SKIP_SEGMENTS = {"node_modules", ".git", "vendor", "dist", "build", "target"}
-_TOML_TABLE_RE = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
+
+
+def _toml_table_header(line: str) -> str | None:
+    """The table name of a `[name]` header line (optionally `# comment`ed), else None.
+
+    A linear scan, not a regex: the earlier pattern's overlapping whitespace
+    quantifiers were super-linear on a long unterminated `[` line, and mirrored
+    repo content reaches this parser (security gate pass 1, SC-10)."""
+    s = line.strip()
+    if not s.startswith("[") or s.startswith("[["):
+        return None
+    close = s.find("]")
+    if close < 0:
+        return None
+    name = s[1:close].strip()
+    if not name or "[" in name:
+        return None
+    rest = s[close + 1:].strip()
+    if rest and not rest.startswith("#"):
+        return None
+    return name
 _TOML_ARRAY_TABLE_RE = re.compile(r"^\s*\[\[")
 _TOML_VERSION_RE = re.compile(r"""^\s*version\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$""")
 # §2: pre-commit-tests.sh runs only what .pre-commit-tests declares. A repo
@@ -230,7 +250,15 @@ STUB_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
 )
 # A Python file that declares an abstract base raises NotImplementedError by
 # design; such files are excluded wholesale rather than parsed per method.
-_PY_ABSTRACT_RE = re.compile(r"^\s*(?:import\s+abc\b|from\s+abc\s+import\b)|@abstractmethod\b", re.MULTILINE)
+# Matched per line after lstrip (security gate pass 2, SC-10): a MULTILINE `^\s*`
+# lets `\s*` run across newlines from every line start, quadratic on a file of blank lines.
+_PY_ABSTRACT_LINE_RE = re.compile(r"(?:import\s+abc\b|from\s+abc\s+import\b)")
+
+
+def _py_declares_abc(text: str) -> bool:
+    if "@abstractmethod" in text:
+        return True
+    return any(_PY_ABSTRACT_LINE_RE.match(line.lstrip()) for line in text.splitlines())
 STUB_MAX_ITEMS = 20
 # Security register (REVIEW-MODEL.md): the repo-local copy the gate reads.
 SECURITY_REGISTER_PATHS = ("SECURITY-CHECKS.md", "security/SECURITY-CHECKS.md")
@@ -325,10 +353,12 @@ def gitconfig(repo: Path, key: str) -> str | None:
     return None
 
 
-def tracked_files(repo: Path) -> list[str]:
+def tracked_files(repo: Path) -> list[str] | None:
+    """Tracked paths, or None when `git ls-files` failed: a failure is never
+    "nothing tracked" (security gate pass 2, SC-04)."""
     rc, out, _ = run(["git", "ls-files"], cwd=repo)
     if rc != 0:
-        return []
+        return None
     return [line for line in out.splitlines() if line]
 
 
@@ -858,9 +888,9 @@ def _toml_table_version(path: Path, tables: tuple[str, ...]) -> str | None:
         if _TOML_ARRAY_TABLE_RE.match(line):
             current = None
             continue
-        m = _TOML_TABLE_RE.match(line)
-        if m:
-            current = m.group(1).replace(" ", "")
+        header = _toml_table_header(line)
+        if header is not None:
+            current = header.replace(" ", "")
             continue
         if current in tables and current not in found:
             vm = _TOML_VERSION_RE.match(line)
@@ -908,9 +938,22 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
         ("VERSION", _first_line),
     )
     sources: list[dict[str, str]] = []
+    unexamined: list[dict[str, str]] = []
     for rel, reader in readers:
         if rel not in tracked_set:
             continue
+        # A declaration that could not be read or parsed is unexamined, never
+        # "no source" (security gate pass 1, SC-07).
+        text, skip = _read_text_capped(repo / rel)
+        if skip or text is None:
+            unexamined.append({"path": rel, "reason": skip or "unreadable"})
+            continue
+        if rel.endswith(".json"):
+            try:
+                json.loads(text)
+            except ValueError:
+                unexamined.append({"path": rel, "reason": "not valid JSON"})
+                continue
         value = reader(repo / rel)
         if value is not None:
             sources.append({"path": rel, "version": value})
@@ -927,14 +970,32 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
                 continue
             if any(seg in VERSION_NESTED_SKIP_SEGMENTS for seg in parts[:-1]):
                 continue
+            ntext, nskip = _read_text_capped(repo / rel)
+            if nskip or ntext is None:
+                unexamined.append({"path": rel, "reason": nskip or "unreadable"})
+                continue
+            try:
+                json.loads(ntext)
+            except ValueError:
+                unexamined.append({"path": rel, "reason": "not valid JSON"})
+                continue
             nested = _json_version(repo / rel)
             if nested is not None and _version_key(nested) != _version_key(root_json):
                 if not any(i["path"] == "version.json" for i in items):
                     items.append({"path": "version.json", "version": root_json})
                 items.append({"path": rel, "version": nested})
+    out: list[dict[str, Any]] = []
+    if unexamined:
+        out.append({
+            "severity": "LOW",
+            "code": "version-unexamined",
+            "count": len(unexamined),
+            "items": unexamined[:20],
+            "note": "a version declaration could not be read; the version check did not run on it",
+        })
     if not items:
-        return []
-    return [{
+        return out
+    return out + [{
         "severity": "MEDIUM",
         "code": "version-divergence",
         "count": len(items),
@@ -982,7 +1043,7 @@ def scan_stub_markers(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
             skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
         if not text:
             continue
-        if lower.endswith(".py") and _PY_ABSTRACT_RE.search(text):
+        if lower.endswith(".py") and _py_declares_abc(text):
             continue
         for n, line in enumerate(text.splitlines(), 1):
             if _is_comment_line(rel, line):
@@ -1115,7 +1176,21 @@ def scan_repo(
     name = repo.name
     findings: list[dict[str, Any]] = []
 
-    tracked = tracked_files(repo)
+    listed = tracked_files(repo)
+    if listed is None:
+        # Every content check below would vacuously pass on an empty list. The
+        # `-unexamined` suffix makes the exporter report the repo as not scanned.
+        return {
+            "name": name,
+            "path": str(repo),
+            "tracked_count": 0,
+            "findings": [{
+                "severity": "LOW",
+                "code": "tracked-files-unexamined",
+                "note": "git ls-files failed; no content check ran on this repo",
+            }],
+        }
+    tracked = listed
 
     # HIGH: binaries / oversized
     big: list[dict[str, Any]] = []

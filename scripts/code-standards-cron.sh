@@ -116,7 +116,7 @@ rm -f -- "$work"/hygiene/hygiene-scan-*.json
 scan_rc=0
 env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$work/no-xdg" \
   GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=20" \
-  python3 -I "$here/repo-hygiene-scan.py" \
+  timeout --kill-after=60 3600 python3 -I "$here/repo-hygiene-scan.py" \
     --root "$mirror" \
     --output-dir "$work/hygiene" \
     --no-layout \
@@ -136,21 +136,26 @@ if (( ${#reports[@]} != 1 )); then
   exit 1
 fi
 
-# 4. npm audit (degradable). Environment config outranks a repo's .npmrc, so
-#    a mirrored repo cannot point the audit at another registry; scripts are
-#    off as belt-and-braces (`npm audit` runs none).
+# 4. npm audit (degradable, bounded). The environment's npm_config_registry
+#    outranks a repo .npmrc's top-level `registry` key only; scoped
+#    `@scope:registry` and other repo .npmrc keys still apply. That is
+#    unverified at the wire and tracked as debt with the npm-audit status fix
+#    (issue 2e17bd88). Scripts are off as belt-and-braces (`npm audit` runs none).
 rm -f -- "$work"/npm/npm-audit-*.json
 npm_args=()
 npm_rc=0
 env npm_config_registry="https://registry.npmjs.org/" npm_config_ignore_scripts=true \
   npm_config_update_notifier=false npm_config_fund=false \
-  "$here/npm-audit-weekly.sh" --root "$mirror" --output-dir "$work/npm" \
+  timeout --kill-after=60 3600 "$here/npm-audit-weekly.sh" --root "$mirror" --output-dir "$work/npm" \
   > "$work/npm/npm-audit.md" 2> "$work/npm/npm-audit.err" || npm_rc=$?
 shopt -s nullglob
 npm_reports=("$work"/npm/npm-audit-*.json)
 shopt -u nullglob
-# 0 = under thresholds, 3 = thresholds exceeded; both wrote a report.
-if (( (npm_rc == 0 || npm_rc == 3) && ${#npm_reports[@]} == 1 )); then
+# 0 = under thresholds, 3 = thresholds exceeded, 4 = some repo not examined
+# (status "error", null counts); all three wrote a report. code-standards-facts.py
+# exports only status "ok" entries with integer counts as scanned, so an error
+# entry reads as deps_scanned 0, never as clean, and the rest of the report is kept.
+if (( (npm_rc == 0 || npm_rc == 3 || npm_rc == 4) && ${#npm_reports[@]} == 1 )); then
   npm_args=(--npm-audit "${npm_reports[0]}")
 else
   log "WARNING npm-audit-weekly.sh exit $npm_rc, ${#npm_reports[@]} report(s); deps exported as not scanned"
