@@ -1,0 +1,98 @@
+# Estate roster for the code-standards facts export (scripts/code-standards-cron.sh).
+# One GitHub repo name per line (owner Ohio15), exactly as GitHub spells it; the
+# mirror directory and the exported `repo` label are the lowercase form. `#` starts
+# a comment. Every repo listed here is exported as code_standards_repo_scanned 0|1
+# on every run, so a repo that fails to mirror is visible, never silently dropped.
+#
+# Source: `gh repo list Ohio15 --no-archived --source` on 2026-11-10, every repo
+# pushed since 2026-08-10. Steward's own repos (steward, steward-core,
+# steward-sessionwatch, steward-presence, steward-governance) are reviewed like
+# every other repo: no exemption (scripts/tests/test_code_standards_roster.py).
+#
+# Excluded:
+# aibrowser-updates   -- ~3 GB binary update channel for AIBrowser, not source code
+# Not listed (no push since 2026-08-10): PDFReaderEditor, PDFConverter, AdGuardHome
+
+ai-console
+AIWebBrowser
+APM
+AppCodeVisualizer
+brain-mcp-proxy
+cadcraft
+CareManager
+ceremony
+chrome-ui-review
+cortex
+cortex-core
+cortex-hooks
+craft-adobe
+craft-autodesk
+craft-avid
+craft-libs
+craft-microsoft
+craft-tools
+deckcraft
+designcraft
+dev-standards
+dev-standards-canary
+DirectoryExplorer
+e38flash
+effectcraft
+FileCompactor
+filmcraft
+GameManager
+gridcraft
+hpt-extract
+infra
+juicebox-hsm-realm
+juicebox-software-realm
+lightcraft
+MCP-Core
+ms-account-router
+n3xus-identity
+n3xus-notify
+NCtoDXF-Converter
+newtab-server
+nexus-realervnc
+nexus-relay
+nexus-suricata
+nexus-watch
+notification-service
+op-front
+op-proxy
+OpenClaw
+OpenOBD
+OpenOS
+OSTViewer
+Outlook-jira-plugin
+patriot-browser-policy-reconciler
+patriot-compliance
+patriot-nas-mail-relay
+patriot-network-backups
+Patriot-P2-scripts
+patriot-printer-reconciler
+patriot-provisioning
+paxson-bin
+paxson-claude-config
+pdfcraft
+PDFManager
+personal-ai-pod
+photocraft
+ResourceOverlay
+Sentinel
+Shared-Brain
+Site-Roller
+soundcraft
+Sports-hub
+steward
+steward-core
+steward-governance
+steward-presence
+steward-sessionwatch
+ToolVault
+training-data-store
+truck-mcp
+unas-ops
+vectorcraft
+WebTester
+wordcraft
