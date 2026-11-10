@@ -46,6 +46,21 @@ Findings (severity-tagged):
     MEDIUM  an AI-vendor host literal in non-test runtime source of a
             `full` repo with no ADR naming that host (AI-1)
     MEDIUM  release-config.yml `independence:` holds an unknown value
+    Code standards (content-only; exported to Steward by
+    code-standards-facts.py as the code-standards-* positions):
+    MEDIUM  version-divergence: root version declarations (version.json,
+            package.json, Cargo.toml [package], pyproject.toml, VERSION)
+            disagree, or a nested version.json differs from the root one (§3)
+    LOW     tests-undeclared: no root .pre-commit-tests in a repo with
+            tracked source (§2)
+    MEDIUM  stub-marker: todo!/unimplemented!, raise NotImplementedError,
+            throw new Error("not implemented"), NotImplementedException in
+            non-test runtime source (no-stubs rule)
+    MEDIUM  security-register-missing: a repo on --security-roster carries
+            no SECURITY-CHECKS.md (root or security/)
+    MEDIUM  security-register-stale: a repo copy lacks an SC-<n> rule the
+            --canonical-register names
+    The two security checks run only when their argument is given.
 
 Output:
     JSON      <output-dir>/hygiene-scan-<YYYY-MM-DD>.json
@@ -188,6 +203,67 @@ COMMENT_PREFIXES_BY_SUFFIX: dict[str, tuple[str, ...]] = {
 ADR_PATH_RE = re.compile(r"(^|/)(docs/)?adr[s]?/|(^|/)adr-\d+|(^|/)ADR", re.IGNORECASE)
 MAX_RUNTIME_SOURCE_BYTES = 1024 * 1024  # skip anything bigger; not hand-written code
 
+# --- Code-standards checks (Steward code-standards-* positions) -----------
+# Content-only checks: every verdict below is a function of the tracked tree,
+# never of local checkout state (hooksPath, working-tree drift), so they mean
+# the same thing on a fresh mirror clone as on a workstation checkout.
+#
+# §3 single source of version truth. Root declarations compared with each
+# other, plus every nested version.json against the root one (the APM scar).
+VERSION_NESTED_SKIP_SEGMENTS = {"node_modules", ".git", "vendor", "dist", "build", "target"}
+
+
+def _toml_table_header(line: str) -> str | None:
+    """The table name of a `[name]` header line (optionally `# comment`ed), else None.
+
+    A linear scan, not a regex: the earlier pattern's overlapping whitespace
+    quantifiers were super-linear on a long unterminated `[` line, and mirrored
+    repo content reaches this parser (security gate pass 1, SC-10)."""
+    s = line.strip()
+    if not s.startswith("[") or s.startswith("[["):
+        return None
+    close = s.find("]")
+    if close < 0:
+        return None
+    name = s[1:close].strip()
+    if not name or "[" in name:
+        return None
+    rest = s[close + 1:].strip()
+    if rest and not rest.startswith("#"):
+        return None
+    return name
+_TOML_ARRAY_TABLE_RE = re.compile(r"^\s*\[\[")
+_TOML_VERSION_RE = re.compile(r"""^\s*version\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$""")
+# §2: pre-commit-tests.sh runs only what .pre-commit-tests declares. A repo
+# whose only tracked "source" is config/data has no suite to declare.
+TESTS_DECLARATION_FILE = ".pre-commit-tests"
+CONFIG_ONLY_SUFFIXES = {".json", ".yml", ".yaml", ".toml", ".ini"}
+# No-stubs rule. Exact shapes only (precision over recall): each pattern is
+# applied to the suffixes of its own language, on non-comment lines of
+# tracked non-test runtime source.
+_JS_SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+STUB_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
+    ((".rs",), re.compile(r"\b(?:todo|unimplemented)!\s*\(")),
+    ((".py",), re.compile(r"^\s*raise\s+NotImplementedError\b")),
+    (_JS_SUFFIXES, re.compile(r"""\bthrow\s+new\s+Error\s*\(\s*(["'`])not implemented\1\s*\)""", re.IGNORECASE)),
+    ((".cs",), re.compile(r"\bthrow\s+new\s+NotImplementedException\b")),
+)
+# A Python file that declares an abstract base raises NotImplementedError by
+# design; such files are excluded wholesale rather than parsed per method.
+# Matched per line after lstrip (security gate pass 2, SC-10): a MULTILINE `^\s*`
+# lets `\s*` run across newlines from every line start, quadratic on a file of blank lines.
+_PY_ABSTRACT_LINE_RE = re.compile(r"(?:import\s+abc\b|from\s+abc\s+import\b)")
+
+
+def _py_declares_abc(text: str) -> bool:
+    if "@abstractmethod" in text:
+        return True
+    return any(_PY_ABSTRACT_LINE_RE.match(line.lstrip()) for line in text.splitlines())
+STUB_MAX_ITEMS = 20
+# Security register (REVIEW-MODEL.md): the repo-local copy the gate reads.
+SECURITY_REGISTER_PATHS = ("SECURITY-CHECKS.md", "security/SECURITY-CHECKS.md")
+SECURITY_RULE_ID_RE = re.compile(r"\bSC-\d+\b")
+
 # Drift detection constants
 NEXUS_HOST = "ohio_@100.98.48.63"
 NTFY_URL = "http://192.168.1.20:2586/nexus-alerts"
@@ -277,10 +353,12 @@ def gitconfig(repo: Path, key: str) -> str | None:
     return None
 
 
-def tracked_files(repo: Path) -> list[str]:
+def tracked_files(repo: Path) -> list[str] | None:
+    """Tracked paths, or None when `git ls-files` failed: a failure is never
+    "nothing tracked" (security gate pass 2, SC-04)."""
     rc, out, _ = run(["git", "ls-files"], cwd=repo)
     if rc != 0:
-        return []
+        return None
     return [line for line in out.splitlines() if line]
 
 
@@ -782,11 +860,337 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
     return findings
 
 
-def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
+def _json_version(path: Path) -> str | None:
+    """Top-level "version" string of a JSON file, or None (absent/unparseable)."""
+    text, skip = _read_text_capped(path)
+    if skip or text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    v = data.get("version") if isinstance(data, dict) else None
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _toml_table_version(path: Path, tables: tuple[str, ...]) -> str | None:
+    """`version = "..."` inside the first of `tables` that declares one.
+
+    A line parse, not a TOML parser (stdlib-only on Python 3.8): only a plain
+    string value counts, so `version.workspace = true` and
+    `version = { workspace = true }` (workspace-inherited) are not sources."""
+    text, skip = _read_text_capped(path)
+    if skip or text is None:
+        return None
+    found: dict[str, str] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if _TOML_ARRAY_TABLE_RE.match(line):
+            current = None
+            continue
+        header = _toml_table_header(line)
+        if header is not None:
+            current = header.replace(" ", "")
+            continue
+        if current in tables and current not in found:
+            vm = _TOML_VERSION_RE.match(line)
+            if vm:
+                value = (vm.group(1) if vm.group(1) is not None else vm.group(2)).strip()
+                if value:
+                    found[current] = value
+    for table in tables:
+        if table in found:
+            return found[table]
+    return None
+
+
+def _first_line(path: Path) -> str | None:
+    text, skip = _read_text_capped(path)
+    if skip or text is None:
+        return None
+    lines = text.splitlines()
+    value = lines[0].strip() if lines else ""
+    return value or None
+
+
+def _version_key(value: str) -> str:
+    # `v1.2.3` (a VERSION file, a tag-style string) and `1.2.3` are one version.
+    return value[1:] if value[:1] in ("v", "V") and value[1:2].isdigit() else value
+
+
+def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
+    """MEDIUM `version-divergence` (STANDARDS §3): the repo declares more than
+    one version and they disagree.
+
+    Root declarations: version.json, package.json, Cargo.toml [package],
+    pyproject.toml [project] / [tool.poetry], VERSION (first line). Any two or
+    more that are not all equal is a finding. Separately, every tracked
+    non-root version.json (outside node_modules/.git/vendor/dist/build/target)
+    whose "version" differs from root version.json is a finding: the APM
+    v0.9.2 scar, where the gate read the root file and /api/health read a
+    stale server/version.json. Only tracked files are sources."""
+    tracked_set = set(t.replace("\\", "/") for t in tracked)
+    readers: tuple[tuple[str, Any], ...] = (
+        ("version.json", _json_version),
+        ("package.json", _json_version),
+        ("Cargo.toml", lambda p: _toml_table_version(p, ("package",))),
+        ("pyproject.toml", lambda p: _toml_table_version(p, ("project", "tool.poetry"))),
+        ("VERSION", _first_line),
+    )
+    sources: list[dict[str, str]] = []
+    unexamined: list[dict[str, str]] = []
+    for rel, reader in readers:
+        if rel not in tracked_set:
+            continue
+        # A declaration that could not be read or parsed is unexamined, never
+        # "no source" (security gate pass 1, SC-07).
+        text, skip = _read_text_capped(repo / rel)
+        if skip or text is None:
+            unexamined.append({"path": rel, "reason": skip or "unreadable"})
+            continue
+        if rel.endswith(".json"):
+            try:
+                json.loads(text)
+            except ValueError:
+                unexamined.append({"path": rel, "reason": "not valid JSON"})
+                continue
+        value = reader(repo / rel)
+        if value is not None:
+            sources.append({"path": rel, "version": value})
+
+    items: list[dict[str, str]] = []
+    if len(sources) >= 2 and len({_version_key(s["version"]) for s in sources}) > 1:
+        items.extend(sources)
+
+    root_json = next((s["version"] for s in sources if s["path"] == "version.json"), None)
+    if root_json is not None:
+        for rel in sorted(tracked_set):
+            parts = rel.split("/")
+            if len(parts) < 2 or parts[-1] != "version.json":
+                continue
+            if any(seg in VERSION_NESTED_SKIP_SEGMENTS for seg in parts[:-1]):
+                continue
+            ntext, nskip = _read_text_capped(repo / rel)
+            if nskip or ntext is None:
+                unexamined.append({"path": rel, "reason": nskip or "unreadable"})
+                continue
+            try:
+                json.loads(ntext)
+            except ValueError:
+                unexamined.append({"path": rel, "reason": "not valid JSON"})
+                continue
+            nested = _json_version(repo / rel)
+            if nested is not None and _version_key(nested) != _version_key(root_json):
+                if not any(i["path"] == "version.json" for i in items):
+                    items.append({"path": "version.json", "version": root_json})
+                items.append({"path": rel, "version": nested})
+    out: list[dict[str, Any]] = []
+    if unexamined:
+        out.append({
+            "severity": "LOW",
+            "code": "version-unexamined",
+            "count": len(unexamined),
+            "items": unexamined[:20],
+            "note": "a version declaration could not be read; the version check did not run on it",
+        })
+    if not items:
+        return out
+    return out + [{
+        "severity": "MEDIUM",
+        "code": "version-divergence",
+        "count": len(items),
+        "items": items[:20],
+        "note": "version declarations disagree; root version.json is the single source of truth and every "
+                "other declaration must derive from it (STANDARDS §3)",
+    }]
+
+
+def scan_tests_declared(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
+    """LOW `tests-undeclared` (STANDARDS §2): no tracked root .pre-commit-tests,
+    so pre-commit-tests.sh has nothing to run and the commit gate confirms
+    nothing. Repos with no tracked source at all (docs/config only) are
+    skipped: there is no suite to declare."""
+    tracked_set = set(t.replace("\\", "/") for t in tracked)
+    if TESTS_DECLARATION_FILE in tracked_set:
+        return []
+    source_suffixes = tuple(sorted(RUNTIME_SOURCE_SUFFIXES - CONFIG_ONLY_SUFFIXES))
+    if not any(t.lower().endswith(source_suffixes) for t in tracked_set):
+        return []
+    return [{
+        "severity": "LOW",
+        "code": "tests-undeclared",
+        "note": "no .pre-commit-tests at the repo root; the pre-commit test hook runs only what a repo "
+                "declares, so without it the commit gate confirms nothing (STANDARDS §2)",
+    }]
+
+
+def scan_stub_markers(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
+    """MEDIUM `stub-marker` (no-stubs rule): an exact stub shape in tracked
+    non-test runtime source. Rust `todo!(`/`unimplemented!(`; Python
+    `raise NotImplementedError` (files declaring an abstract base excluded);
+    JS/TS `throw new Error("not implemented")`; C# `throw new
+    NotImplementedException`. Comment lines never match. Files the pass could
+    not read are reported as LOW `stub-marker-unexamined`, never as clean."""
+    hits: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for rel in sorted(set(t.replace("\\", "/") for t in tracked)):
+        lower = rel.lower()
+        patterns = [pat for sufs, pat in STUB_PATTERNS if lower.endswith(sufs)]
+        if not patterns or _is_test_path(rel) or lower.startswith(".github/"):
+            continue
+        text, skip = _read_text_capped(repo / rel)
+        if skip:
+            skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
+        if not text:
+            continue
+        if lower.endswith(".py") and _py_declares_abc(text):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if _is_comment_line(rel, line):
+                continue
+            if any(pat.search(line) for pat in patterns):
+                hits.append(f"{rel}:{n}")
+    findings: list[dict[str, Any]] = []
+    if hits:
+        findings.append({
+            "severity": "MEDIUM",
+            "code": "stub-marker",
+            "count": len(hits),
+            "items": hits[:STUB_MAX_ITEMS],
+            "note": "stub marker in runtime source; no stubs, placeholders or unimplemented paths outside tests",
+        })
+    if skipped:
+        findings.append({
+            "severity": "LOW",
+            "code": "stub-marker-unexamined",
+            "count": len(skipped),
+            "items": skipped[:20],
+            "note": "files the stub-marker pass could not read: not examined, not clean",
+        })
+    return findings
+
+
+def load_security_roster(path: Path) -> set[str]:
+    """Lowercased repo names from cortex-hooks config/security-repos.json
+    (`repos[].name`). Raises ValueError on any unreadable or malformed roster:
+    a roster that silently parsed to nothing would pass every repo."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"security roster {path} unreadable: {exc}") from exc
+    repos = data.get("repos") if isinstance(data, dict) else None
+    if not isinstance(repos, list):
+        raise ValueError(f"security roster {path} has no repos[] list")
+    names: set[str] = set()
+    for entry in repos:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"security roster {path} has an entry without a name: {entry!r}")
+        names.add(name.strip().lower())
+    if not names:
+        raise ValueError(f"security roster {path} lists no repos")
+    return names
+
+
+def register_rule_ids(text: str) -> set[str]:
+    """SC-<n> ids named on heading lines (lines starting with '#')."""
+    ids: set[str] = set()
+    for line in text.splitlines():
+        if line.startswith("#"):
+            ids.update(SECURITY_RULE_ID_RE.findall(line))
+    return ids
+
+
+def load_canonical_register(path: Path) -> tuple[Path, set[str]]:
+    """(resolved path, rule ids) of the canonical register. Raises ValueError
+    when it cannot be read or names no rule: an empty canonical would make
+    every repo copy vacuously current."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"canonical register {path} unreadable: {exc}") from exc
+    ids = register_rule_ids(text)
+    if not ids:
+        raise ValueError(f"canonical register {path} names no SC-<n> rule on a heading line")
+    return path.resolve(), ids
+
+
+def scan_security_register(
+    repo: Path,
+    tracked: list[str],
+    security_roster: set[str] | None = None,
+    canonical: tuple[Path, set[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """MEDIUM `security-register-missing`: a repo on the security-audit roster
+    carries no SECURITY-CHECKS.md (root or security/). MEDIUM
+    `security-register-stale`: a repo copy lacks a rule id the canonical
+    dev-standards register names. Each check runs only when its input was
+    supplied; without it the check is absent, not passed."""
+    tracked_set = set(t.replace("\\", "/") for t in tracked)
+    copies = [rel for rel in SECURITY_REGISTER_PATHS if rel in tracked_set]
+    findings: list[dict[str, Any]] = []
+    if security_roster is not None and repo.name.lower() in security_roster and not copies:
+        findings.append({
+            "severity": "MEDIUM",
+            "code": "security-register-missing",
+            "note": "repo is on the security-audit roster (cortex-hooks config/security-repos.json) but carries "
+                    "no SECURITY-CHECKS.md or security/SECURITY-CHECKS.md; re-run install.sh",
+        })
+    if canonical is not None and copies:
+        canon_path, canon_ids = canonical
+        missing: set[str] = set()
+        stale_paths: list[str] = []
+        for rel in copies:
+            path = repo / rel
+            if path.resolve() == canon_path:
+                continue  # the canonical file itself (dev-standards' own security/)
+            text, skip = _read_text_capped(path)
+            if skip or text is None:
+                missing.update(canon_ids)  # unreadable copy: nothing in it can be shown current
+                stale_paths.append(f"{rel} ({skip or 'empty'})")
+                continue
+            lacking = canon_ids - register_rule_ids(text)
+            if lacking:
+                missing.update(lacking)
+                stale_paths.append(rel)
+        if missing:
+            ordered = sorted(missing, key=lambda i: int(i.split("-", 1)[1]))
+            findings.append({
+                "severity": "MEDIUM",
+                "code": "security-register-stale",
+                "count": len(ordered),
+                "items": ordered[:20],
+                "paths": stale_paths,
+                "note": "repo SECURITY-CHECKS.md lacks rules the canonical dev-standards register names; "
+                        "re-run install.sh to sync it",
+            })
+    return findings
+
+
+def scan_repo(
+    repo: Path,
+    age_threshold: int,
+    security_roster: set[str] | None = None,
+    canonical_register: tuple[Path, set[str]] | None = None,
+) -> dict[str, Any]:
     name = repo.name
     findings: list[dict[str, Any]] = []
 
-    tracked = tracked_files(repo)
+    listed = tracked_files(repo)
+    if listed is None:
+        # Every content check below would vacuously pass on an empty list. The
+        # `-unexamined` suffix makes the exporter report the repo as not scanned.
+        return {
+            "name": name,
+            "path": str(repo),
+            "tracked_count": 0,
+            "findings": [{
+                "severity": "LOW",
+                "code": "tracked-files-unexamined",
+                "note": "git ls-files failed; no content check ran on this repo",
+            }],
+        }
+    tracked = listed
 
     # HIGH: binaries / oversized
     big: list[dict[str, Any]] = []
@@ -880,6 +1284,18 @@ def scan_repo(repo: Path, age_threshold: int) -> dict[str, Any]:
 
     # HIGH/MEDIUM: application independence floor (STANDARDS §13, IMPL-34)
     findings.extend(scan_independence(repo, tracked))
+
+    # MEDIUM: divergent version declarations (STANDARDS §3)
+    findings.extend(scan_version_divergence(repo, tracked))
+
+    # LOW: no declared pre-commit test suite (STANDARDS §2)
+    findings.extend(scan_tests_declared(repo, tracked))
+
+    # MEDIUM: stub markers in runtime source (no-stubs rule)
+    findings.extend(scan_stub_markers(repo, tracked))
+
+    # MEDIUM: security register missing (rostered repos) / stale vs canonical
+    findings.extend(scan_security_register(repo, tracked, security_roster, canonical_register))
 
     # LOW: noise
     noise = noise_files(repo, tracked)
@@ -2121,7 +2537,29 @@ def main() -> int:
         "--no-layout", action="store_true",
         help="Skip the workspace layout floor passes (Projects root, worktrees root, scratch root)",
     )
+    ap.add_argument(
+        "--security-roster", default=None,
+        help="cortex-hooks config/security-repos.json; enables security-register-missing for the repos "
+             "it lists (absent = the check does not run)",
+    )
+    ap.add_argument(
+        "--canonical-register", default=None,
+        help="dev-standards security/SECURITY-CHECKS.md; enables security-register-stale "
+             "(absent = the check does not run)",
+    )
     args = ap.parse_args()
+
+    # A supplied input that cannot be read is a usage error, never a silent
+    # skip: the check would otherwise read as passed for every repo.
+    security_roster: set[str] | None = None
+    canonical_register: tuple[Path, set[str]] | None = None
+    try:
+        if args.security_roster:
+            security_roster = load_security_roster(Path(args.security_roster))
+        if args.canonical_register:
+            canonical_register = load_canonical_register(Path(args.canonical_register))
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # Task Scheduler / cmd.exe stdout is cp1252 on Windows; any non-Latin-1
     # character in a path or note would otherwise abort the whole scan at
@@ -2143,7 +2581,7 @@ def main() -> int:
     repos = discover_repos(roots)
     scan_date = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
-    repo_reports = [scan_repo(r, args.age_threshold) for r in repos]
+    repo_reports = [scan_repo(r, args.age_threshold, security_roster, canonical_register) for r in repos]
 
     # Drift detection (Phase 1C) — additive: produces its own findings list
     # that gets merged into the corresponding repo report by name, and a
