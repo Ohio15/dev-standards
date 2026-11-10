@@ -3,6 +3,24 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.4 - 2026-11-10
+
+The code-standards exporter scanned no dependencies: `scripts/npm-audit-weekly.sh` was committed
+mode 100644 (since before 1a18512) while `code-standards-cron.sh` runs it directly
+(`timeout ... "$here/npm-audit-weekly.sh"`). On NEXUS every 6-hourly run got exit 126 and exported
+every dependency position as not scanned (first exporter run 2026-11-10T18:26Z): a blind scan,
+reported as not scanned rather than clean, but no dependency was examined.
+
+- Index mode 100755 (`git update-index --chmod=+x`) for `scripts/npm-audit-weekly.sh` (run directly
+  by the cron and by README's crontab and `./scripts/` examples), `scripts/register-nexus-runner.sh`
+  (README and its own usage run `./scripts/register-nexus-runner.sh`) and
+  `scripts/repo-hygiene-scan.py` (README's NEXUS crontab line runs it without an interpreter).
+- `scripts/tests/test_exec_bits.py` (new): every tracked shell script or hook with a shebang, every
+  `"$here/<name>"` a tracked script runs without an interpreter, and every `./scripts/<name>` /
+  `.../dev-standards/scripts/<name>` a tracked doc or script runs without an interpreter must be
+  100755 in the git index; a failure names the file and each place that runs it. Red on 9c90e0a
+  (those three files), green after.
+
 ## 1.1.3 - 2026-11-10
 
 Routine security audit 2026-11-10.2 (dev-standards): M3, M4 and L1, each found by all three
