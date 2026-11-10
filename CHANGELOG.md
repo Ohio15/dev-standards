@@ -3,6 +3,12 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.2 - 2026-11-10
+
+Security register SC-53..SC-55 graduated from audit-steward-sessionwatch-2026-11-10, approved by
+Ron 2026-11-10 (shared-brain b37ab3ef): an enforcement point named with no consumer (SC-53), a
+sanitizer that leaves Unicode format characters (SC-54), a finding resolved on absence rather
+than a satisfied predicate (SC-55). Both register copies updated identically.
 ## 1.1.1 - 2026-11-10
 
 Work item 2e17bd88 (security, high): `npm-audit-weekly.sh` failed open.
