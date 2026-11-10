@@ -338,8 +338,8 @@ if [ -d "$target/.github/workflows" ]; then
   # The sort's status is checked (a failed sort would otherwise yield an
   # empty list and an install that scanned nothing: fail-open, gate pass 2
   # note on #73), and the sorted list must hold every entry find produced.
-  n_found="$(tr -cd ' ' <"$wf_list" | wc -c)"
-  n_sorted="$(tr -cd ' ' <"$wf_sorted" | wc -c)"
+  n_found="$(tr -cd '\000' <"$wf_list" | wc -c)"
+  n_sorted="$(tr -cd '\000' <"$wf_sorted" | wc -c)"
   if [ "$n_found" -ne "$n_sorted" ]; then
     echo "ERROR: the workflow list for the cache-restore check lost entries ($n_sorted of $n_found); nothing installed" >&2
     exit 1

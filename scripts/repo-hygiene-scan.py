@@ -88,8 +88,10 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 import importlib.util
@@ -390,11 +392,11 @@ def check_ignored(repo: Path, paths: list[str]) -> list[str]:
 
 
 def file_size(repo: Path, rel: str) -> int | None:
-    p = repo / rel
-    try:
-        return p.stat().st_size
-    except (OSError, FileNotFoundError):
-        return None
+    # lstat_repo_path: a tracked symlink is a link-text blob; stat() would
+    # report (and probe the existence of) whatever the link names outside the
+    # repo (SC-58). A symlink is not an oversized file, so it has no size here.
+    st, _why = lstat_repo_path(repo, rel)
+    return st.st_size if st is not None else None
 
 
 def working_tree_drift(repo: Path) -> list[str]:
@@ -441,31 +443,44 @@ def noise_files(repo: Path, tracked: list[str]) -> list[str]:
     return sorted(hits)
 
 
-def parse_gitmodules(repo: Path) -> list[dict[str, str]]:
-    """Return [{name, path, url, branch}] from the superproject's .gitmodules
-    (branch defaults to SUBMODULE_DEFAULT_BRANCH). Uses git's own parser so
-    quoting/whitespace edge cases match what `git submodule` would see."""
-    gm = repo / ".gitmodules"
-    if not gm.is_file():
-        return []
-    rc, out, _ = run(["git", "config", "-f", str(gm), "--get-regexp", r"^submodule\..*\.path$"], cwd=repo)
-    if rc != 0:
-        return []
+def read_gitmodules(repo: Path) -> tuple[list[dict[str, str]], str | None]:
+    """([{name, path, url, branch}], None) from the superproject's .gitmodules
+    (branch defaults to SUBMODULE_DEFAULT_BRANCH), or ([], reason) when the file
+    exists but was NOT examined (symlinked, not a regular file, oversized,
+    unreadable). An absent file is ([], None). Uses git's own parser so
+    quoting/whitespace edge cases match what `git submodule` would see, but on
+    a private copy of the bytes read_repo_file returned: git is never handed a
+    path inside the repo, so a symlinked .gitmodules is never followed
+    (gate pass 1 on #87, SC-01). `-f` reads no includes by default."""
+    raw, why = read_repo_file(repo, ".gitmodules")
+    if raw is None:
+        return [], (None if why == REPO_ABSENT else why)
     mods: list[dict[str, str]] = []
-    for line in out.splitlines():
-        key, _, path = line.partition(" ")
-        name = key[len("submodule."):-len(".path")]
-        if not name or not path:
-            continue
-        rc_u, url, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.url"], cwd=repo)
-        rc_b, branch, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.branch"], cwd=repo)
-        mods.append({
-            "name": name,
-            "path": path.strip(),
-            "url": url.strip() if rc_u == 0 else "",
-            "branch": branch.strip() if rc_b == 0 and branch.strip() else SUBMODULE_DEFAULT_BRANCH,
-        })
-    return mods
+    with tempfile.TemporaryDirectory(prefix="hygiene-gitmodules-") as tmp:
+        gm = Path(tmp) / "gitmodules"
+        gm.write_bytes(raw)
+        rc, out, _ = run(["git", "config", "-f", str(gm), "--get-regexp", r"^submodule\..*\.path$"], cwd=Path(tmp))
+        if rc != 0:
+            return [], None
+        for line in out.splitlines():
+            key, _, path = line.partition(" ")
+            name = key[len("submodule."):-len(".path")]
+            if not name or not path:
+                continue
+            rc_u, url, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.url"], cwd=Path(tmp))
+            rc_b, branch, _ = run(["git", "config", "-f", str(gm), "--get", f"submodule.{name}.branch"], cwd=Path(tmp))
+            mods.append({
+                "name": name,
+                "path": path.strip(),
+                "url": url.strip() if rc_u == 0 else "",
+                "branch": branch.strip() if rc_b == 0 and branch.strip() else SUBMODULE_DEFAULT_BRANCH,
+            })
+    return mods, None
+
+
+def parse_gitmodules(repo: Path) -> list[dict[str, str]]:
+    """read_gitmodules without the reason (a not-examined file reads as [])."""
+    return read_gitmodules(repo)[0]
 
 
 def submodule_pointer(repo: Path, path: str) -> str | None:
@@ -550,7 +565,17 @@ def scan_submodule_pointer_lag(repo: Path) -> list[dict[str, Any]]:
     the lag range contains a version bump, LOW otherwise (including the
     unknown-lag and pointer-not-on-branch cases). Side-effect-free."""
     findings: list[dict[str, Any]] = []
-    for mod in parse_gitmodules(repo):
+    mods, why = read_gitmodules(repo)
+    if why is not None:
+        findings.append({
+            "severity": "LOW",
+            "code": "submodule-unexamined",
+            "path": ".gitmodules",
+            "reason": why,
+            "note": ".gitmodules was not read (symlinked, not a regular file, oversized or unreadable): "
+                    "the submodule pointer check did not run, not clean",
+        })
+    for mod in mods:
         path, url, branch = mod["path"], mod["url"], mod["branch"]
         fix = f"git -C {repo} submodule update --remote -- {path} && git add {path} && commit the pointer bump"
         pointer = submodule_pointer(repo, path)
@@ -571,7 +596,11 @@ def scan_submodule_pointer_lag(repo: Path) -> list[dict[str, Any]]:
             continue
         if head == pointer:
             continue
-        lag, bump = submodule_lag(repo / path, pointer, head)
+        child_st, child_why = lstat_repo_path(repo, path)
+        if child_st is not None and stat.S_ISDIR(child_st.st_mode):
+            lag, bump = submodule_lag(repo / path, pointer, head)
+        else:
+            lag, bump = None, False  # no real child checkout (or a symlink): git is never run in it
         if lag == 0:
             # head is reachable from pointer: the pointer is AHEAD of (or off)
             # the remote branch -- an unpushed or non-branch commit.
@@ -596,10 +625,9 @@ def scan_submodule_pointer_lag(repo: Path) -> list[dict[str, Any]]:
     return findings
 
 
-def _hook_digest(path: Path) -> str:
-    """sha256 of a hook file with CRLF folded to LF (checkout-neutral)."""
-    data = path.read_bytes().replace(b"\r\n", b"\n")
-    return hashlib.sha256(data).hexdigest()
+def _hook_digest(data: bytes) -> str:
+    """sha256 of a hook file's bytes with CRLF folded to LF (checkout-neutral)."""
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def scan_hook_drift(repo: Path, canonical_dir: Path = CANONICAL_HOOKS_DIR) -> list[dict[str, Any]]:
@@ -611,18 +639,26 @@ def scan_hook_drift(repo: Path, canonical_dir: Path = CANONICAL_HOOKS_DIR) -> li
     expected verbatim (modulo line endings) under `.githooks/`; local edits are
     drift because install.sh overwrites them on the next run anyway.
     """
-    githooks_dir = repo / ".githooks"
-    if not githooks_dir.is_dir() or not canonical_dir.is_dir():
+    hooks_st, hooks_why = lstat_repo_path(repo, ".githooks")
+    if hooks_why == REPO_ABSENT or (hooks_st is not None and not stat.S_ISDIR(hooks_st.st_mode)):
+        return []  # not onboarded; a symlinked .githooks is judged below (every read is refused)
+    if not canonical_dir.is_dir():
         return []
 
     drifted: list[dict[str, str]] = []
     missing: list[str] = []
     for canon in sorted(p for p in canonical_dir.iterdir() if p.is_file()):
-        installed = githooks_dir / canon.name
-        if not installed.is_file():
+        installed_rel = f".githooks/{canon.name}"
+        if lstat_repo_path(repo, installed_rel)[1] == REPO_ABSENT:
             missing.append(canon.name)
             continue
-        want, have = _hook_digest(canon), _hook_digest(installed)
+        want = _hook_digest(canon.read_bytes())  # dev-standards' own checkout, not the scanned repo
+        installed, skip = read_repo_file(repo, installed_rel)
+        if installed is None:
+            # A symlinked, oversized or unreadable hook cannot be shown to match: drift, never clean.
+            drifted.append({"hook": canon.name, "canonical": want[:12], "installed": f"not read ({skip})"})
+            continue
+        have = _hook_digest(installed)
         if want != have:
             drifted.append({"hook": canon.name, "canonical": want[:12], "installed": have[:12]})
 
@@ -660,10 +696,15 @@ def scan_cache_restore(repo: Path, allowlist_path: Path = ENROLMENT_USES_ALLOWLI
     (scripts/cache_restore.py); an unreadable or malformed allow-list is
     reported for every enrolled repo instead of classifying against it.
     """
-    if not (repo / ".github" / "auto-apply-enabled").exists():
+    # Any entry but an absent one enrols: a symlinked marker is the stricter reading.
+    if lstat_repo_path(repo, ".github/auto-apply-enabled")[1] == REPO_ABSENT:
         return []
-    wf_dir = repo / ".github" / "workflows"
-    if not wf_dir.is_dir():
+    # Symlinks are listed, never followed; a symlinked or unreadable workflow
+    # (or workflows dir) is reported as not examined, whatever its name
+    # (audit 2026-11-10.2 M4).
+    entries = [(rel, why) for rel, why in walk_repo_files(repo, ".github/workflows")
+               if why is not None or rel.endswith((".yml", ".yaml"))]
+    if not entries:
         return []
     items: list[dict[str, Any]] = []
     try:
@@ -671,15 +712,13 @@ def scan_cache_restore(repo: Path, allowlist_path: Path = ENROLMENT_USES_ALLOWLI
     except (OSError, UnicodeDecodeError) as exc:
         allowlist, allow_errors = frozenset(), [(None, f"allow-list unreadable: {exc}")]
     items.extend({"path": ENROLMENT_USES_ALLOWLIST_REL, "line": line, "form": form} for line, form in allow_errors)
-    paths = [] if allow_errors else sorted(p for p in wf_dir.rglob("*") if p.suffix in (".yml", ".yaml"))
-    for path in paths:
-        if path.is_dir():
+    for rel, why in ([] if allow_errors else entries):
+        if why is not None:
+            items.append({"path": rel, "line": None, "form": why})
             continue
-        rel = path.relative_to(repo).as_posix()
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            items.append({"path": rel, "line": None, "form": f"unreadable: {exc.strerror or exc}"})
+        text, skip = _read_text_capped(repo, rel)
+        if text is None:
+            items.append({"path": rel, "line": None, "form": skip or "unreadable"})
             continue
         for line, form in cache_restore.find_cache_restores(text, allowlist):
             items.append({"path": rel, "line": line, "form": form})
@@ -701,13 +740,9 @@ def read_independence_mode(repo: Path) -> tuple[str, str | None]:
     value, `full` when the file or key is absent (STANDARDS.md §13.2). An
     unknown value is reported as `full` plus an error string, so a typo never
     widens the exemption."""
-    cfg = repo / "release-config.yml"
-    if not cfg.is_file():
-        return "full", None
-    try:
-        text = cfg.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "full", None
+    text, _skip = _read_text_capped(repo, "release-config.yml")
+    if text is None:
+        return "full", None  # absent, symlinked or unreadable: the strictest mode
     m = INDEPENDENCE_MODE_RE.search(text)
     if not m:
         return "full", None
@@ -735,17 +770,157 @@ def _is_comment_line(rel: str, line: str) -> bool:
     return False
 
 
-def _read_text_capped(path: Path) -> tuple[str | None, str | None]:
-    """(text, None) when the file was read; (None, reason) when it was NOT
-    examined. Callers must surface the second shape: a file the scan skipped is
-    unexamined, never clean."""
+def _is_link(st: os.stat_result) -> bool:
+    """True for a symlink, and on Windows for any reparse point (junctions included)."""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse and getattr(st, "st_file_attributes", 0) & reparse)
+
+
+# The reason lstat_repo_path / read_repo_file give for an entry that does not
+# exist: the one benign "not read" (callers may treat it as "no such file").
+REPO_ABSENT = "unreadable: FileNotFoundError"
+
+
+def lstat_repo_path(repo: Path, rel: str | Path) -> tuple[os.stat_result | None, str | None]:
+    """lstat of <repo>/<rel> with no symlink followed anywhere on the path.
+
+    The ONE metadata probe for a path inside a scanned repo (gate pass 1 on
+    #87): (stat, None) for an entry reached through real directories only;
+    (None, REPO_ABSENT) when it does not exist; otherwise (None, reason):
+    an absolute or `..` path, a symlink (or Windows reparse point) as any
+    component, or an I/O error. Callers never use Path.is_file / exists /
+    stat / resolve on a repo path, all of which follow links."""
+    rel_path = Path(rel)
+    if not rel_path.parts or rel_path.is_absolute() or rel_path.drive or ".." in rel_path.parts:
+        return None, "path escapes the repo: not read"
+    current = repo
+    st: os.stat_result | None = None
     try:
-        size = path.stat().st_size
-        if size > MAX_RUNTIME_SOURCE_BYTES:
-            return None, f"size {size} bytes exceeds {MAX_RUNTIME_SOURCE_BYTES}-byte cap"
-        return path.read_text(encoding="utf-8", errors="replace"), None
+        for part in rel_path.parts:
+            current = current / part
+            st = os.lstat(current)
+            if _is_link(st):
+                return None, "symlink: not followed"
+    except (FileNotFoundError, NotADirectoryError):
+        return None, REPO_ABSENT
     except OSError as e:
         return None, f"unreadable: {e.__class__.__name__}"
+    return st, None
+
+
+def read_repo_file(repo: Path, rel: str | Path, cap: int | None = None) -> tuple[bytes | None, str | None]:
+    """The ONE reader for a file inside a scanned repo (audit 2026-11-10.2 M4,
+    proposed SC-58). Every repo-relative read goes through here.
+
+    A scanned repo is third-party content: a committed `VERSION ->
+    ~/.git-credentials` would otherwise put a secret's first line into the
+    report and the shared-brain post, and `src/a.py -> /dev/zero` would defeat a
+    cap that trusts st_size. So: the path must stay inside the repo (no
+    absolute path, no `..`); every component is lstat'd and a symlink (or a
+    Windows reparse point) anywhere on the path is refused, never followed; the
+    leaf must be a regular file (S_ISREG, re-checked on the open descriptor,
+    opened O_NOFOLLOW|O_NONBLOCK where the OS has them so a FIFO cannot block);
+    and the cap is enforced on the bytes read, `read(cap + 1)`, not on st_size.
+
+    Returns (bytes, None) when read, or (None, reason) when NOT examined; callers
+    must surface the second shape, which is unexamined, never clean. `cap`
+    defaults to MAX_RUNTIME_SOURCE_BYTES, read at call time.
+    """
+    limit = MAX_RUNTIME_SOURCE_BYTES if cap is None else cap
+    st, why = lstat_repo_path(repo, rel)
+    if st is None:
+        return None, why
+    if not stat.S_ISREG(st.st_mode):
+        return None, "not a regular file: not read"
+    current = repo / Path(rel)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(current, flags)
+    except OSError as e:
+        return None, f"unreadable: {e.__class__.__name__}"
+    chunks: list[bytes] = []
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not a regular file: not read"
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1 << 16))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as e:
+        return None, f"unreadable: {e.__class__.__name__}"
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        return None, f"exceeds {limit}-byte cap: not read"
+    return data, None
+
+
+def _read_text_capped(repo: Path, rel: str | Path) -> tuple[str | None, str | None]:
+    """read_repo_file, decoded as UTF-8 (undecodable bytes replaced)."""
+    data, skip = read_repo_file(repo, rel)
+    if data is None:
+        return None, skip
+    return data.decode("utf-8", errors="replace"), None
+
+
+def walk_repo_files(repo: Path, rel_dir: str) -> list[tuple[str, str | None]]:
+    """(repo-relative POSIX path, reason) for every file under `rel_dir`,
+    recursively, never descending through a symlinked directory (os.walk
+    followlinks=False). reason is None for a regular entry the caller may read
+    with read_repo_file, else why it was NOT examined: a symlinked entry (file
+    or directory, or `rel_dir` or one of its parents), or a directory that
+    could not be listed / an entry that could not be lstat'd (os.walk onerror).
+    Only absence is benign: [] when `rel_dir` does not exist; a `rel_dir` that
+    is not a directory, or any other error, is listed with its reason, never
+    dropped. Sorted."""
+    base = Path(rel_dir).as_posix()
+    st, why = lstat_repo_path(repo, rel_dir)
+    if why == REPO_ABSENT:
+        return []
+    if st is None:
+        return [(base, why)]
+    if not stat.S_ISDIR(st.st_mode):
+        return [(base, "not a directory: not read")]
+    out: list[tuple[str, str | None]] = []
+
+    def walk_error(err: OSError) -> None:
+        where = Path(err.filename) if err.filename else repo / rel_dir
+        try:
+            rel = where.relative_to(repo).as_posix()
+        except ValueError:
+            rel = base
+        out.append((rel, f"unreadable: {err.__class__.__name__}"))
+
+    for dirpath, dirnames, filenames in os.walk(repo / rel_dir, onerror=walk_error, followlinks=False):
+        here = Path(dirpath)
+        for name in list(dirnames):
+            rel = (here / name).relative_to(repo).as_posix()
+            try:
+                entry_why = "symlink: not followed" if _is_link(os.lstat(here / name)) else None
+            except FileNotFoundError:
+                dirnames.remove(name)  # vanished mid-walk: nothing there
+                continue
+            except OSError as e:
+                entry_why = f"unreadable: {e.__class__.__name__}"
+            if entry_why is not None:
+                dirnames.remove(name)  # never descend; listed so it is reported
+                out.append((rel, entry_why))
+        for name in filenames:
+            rel = (here / name).relative_to(repo).as_posix()
+            try:
+                entry_why = "symlink: not followed" if _is_link(os.lstat(here / name)) else None
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                entry_why = f"unreadable: {e.__class__.__name__}"
+            out.append((rel, entry_why))
+    return sorted(out, key=lambda e: e[0])
 
 
 def _adr_mentions(repo: Path, tracked: list[str], skipped: list[dict[str, str]]) -> set[str]:
@@ -755,7 +930,7 @@ def _adr_mentions(repo: Path, tracked: list[str], skipped: list[dict[str, str]])
     for rel in tracked:
         if not rel.lower().endswith(".md") or not ADR_PATH_RE.search(rel):
             continue
-        text, skip = _read_text_capped(repo / rel)
+        text, skip = _read_text_capped(repo, rel)
         if skip:
             skipped.append({"path": rel, "kind": "adr", "reason": skip})
         if not text:
@@ -801,7 +976,7 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
         if RELEASE_WORKFLOW_NAME_RE.search(Path(wf).name):
             has_release_wf = True
             break
-        body, skip = _read_text_capped(repo / wf)
+        body, skip = _read_text_capped(repo, wf)
         if skip:
             skipped.append({"path": wf, "kind": "workflow", "reason": skip})
         if body and RELEASE_WORKFLOW_BODY_RE.search(body):
@@ -826,7 +1001,7 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
                 continue
             if _is_test_path(rel) or lower.startswith(".github/"):
                 continue
-            text, skip = _read_text_capped(repo / rel)
+            text, skip = _read_text_capped(repo, rel)
             if skip:
                 skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
             if not text:
@@ -860,11 +1035,8 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
     return findings
 
 
-def _json_version(path: Path) -> str | None:
-    """Top-level "version" string of a JSON file, or None (absent/unparseable)."""
-    text, skip = _read_text_capped(path)
-    if skip or text is None:
-        return None
+def _json_version(text: str) -> str | None:
+    """Top-level "version" string of a JSON document, or None (absent/unparseable)."""
     try:
         data = json.loads(text)
     except ValueError:
@@ -873,15 +1045,12 @@ def _json_version(path: Path) -> str | None:
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-def _toml_table_version(path: Path, tables: tuple[str, ...]) -> str | None:
+def _toml_table_version(text: str, tables: tuple[str, ...]) -> str | None:
     """`version = "..."` inside the first of `tables` that declares one.
 
     A line parse, not a TOML parser (stdlib-only on Python 3.8): only a plain
     string value counts, so `version.workspace = true` and
     `version = { workspace = true }` (workspace-inherited) are not sources."""
-    text, skip = _read_text_capped(path)
-    if skip or text is None:
-        return None
     found: dict[str, str] = {}
     current: str | None = None
     for line in text.splitlines():
@@ -904,10 +1073,7 @@ def _toml_table_version(path: Path, tables: tuple[str, ...]) -> str | None:
     return None
 
 
-def _first_line(path: Path) -> str | None:
-    text, skip = _read_text_capped(path)
-    if skip or text is None:
-        return None
+def _first_line(text: str) -> str | None:
     lines = text.splitlines()
     value = lines[0].strip() if lines else ""
     return value or None
@@ -944,7 +1110,7 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
             continue
         # A declaration that could not be read or parsed is unexamined, never
         # "no source" (security gate pass 1, SC-07).
-        text, skip = _read_text_capped(repo / rel)
+        text, skip = _read_text_capped(repo, rel)
         if skip or text is None:
             unexamined.append({"path": rel, "reason": skip or "unreadable"})
             continue
@@ -954,7 +1120,7 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
             except ValueError:
                 unexamined.append({"path": rel, "reason": "not valid JSON"})
                 continue
-        value = reader(repo / rel)
+        value = reader(text)
         if value is not None:
             sources.append({"path": rel, "version": value})
 
@@ -970,7 +1136,7 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
                 continue
             if any(seg in VERSION_NESTED_SKIP_SEGMENTS for seg in parts[:-1]):
                 continue
-            ntext, nskip = _read_text_capped(repo / rel)
+            ntext, nskip = _read_text_capped(repo, rel)
             if nskip or ntext is None:
                 unexamined.append({"path": rel, "reason": nskip or "unreadable"})
                 continue
@@ -979,7 +1145,7 @@ def scan_version_divergence(repo: Path, tracked: list[str]) -> list[dict[str, An
             except ValueError:
                 unexamined.append({"path": rel, "reason": "not valid JSON"})
                 continue
-            nested = _json_version(repo / rel)
+            nested = _json_version(ntext)
             if nested is not None and _version_key(nested) != _version_key(root_json):
                 if not any(i["path"] == "version.json" for i in items):
                     items.append({"path": "version.json", "version": root_json})
@@ -1038,7 +1204,7 @@ def scan_stub_markers(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
         patterns = [pat for sufs, pat in STUB_PATTERNS if lower.endswith(sufs)]
         if not patterns or _is_test_path(rel) or lower.startswith(".github/"):
             continue
-        text, skip = _read_text_capped(repo / rel)
+        text, skip = _read_text_capped(repo, rel)
         if skip:
             skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
         if not text:
@@ -1140,11 +1306,20 @@ def scan_security_register(
         canon_path, canon_ids = canonical
         missing: set[str] = set()
         stale_paths: list[str] = []
+        try:
+            canon_stat: os.stat_result | None = os.stat(canon_path)  # operator path
+        except OSError:
+            canon_stat = None
         for rel in copies:
-            path = repo / rel
-            if path.resolve() == canon_path:
-                continue  # the canonical file itself (dev-standards' own security/)
-            text, skip = _read_text_capped(path)
+            # The canonical file itself (dev-standards' own security/), by inode
+            # of a real file reached with no symlink: a copy committed as a
+            # symlink to the canonical path is a copy, judged below (and refused
+            # by read_repo_file), never "the canonical file" (gate pass 1, #87).
+            st, _why = lstat_repo_path(repo, rel)
+            if (st is not None and canon_stat is not None and stat.S_ISREG(st.st_mode)
+                    and os.path.samestat(st, canon_stat)):
+                continue
+            text, skip = _read_text_capped(repo, rel)
             if skip or text is None:
                 missing.update(canon_ids)  # unreadable copy: nothing in it can be shown current
                 stale_paths.append(f"{rel} ({skip or 'empty'})")
@@ -1229,14 +1404,12 @@ def scan_repo(
         now = dt.datetime.now().timestamp()
         for line in drift:
             path = line[3:].strip()
-            full = repo / path
-            try:
-                mtime = full.stat().st_mtime
-                age = (now - mtime) / 86400
-                if age > oldest_age:
-                    oldest_age = age
-            except (OSError, FileNotFoundError):
+            st, _why = lstat_repo_path(repo, path)  # never follow a link out of the repo
+            if st is None:
                 continue
+            age = (now - st.st_mtime) / 86400
+            if age > oldest_age:
+                oldest_age = age
         if oldest_age >= age_threshold:
             findings.append({
                 "severity": "MEDIUM",
@@ -1256,7 +1429,7 @@ def scan_repo(
             "value": hp,
             "note": "still pointing at retired D:/Projects/git-hooks",
         })
-    elif githooks_dir.is_dir() and hp not in (".githooks", str(githooks_dir)):
+    elif lstat_repo_path(repo, ".githooks")[1] != REPO_ABSENT and hp not in (".githooks", str(githooks_dir)):
         findings.append({
             "severity": "MEDIUM",
             "code": "hooks-path-misconfigured",
@@ -1767,33 +1940,53 @@ def _emit_scalar(v: Any) -> str:
     return s
 
 
-def discover_enrolled_repos(roots: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
-    """Find repos with release-config.yml and parse the config."""
+def discover_enrolled_repos(
+    roots: list[Path], skipped: list[dict[str, str]] | None = None,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Find repos with release-config.yml and parse the config.
+
+    A candidate is any repo whose release-config.yml entry exists (lstat, no
+    link followed). One whose file cannot be examined (symlinked, not a
+    regular file, oversized, unreadable, not UTF-8, not a mapping) is not
+    enrolled and is appended to `skipped` as {path, reason}: an enrolment the
+    scan dropped is reported, never silent (gate pass 1 on #87, SC-04)."""
     enrolled: list[tuple[Path, dict[str, Any]]] = []
     seen: set[Path] = set()
+
+    def skip(repo: Path, reason: str) -> None:
+        if skipped is not None:
+            skipped.append({"path": f"{repo.as_posix()}/release-config.yml", "reason": reason})
+
     for root in roots:
         if not root.is_dir():
             continue
         candidates: list[Path] = []
-        if is_git_repo(root) and (root / "release-config.yml").is_file():
+        if is_git_repo(root) and lstat_repo_path(root, "release-config.yml")[1] != REPO_ABSENT:
             candidates.append(root)
         try:
             for child in sorted(root.iterdir()):
-                if child.is_dir() and (child / "release-config.yml").is_file():
+                if child.is_dir() and lstat_repo_path(child, "release-config.yml")[1] != REPO_ABSENT:
                     candidates.append(child)
         except PermissionError:
             continue
         for c in candidates:
-            rc = c.resolve()
+            rc = c.resolve()  # the operator's root entry, not a path inside the repo
             if rc in seen:
                 continue
             seen.add(rc)
-            try:
-                cfg = parse_yaml((c / "release-config.yml").read_text(encoding="utf-8"))
-                if isinstance(cfg, dict):
-                    enrolled.append((c, cfg))
-            except (OSError, UnicodeDecodeError):
+            raw, why = read_repo_file(c, "release-config.yml")
+            if raw is None:
+                skip(c, why or "unreadable")
                 continue
+            try:
+                cfg = parse_yaml(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                skip(c, "not UTF-8: not read")
+                continue
+            if isinstance(cfg, dict):
+                enrolled.append((c, cfg))
+            else:
+                skip(c, "not a YAML mapping")
     return enrolled
 
 
@@ -1803,12 +1996,14 @@ def parse_compose_services(repo: Path, compose_file: str) -> dict[str, dict[str,
     image_name is the registry/repo portion (before the `:tag`), useful for
     matching against running container images.
     """
-    cf = repo / compose_file
-    if not cf.is_file():
+    if not isinstance(compose_file, str):
+        return {}
+    raw, _skip = read_repo_file(repo, compose_file)  # repo-chosen path: confined, no symlinks
+    if raw is None:
         return {}
     try:
-        data = parse_yaml(cf.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError):
+        data = parse_yaml(raw.decode("utf-8"))
+    except UnicodeDecodeError:
         return {}
     services = data.get("services", {}) if isinstance(data, dict) else {}
     out: dict[str, dict[str, str]] = {}
@@ -2178,13 +2373,18 @@ def scan_repo_drift(repo: Path, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def render_drift_markdown(drift: dict[str, Any]) -> str:
-    if not drift.get("repos"):
+    unexamined = drift.get("enrolment_unexamined") or []
+    if not drift.get("repos") and not unexamined:
         return ""
     lines: list[str] = []
     lines.append("")
     lines.append(f"# Drift detection — {drift['scanned_at']}")
     lines.append("")
     lines.append(f"Enrolled repos: {drift['enrolled_count']}")
+    if unexamined:
+        lines.append(f"Enrolment candidates NOT examined (not enrolled, not clean): {len(unexamined)}")
+        for u in unexamined:
+            lines.append(f"  - {u['path']}: {u['reason']}")
     lines.append(f"Drift findings: {drift['drift_findings']}")
     if drift.get("ntfy_sent"):
         lines.append(f"ntfy: {drift['ntfy_sent']}")
@@ -2208,7 +2408,8 @@ def render_drift_markdown(drift: dict[str, Any]) -> str:
 def run_drift_scan(roots: list[Path]) -> dict[str, Any]:
     """Top-level drift entry point. Discovers enrolled repos, queries each."""
     scanned_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    enrolled = discover_enrolled_repos(roots)
+    enrolment_unexamined: list[dict[str, str]] = []
+    enrolled = discover_enrolled_repos(roots, enrolment_unexamined)
     repo_results: list[dict[str, Any]] = []
     versions_payload: dict[str, dict[str, Any]] = {}
     drift_count = 0
@@ -2223,6 +2424,7 @@ def run_drift_scan(roots: list[Path]) -> dict[str, Any]:
     return {
         "scanned_at": scanned_at,
         "enrolled_count": len(enrolled),
+        "enrolment_unexamined": enrolment_unexamined,
         "drift_findings": drift_count,
         "repos": repo_results,
         "versions_payload": versions_payload,
@@ -2641,6 +2843,7 @@ def main() -> int:
         report["drift"] = {
             "scanned_at": drift_result["scanned_at"],
             "enrolled_count": drift_result["enrolled_count"],
+            "enrolment_unexamined": drift_result["enrolment_unexamined"],
             "drift_findings": drift_result["drift_findings"],
             "versions": drift_result["versions_payload"],
         }
