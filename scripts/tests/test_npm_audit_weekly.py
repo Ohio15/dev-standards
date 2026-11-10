@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,14 +25,27 @@ BASH = "C:/Program Files/Git/bin/bash.exe" if IS_WINDOWS else shutil.which("bash
 
 needs_jq = pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")
 
-# The fake npm picks its behaviour from a per-repo file so one run can mix
-# healthy and broken repos. `.fake-mode-prod` overrides it for `--omit=dev`.
+# The fake npm picks its behaviour from the package.json it is run against so
+# one run can mix healthy and broken repos: npm runs in a staged copy of the
+# repo (package.json + lockfile only, audit 2026-11-10.2 M3), so the mode must
+# travel inside package.json. `fake_mode_prod` overrides it for `--omit=dev`.
+# With FAKE_NPM_LOG set, each call records its cwd, its npm_config_* env and
+# the cwd listing; with REAL_NPM also set, it records real npm's resolved
+# config sources for that cwd and env (the precedence is npm's, not assumed).
 FAKE_NPM = r"""#!/usr/bin/env bash
-mode_file=.fake-mode
+pj="$(cat package.json 2>/dev/null)"
+mode="$(printf '%s' "$pj" | sed -n 's/.*"fake_mode":"\([a-z]*\)".*/\1/p')"
+prod="$(printf '%s' "$pj" | sed -n 's/.*"fake_mode_prod":"\([a-z]*\)".*/\1/p')"
 for a in "$@"; do
-  if [ "$a" = "--omit=dev" ] && [ -f .fake-mode-prod ]; then mode_file=.fake-mode-prod; fi
+  if [ "$a" = "--omit=dev" ] && [ -n "$prod" ]; then mode="$prod"; fi
 done
-mode="$(cat "$mode_file" 2>/dev/null || echo clean)"
+mode="${mode:-clean}"
+if [ -n "${FAKE_NPM_LOG:-}" ]; then
+  log="$FAKE_NPM_LOG/$$.log"
+  { echo "cwd=$(pwd)"; env | grep -i '^npm_config_' | sort; echo "--- ls"; ls -A
+    if [ -f packages/a/package.json ]; then echo "--- ws"; cat packages/a/package.json; echo; fi; } > "$log"
+  if [ -n "${REAL_NPM:-}" ]; then echo "--- npm config ls" >> "$log"; "$REAL_NPM" config ls >> "$log" 2>&1; fi
+fi
 vuln() {
   printf '{"auditReportVersion":2,"vulnerabilities":{},"metadata":{"vulnerabilities":{"info":0,"low":%s,"moderate":%s,"high":%s,"critical":%s,"total":0}}}' "$1" "$2" "$3" "$4"
 }
@@ -59,12 +73,12 @@ FAKE_CURL = "#!/usr/bin/env bash\nexit 1\n"  # KEV fetch fails fast; the script 
 def _make_repo(root: Path, name: str, mode: str, *, lockfile: bool = True, prod_mode: str | None = None) -> None:
     repo = root / name
     (repo / ".git").mkdir(parents=True)
-    (repo / "package.json").write_text("{}", encoding="utf-8")
+    manifest = {"name": name, "fake_mode": mode}
+    if prod_mode is not None:
+        manifest["fake_mode_prod"] = prod_mode
+    (repo / "package.json").write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     if lockfile:
         (repo / "package-lock.json").write_text("{}", encoding="utf-8")
-    (repo / ".fake-mode").write_text(mode, encoding="utf-8")
-    if prod_mode is not None:
-        (repo / ".fake-mode-prod").write_text(prod_mode, encoding="utf-8")
 
 
 def _fake_bin(tmp_path: Path) -> Path:
@@ -235,3 +249,149 @@ def test_missing_npm_is_unexamined(tmp_path: Path) -> None:
     proc, report = _run(tmp_path, {"good": "clean"}, path_override=f"{curl_only}{os.pathsep}{tools}")
     assert proc.returncode == 4
     _assert_unexamined(_entry(report, "good"), "npm-missing")
+
+
+# ── audit 2026-11-10.2 M3: a repo .npmrc never configures the audit ──
+
+HOSTILE_NPMRC = ("registry=http://127.0.0.1:9/\nhttps-proxy=http://127.0.0.1:9/\nproxy=http://127.0.0.1:9/\n"
+                 "strict-ssl=false\ncafile=./evil.pem\nnoproxy=*\n@x:registry=http://127.0.0.1:9/\n")
+
+
+def _from_bash(path: str) -> Path:
+    """A path `pwd` printed under msys bash (/c/x) as a native Path (C:/x)."""
+    path = path.strip()
+    m = re.match(r"^/([a-zA-Z])/(.*)$", path) if IS_WINDOWS else None
+    return Path(f"{m.group(1)}:/{m.group(2)}") if m else Path(path)
+
+
+def _logs(log_dir: Path) -> list[str]:
+    return [p.read_text(encoding="utf-8", errors="replace") for p in sorted(log_dir.glob("*.log"))]
+
+
+def _real_npm() -> str | None:
+    found = shutil.which("npm")
+    if not found:
+        return None
+    if IS_WINDOWS:  # npm.cmd sits next to the `npm` sh launcher bash can run
+        sh = Path(found).with_name("npm")
+        return sh.as_posix() if sh.is_file() else None
+    return found
+
+
+@needs_jq
+def test_npm_never_runs_in_the_repo_and_its_config_is_pinned(tmp_path: Path) -> None:
+    log_dir = tmp_path / "npmlog"
+    log_dir.mkdir()
+    env = {"FAKE_NPM_LOG": log_dir.as_posix()}
+    real = _real_npm()
+    if real:
+        env["REAL_NPM"] = real
+    # The .npmrc is written by the hook below, after _make_repo created the repo.
+    orig = _make_repo
+
+    def make_with_npmrc(root: Path, name: str, mode: str, **kw) -> None:
+        orig(root, name, mode, **kw)
+        (root / name / ".npmrc").write_text(HOSTILE_NPMRC, encoding="utf-8")
+        (root / name / "evil.pem").write_text("not a ca", encoding="utf-8")
+
+    globals()["_make_repo"] = make_with_npmrc
+    try:
+        proc, report = _run(tmp_path, {"hostile": "clean"}, env_extra=env)
+    finally:
+        globals()["_make_repo"] = orig
+    assert proc.returncode == 0, proc.stderr
+    assert _entry(report, "hostile")["status"] == "ok"
+    logs = _logs(log_dir)
+    assert len(logs) == 2, logs  # full + --omit=dev
+    for log in logs:
+        cwd = _from_bash(log.splitlines()[0].removeprefix("cwd="))
+        # The staged tree is removed when the script exits, so compare paths, not inodes.
+        norm = (lambda q: q.as_posix().lower()) if IS_WINDOWS else (lambda q: q.as_posix())
+        assert not norm(cwd).startswith(norm(tmp_path / "root")), f"npm ran inside the scanned tree: {cwd}"
+        listing = log.split("--- ls\n", 1)[1].split("--- npm config ls", 1)[0].split("--- ws", 1)[0].split()
+        assert ".npmrc" not in listing and "evil.pem" not in listing, listing
+        assert set(listing) == {"package.json", "package-lock.json"}, listing
+        assert "npm_config_registry=https://registry.npmjs.org/" in log
+        assert "npm_config_strict_ssl=true" in log
+        assert "npm_config_proxy=false" in log and "npm_config_https_proxy=false" in log
+        assert "npm_config_ignore_scripts=true" in log
+        for key in ("npm_config_userconfig=", "npm_config_globalconfig="):
+            line = next(ln for ln in log.splitlines() if ln.startswith(key))
+            assert line.split("=", 1)[1], f"{key} not pinned"
+        if real:
+            # Real npm, same cwd and env: no project config and nothing hostile resolved.
+            npm_ls = log.split("--- npm config ls", 1)[1]
+            assert '"project" config from' not in npm_ls, npm_ls
+            assert "127.0.0.1:9" not in npm_ls and "evil.pem" not in npm_ls, npm_ls
+
+
+def _lock_with_workspace(key: str) -> str:
+    return json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"name": "w", "workspaces": ["packages/*"]},
+        f"node_modules/a": {"resolved": key, "link": True},
+        "node_modules/lodash": {"version": "4.17.21"},
+        key: {"name": "a", "version": "1.0.0"},
+    }})
+
+
+@needs_jq
+def test_workspace_manifests_named_by_the_lockfile_are_staged(tmp_path: Path) -> None:
+    log_dir = tmp_path / "npmlog"
+    log_dir.mkdir()
+    orig = _make_repo
+
+    def make_ws(root: Path, name: str, mode: str, **kw) -> None:
+        orig(root, name, mode, **kw)
+        (root / name / "package-lock.json").write_text(_lock_with_workspace("packages/a"), encoding="utf-8")
+        (root / name / "packages" / "a").mkdir(parents=True)
+        (root / name / "packages" / "a" / "package.json").write_text('{"name":"a"}', encoding="utf-8")
+
+    globals()["_make_repo"] = make_ws
+    try:
+        proc, report = _run(tmp_path, {"ws": "clean"}, env_extra={"FAKE_NPM_LOG": log_dir.as_posix()})
+    finally:
+        globals()["_make_repo"] = orig
+    assert proc.returncode == 0, proc.stderr
+    assert _entry(report, "ws")["status"] == "ok"
+    logs = _logs(log_dir)
+    assert len(logs) == 2, logs
+    for log in logs:
+        assert '--- ws\n{"name":"a"}' in log, log
+
+
+@needs_jq
+def test_a_workspace_path_outside_the_repo_is_unexamined(tmp_path: Path) -> None:
+    orig = _make_repo
+
+    def make_escape(root: Path, name: str, mode: str, **kw) -> None:
+        orig(root, name, mode, **kw)
+        (root / name / "package-lock.json").write_text(_lock_with_workspace("../outside"), encoding="utf-8")
+
+    globals()["_make_repo"] = make_escape
+    try:
+        proc, report = _run(tmp_path, {"esc": "clean"})
+    finally:
+        globals()["_make_repo"] = orig
+    assert proc.returncode == 4
+    _assert_unexamined(_entry(report, "esc"), "workspace-path-outside-repo")
+
+
+@needs_jq
+@pytest.mark.skipif(IS_WINDOWS, reason="needs a real symlink, which msys cp/test -L handle differently")
+def test_a_symlinked_lockfile_is_unexamined_never_read(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.json"
+    secret.write_text("{}", encoding="utf-8")
+    orig = _make_repo
+
+    def make_link(root: Path, name: str, mode: str, **kw) -> None:
+        orig(root, name, mode, **kw)
+        (root / name / "package-lock.json").unlink()
+        (root / name / "package-lock.json").symlink_to(secret)
+
+    globals()["_make_repo"] = make_link
+    try:
+        proc, report = _run(tmp_path, {"lnk": "clean"})
+    finally:
+        globals()["_make_repo"] = orig
+    assert proc.returncode == 4
+    _assert_unexamined(_entry(report, "lnk"), "package-lock.json-not-a-regular-file")

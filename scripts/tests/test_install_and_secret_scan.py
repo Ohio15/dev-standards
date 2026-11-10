@@ -653,6 +653,48 @@ def test_install_skips_the_workflows_it_replaces(tmp_path):
         assert (repo / ".github" / "workflows" / name).read_bytes() == template.read_bytes(), name
 
 
+
+# ── audit 2026-11-10.2 L1: the lost-entries guard can fire ──
+# It was spelled `tr -cd '<raw NUL>'`; bash strips the NUL from script text, so
+# both counts were always 0 and the guard compared 0 with 0. A fake `sort` that
+# drops entries from the NUL-separated list (exit 0) must now be refused.
+
+def test_install_refuses_when_the_sorted_workflow_list_loses_an_entry(tmp_path):
+    clean = CACHE_RESTORE_CASES["no-cache-anywhere"][0]
+    files = {"a.yml": clean, "b.yml": clean, "c.yml": clean}
+    repo = target_with_workflows(tmp_path, files)
+    bindir = tmp_path / "sortbin"
+    bindir.mkdir()
+    sort = bindir / "sort"
+    sort.write_text("#!/usr/bin/env bash\n"
+                    'for a in "$@"; do if [ "$a" = -z ]; then /usr/bin/sort "$@" | head -z -n 1; exit 0; fi; done\n'
+                    'exec /usr/bin/sort "$@"\n', encoding="utf-8", newline="\n")
+    sort.chmod(0o755)
+    git_dir = Path(shutil.which("git")).resolve().parent
+    env = {**os.environ, "PATH": f"{bash_path(bindir)}:{bash_path(git_dir)}:/usr/bin:/bin"}
+    proc = subprocess.run([BASH, INSTALL.as_posix(), "--private", "--no-gh", repo.as_posix()],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "lost entries (1 of 3)" in proc.stderr, proc.stderr
+    assert "Installed into" not in proc.stdout
+    assert_untouched(repo, files)
+
+
+def test_no_tracked_file_carries_a_control_byte():
+    """Proposed SC-57: an interpreter strips a literal NUL (and editors hide
+    other control bytes), so a guard spelled with one compares nothing. Only
+    TAB, LF and CR are allowed in a tracked file; every tracked file here is text."""
+    listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"], capture_output=True, check=True).stdout
+    paths = [p for p in listed.decode("utf-8").split("\0") if p]
+    assert "install.sh" in paths
+    bad = []
+    for rel in paths:
+        data = (ROOT / rel).read_bytes()
+        hits = sorted({c for c in data if c < 0x20 and c not in (0x09, 0x0A, 0x0D)} | ({0x7F} & set(data)))
+        if hits:
+            bad.append((rel, hits))
+    assert bad == [], bad
+
 # ── the fleet scan's twin: same table, same answers ──
 
 @pytest.mark.parametrize("name", sorted(ALL_TEMPLATES))

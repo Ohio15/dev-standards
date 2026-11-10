@@ -20,6 +20,18 @@
 # Exit codes: 0 examined and under thresholds; 3 thresholds exceeded;
 # 4 some repo (or the run) was not examined (a report is still written).
 #
+# npm configuration is the operator's, never the scanned repo's (audit
+# 2026-11-10.2 M3, SC-07/SC-12). npm reads <project>/.npmrc from the directory
+# it runs in, and its env override cannot neutralise every key that file sets
+# (an empty npm_config_* value is ignored, so a repo `cafile=`, `noproxy=` or
+# `@scope:registry=` survives any env pin; probed against npm 11.7). So npm
+# never runs in the repo: package.json, the lockfile and each workspace
+# manifest the lockfile names are copied (regular files only, no symlink on
+# the path, nothing outside the repo) into an operator-owned scratch tree with
+# no .npmrc, and npm runs there with userconfig/globalconfig pinned to empty
+# files this script creates, the public registry, strict-ssl on, proxies off
+# and scripts off. A tree that cannot be staged is status "error", never ok.
+#
 # Designed to run from cron weekly. Idempotent.
 
 set -uo pipefail
@@ -149,21 +161,92 @@ audit_file_problem() {
   fi
 }
 
-# Run one audit into $2 with a timeout; echoes the exit code.
+# True when <repo>/<rel> is a regular file and no component of <rel>
+# (the leaf included) is a symlink: a committed `package-lock.json -> ~/x`
+# must not be read (audit 2026-11-10.2 M3/M4, proposed SC-58).
+repo_regular_file() {
+  local repo="$1" rel="$2" cur part
+  case "/$rel/" in
+    *"/../"*|*"/./"*|"//"*) return 1 ;;
+  esac
+  cur="$repo"
+  local IFS=/
+  for part in $rel; do
+    [[ -n "$part" ]] || return 1
+    cur="$cur/$part"
+    [[ -L "$cur" ]] && return 1
+  done
+  [[ -f "$cur" ]]
+}
+
+# Copy what `npm audit` reads (package.json, the lockfile, every workspace
+# manifest the lockfile lists) from repo $1 into the empty dir $2. Echoes ""
+# when staged, else a reason token. Never copies .npmrc or anything else.
+stage_audit_tree() {
+  local repo="$1" dest="$2" f lock="" key
+  for f in package.json package-lock.json npm-shrinkwrap.json; do
+    if [[ -e "$repo/$f" || -L "$repo/$f" ]]; then
+      if ! repo_regular_file "$repo" "$f"; then echo "stage-refused:$f-not-a-regular-file"; return; fi
+      if ! cp -- "$repo/$f" "$dest/$f"; then echo "stage-copy-failed:$f"; return; fi
+    fi
+  done
+  # npm prefers npm-shrinkwrap.json over package-lock.json.
+  if [[ -f "$dest/npm-shrinkwrap.json" ]]; then lock="$dest/npm-shrinkwrap.json"; else lock="$dest/package-lock.json"; fi
+  local keys
+  if ! keys="$(jq -r '(.packages // {}) | keys[] | select(. != "" and (test("(^|/)node_modules/") | not))' < "$lock" 2>/dev/null)"; then
+    echo "stage-lockfile-unparseable"; return
+  fi
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    key="${key%$'\r'}"
+    if [[ ! "$key" =~ ^[A-Za-z0-9_@][A-Za-z0-9._@/-]*$ ]] || [[ "/$key/" == *"/../"* ]]; then
+      echo "stage-refused:workspace-path-outside-repo"; return
+    fi
+    if [[ -e "$repo/$key/package.json" || -L "$repo/$key/package.json" || -L "$repo/$key" ]]; then
+      if ! repo_regular_file "$repo" "$key/package.json"; then
+        echo "stage-refused:workspace-manifest-not-a-regular-file"; return
+      fi
+      if ! mkdir -p -- "$dest/$key" || ! cp -- "$repo/$key/package.json" "$dest/$key/package.json"; then
+        echo "stage-copy-failed:workspace-manifest"; return
+      fi
+    fi
+  done <<<"$keys"
+}
+
+# Run one audit of the staged tree $1 into $2 with a timeout; echoes the exit
+# code. The environment is the whole npm configuration (header).
 run_audit() {
-  local repo="$1" out="$2"; shift 2
+  local tree="$1" out="$2"; shift 2
   local rc=0
+  local -a npm_env=(
+    npm_config_userconfig="$NPM_USERCONFIG"
+    npm_config_globalconfig="$NPM_GLOBALCONFIG"
+    npm_config_registry="https://registry.npmjs.org/"
+    npm_config_strict_ssl=true
+    npm_config_proxy=false
+    npm_config_https_proxy=false
+    npm_config_ignore_scripts=true
+    npm_config_update_notifier=false
+    npm_config_fund=false
+  )
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    ( cd "$repo" && "$TIMEOUT_BIN" "$AUDIT_TIMEOUT" npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
+    ( cd "$tree" && env "${npm_env[@]}" "$TIMEOUT_BIN" "$AUDIT_TIMEOUT" npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
   else
-    ( cd "$repo" && npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
+    ( cd "$tree" && env "${npm_env[@]}" npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
   fi
   echo "$rc"
 }
 
 # ------------------------------- per-repo audit --------------------------
 RAW_DIR="$TMP_DIR/raw"
-mkdir -p "$RAW_DIR"
+STAGE_DIR="$TMP_DIR/stage"
+mkdir -p "$RAW_DIR" "$STAGE_DIR"
+# Empty, operator-owned npm user/global config (header): created here, in the
+# mktemp dir, so nothing a scanned repo or the account's ~/.npmrc holds applies.
+NPM_USERCONFIG="$TMP_DIR/npmrc-user"
+NPM_GLOBALCONFIG="$TMP_DIR/npmrc-global"
+: > "$NPM_USERCONFIG"
+: > "$NPM_GLOBALCONFIG"
 
 AUDIT_TIMEOUT="${AUDIT_TIMEOUT:-180}"
 TIMEOUT_BIN=""
@@ -186,9 +269,11 @@ ERROR_LINES=()
 PER_REPO_JSON="["
 first="true"
 
+repo_idx=0
 for repo in "${REPOS[@]}"; do
   name="$(basename "$repo")"
   echo "auditing $name..." >&2
+  repo_idx=$(( repo_idx + 1 ))
 
   reason=""
   full_json="$RAW_DIR/$name.full.json"
@@ -203,10 +288,18 @@ for repo in "${REPOS[@]}"; do
     # repo that locks with yarn/pnpm cannot be examined by this script.
     reason="missing-lockfile"
   else
+    tree="$STAGE_DIR/$repo_idx"
+    if ! mkdir -- "$tree"; then
+      reason="stage-dir-failed"
+    else
+      reason="$(stage_audit_tree "$repo" "$tree")"
+    fi
+  fi
+  if [[ -z "$reason" ]]; then
     # npm audit exits non-zero on findings, so the exit code alone says nothing;
     # the JSON body decides (audit_file_problem). Only 124 (timeout) is read from rc.
-    full_rc="$(run_audit "$repo" "$full_json")"
-    prod_rc="$(run_audit "$repo" "$prod_json" --omit=dev)"
+    full_rc="$(run_audit "$tree" "$full_json")"
+    prod_rc="$(run_audit "$tree" "$prod_json" --omit=dev)"
     problem="$(audit_file_problem "$full_json" "$full_rc")"
     [[ -n "$problem" ]] && reason="full:$problem"
     if [[ -z "$reason" ]]; then

@@ -3,6 +3,34 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.3 - 2026-11-10
+
+Routine security audit 2026-11-10.2 (dev-standards): M3, M4 and L1, each found by all three
+reviewers. Shared-brain 34910b22, 439c18f1, f48ee67e.
+
+- M3 (34910b22) `scripts/npm-audit-weekly.sh`: a scanned repo's committed `.npmrc` configured the
+  audit (proxy, strict-ssl, cafile, noproxy, scoped registries), so a forged all-zero answer
+  read as clean. An env pin cannot fix that alone: npm ignores an empty `npm_config_*` value,
+  so a repo `cafile=`/`noproxy=`/`@scope:registry=` survives (probed against npm 11.7). npm
+  now never runs in the repo: package.json, the lockfile and each workspace manifest the
+  lockfile names are staged (regular files only, no symlink on the path, nothing outside the
+  repo) into an operator scratch tree with no `.npmrc`, with `npm_config_userconfig` /
+  `npm_config_globalconfig` pinned to empty files the script creates, the public registry,
+  `strict-ssl=true`, `proxy`/`https-proxy=false` and scripts off. A tree that cannot be staged
+  is status `error`. `code-standards-cron.sh` header debt note replaced.
+- M4 (439c18f1) `scripts/repo-hygiene-scan.py`: reads followed symlinks (a `VERSION ->` secret
+  reached the report and the shared-brain post as a "version"; `-> /dev/zero` passed a cap that
+  trusted `st_size`). Every repo-relative read now goes through one helper, `read_repo_file`:
+  no absolute or `..` path, lstat on every component (symlinks and Windows reparse points
+  refused), `S_ISREG` (re-checked on the descriptor, `O_NOFOLLOW|O_NONBLOCK`), bounded
+  `read(cap + 1)`. The workflow walk (`walk_repo_files`, `followlinks=False`) replaces `rglob`
+  and reports symlinked entries as not examined; `file_size` and the drift mtime use `lstat`.
+- L1 (f48ee67e) `install.sh`: the lost-entries guard used a raw NUL as the `tr` argument, which
+  bash strips, so it compared 0 with 0. Now `tr -cd '\000'`; no tracked file holds a NUL.
+- Tests: `test_hygiene_symlinks.py` (new), npm `.npmrc`/staging cases checked against real npm
+  config resolution, a lost-entries refusal and a no-control-byte check over tracked files;
+  each is red against the pre-fix code.
+
 ## 1.1.2 - 2026-11-10
 
 Security register SC-53..SC-55 graduated from audit-steward-sessionwatch-2026-11-10, approved by

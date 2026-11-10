@@ -136,11 +136,12 @@ if (( ${#reports[@]} != 1 )); then
   exit 1
 fi
 
-# 4. npm audit (degradable, bounded). The environment's npm_config_registry
-#    outranks a repo .npmrc's top-level `registry` key only; scoped
-#    `@scope:registry` and other repo .npmrc keys still apply. That is
-#    unverified at the wire and tracked as debt with the npm-audit status fix
-#    (issue 2e17bd88). Scripts are off as belt-and-braces (`npm audit` runs none).
+# 4. npm audit (degradable, bounded). npm-audit-weekly.sh owns the npm
+#    configuration: it never runs npm inside a mirrored repo (package.json and
+#    the lockfiles are staged into an operator tree with no .npmrc) and pins
+#    userconfig/globalconfig to empty files, the registry, strict-ssl, proxies
+#    and scripts itself (audit 2026-11-10.2 M3). The pins below are redundant
+#    belt-and-braces for any npm call made before the script's own.
 rm -f -- "$work"/npm/npm-audit-*.json
 npm_args=()
 npm_rc=0
