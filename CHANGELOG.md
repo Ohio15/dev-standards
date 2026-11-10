@@ -18,13 +18,34 @@ reviewers. Shared-brain 34910b22, 439c18f1, f48ee67e.
   `npm_config_globalconfig` pinned to empty files the script creates, the public registry,
   `strict-ssl=true`, `proxy`/`https-proxy=false` and scripts off. A tree that cannot be staged
   is status `error`. `code-standards-cron.sh` header debt note replaced.
-- M4 (439c18f1) `scripts/repo-hygiene-scan.py`: reads followed symlinks (a `VERSION ->` secret
-  reached the report and the shared-brain post as a "version"; `-> /dev/zero` passed a cap that
-  trusted `st_size`). Every repo-relative read now goes through one helper, `read_repo_file`:
-  no absolute or `..` path, lstat on every component (symlinks and Windows reparse points
-  refused), `S_ISREG` (re-checked on the descriptor, `O_NOFOLLOW|O_NONBLOCK`), bounded
-  `read(cap + 1)`. The workflow walk (`walk_repo_files`, `followlinks=False`) replaces `rglob`
-  and reports symlinked entries as not examined; `file_size` and the drift mtime use `lstat`.
+- M4 (439c18f1) `scripts/repo-hygiene-scan.py`: repo accesses followed symlinks (a `VERSION ->`
+  secret reached the report and the shared-brain post as a "version"; `-> /dev/zero` passed a
+  cap that trusted `st_size`). Every metadata probe of a path inside a scanned repo now goes
+  through `lstat_repo_path` (no absolute or `..` path, lstat on every component, symlinks and
+  Windows reparse points refused, only ENOENT/ENOTDIR read as absent) and every read through
+  `read_repo_file` (that, plus `S_ISREG` re-checked on the descriptor, `O_NOFOLLOW|O_NONBLOCK`,
+  bounded `read(cap + 1)`). The workflow walk (`walk_repo_files`, `followlinks=False`) replaces
+  `rglob` and reports symlinked and unreadable entries as not examined.
+- Security gate pass 1 on #87 (same version, unreleased):
+  - SC-01: the first cut missed two accesses. `scan_security_register` compared
+    `path.resolve()` with the canonical path, so a `SECURITY-CHECKS.md` committed as a symlink to
+    the canonical was skipped as "the canonical file itself"; the self-skip is now an inode match
+    on a real file reached with no link, and a linked copy reports `security-register-stale`.
+    `.gitmodules` was probed with `is_file()` and handed to `git config -f` by repo path; it is
+    now read with `read_repo_file` and git parses a private temp copy (new LOW
+    `submodule-unexamined` when it cannot be read). `file_size`, the drift mtime, the hook-drift
+    and hooksPath probes, the auto-apply marker and enrolment discovery use `lstat_repo_path`;
+    git is run in a submodule path only when it is a real directory. The class test now
+    inventories every filesystem access and every path argument to `run()` from the AST against
+    an allow-list of operator paths (no dead rows allowed).
+  - SC-04: `walk_repo_files` reported nothing on a permission or I/O error (`except OSError:
+    return []`, `os.walk` without `onerror`); every error but absence is now listed as not
+    examined. `discover_enrolled_repos` records each candidate it drops (symlinked, oversized,
+    unreadable, not UTF-8, not a mapping) and the drift report lists them.
+  - SC-13: this entry, the test docstring and STANDARDS.md now claim only what the boundary
+    tests show.
+  - `scripts/fleet-precommit-inventory.py` keeps its direct reads: it has no scheduled or mirror
+    caller (manual run over the operator's own `D:/Projects` checkouts only).
 - L1 (f48ee67e) `install.sh`: the lost-entries guard used a raw NUL as the `tr` argument, which
   bash strips, so it compared 0 with 0. Now `tr -cd '\000'`; no tracked file holds a NUL.
 - Tests: `test_hygiene_symlinks.py` (new), npm `.npmrc`/staging cases checked against real npm
