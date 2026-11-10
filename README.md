@@ -285,7 +285,9 @@ python scripts/repo-hygiene-scan.py \
 
 Weekly `npm audit` roll-up across every Node.js repo under the configured roots. Per-repo it runs `npm audit --json` (full) and `npm audit --omit=dev --json` (prod-only), aggregates totals by severity, and best-effort cross-references the CISA KEV (Known Exploited Vulnerabilities) feed for each finding.
 
-Exit codes: 3 if `THRESH_CRIT` (default 1) or `THRESH_HIGH` (default 3) thresholds are crossed — cron mail picks that up.
+Unknown is never clean. Each repo entry has `status` `ok` or `error` (+ `reason`). `ok` requires both audits to return a numeric `.metadata.vulnerabilities` summary with no `.error`; any failure (ENOLOCK, network, registry, timeout, empty or unparseable output, no `package-lock.json`/`npm-shrinkwrap.json`, `npm` or `jq` missing) yields `status:"error"` with every count `null`, never 0. The roll-up carries the same `status` plus `repos_ok`/`repos_error`; its totals cover examined repos only. Consumers must read a count only from `status:"ok"` entries.
+
+Exit codes: 3 if `THRESH_CRIT` (default 1) or `THRESH_HIGH` (default 3) thresholds are crossed; 4 if any repo (or the whole run) could not be examined. Both are non-zero so cron mail picks them up, and a report is written either way. `AUDIT_TIMEOUT` (default 180) bounds each audit in seconds.
 
 ```bash
 # Default scan
