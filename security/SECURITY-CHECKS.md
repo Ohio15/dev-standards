@@ -953,6 +953,55 @@ fails closed, plus a fleet scan that reports drift.
 **Origin.** audit-dev-standards-2026-10-30 (MEDIUM; approved by Ron 2026-11-01;
 enrolment-time check is dev-standards PR fix/enrol-cache-restore-check, in flight).
 
+### SC-53 · A user-facing message or doc names an enforcement point that has no consumer
+**Shape.** A notice, page, README or module doc asserts that another component
+(a hook, PEP, gate, verifier) will act on this output, and no reader of that
+output exists in any repo. The operator then trusts a control that is not
+there, and a missing output reads the same as a clean one. steward-sessionwatch
+2026-11-10: the PEP claim in the operator notice has no consumer (M10).
+**Check.** For every string or doc line naming a consumer (`Stop hook`, `PEP`,
+`gate will`, `verifier`, a DR id), grep the named consumer's repo (and
+`git log --all -S`) for a reader of the produced artifact (file name, JSON key
+or topic). No hit = FINDING.
+**Fix form.** Build the reader, or remove the claim and say the output is
+advisory until a consumer exists.
+**Since.** approved 2026-11-10.
+**Origin.** audit-steward-sessionwatch-2026-11-10 (MEDIUM M10; approved by Ron
+2026-11-10, shared-brain b37ab3ef).
+
+### SC-54 · A text sanitizer for trusted display strips control characters but not Unicode format characters
+**Shape.** A clean or sanitize function used on attacker- or session-authored
+text that ends up in a trusted notification, board or log removes C0/C1 only,
+leaving bidi overrides, isolates, zero-width characters and line or paragraph
+separators, which reorder, hide or forge lines. steward-sessionwatch
+2026-11-10: the notifier's sanitizer (M13).
+**Check.** For each sanitizer feeding a trusted sink, assert it removes or
+escapes U+200B-U+200D, U+2028-U+2029, U+202A-U+202E, U+2066-U+2069 and U+FEFF
+(grep the function for these ranges, or a unit test with each code point).
+Absent = FINDING.
+**Fix form.** Strip or escape the Unicode format (Cf) and line/paragraph
+separator (Zl/Zp) classes alongside C0/C1, with a unit test per code point.
+**Since.** approved 2026-11-10.
+**Origin.** audit-steward-sessionwatch-2026-11-10 (MEDIUM M13; approved by Ron
+2026-11-10, shared-brain b37ab3ef).
+
+### SC-55 · A finding is marked resolved on absence rather than on a satisfied predicate
+**Shape.** A monitor clears an open finding (and its retry or undelivered
+state) because it was not re-observed this cycle, so aging out, a skipped
+subject or a changed fingerprint is recorded the same as remediation. Refines
+SC-07 for state machines. steward-sessionwatch 2026-11-10: findings resolved on
+absence (M2) and the mtime pre-filter drop (M3).
+**Check.** Grep for removal from the open-findings map inside a loop over keys
+not in the current `seen` set; FINDING unless the removal is conditioned on an
+explicit satisfied-evidence predicate, and an undelivered page is never
+cleared by any other branch.
+**Fix form.** Resolve only on positive evidence that the predicate is
+satisfied; an unseen subject stays open (or becomes unexamined), and an
+undelivered page survives every other transition.
+**Since.** approved 2026-11-10.
+**Origin.** audit-steward-sessionwatch-2026-11-10 (MEDIUM M2, M3; approved by Ron
+2026-11-10, shared-brain b37ab3ef).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -970,7 +1019,8 @@ and renumbered because those numbers were already graduated), approved
 2026-10-26. SC-47..SC-50 (audit-infra-2026-10-29, proposed there as
 SC-43..SC-46 and renumbered because those numbers were already graduated),
 approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
-approved 2026-11-01. SC-37 amended 2026-10-27 (same-repo pull requests on
+approved 2026-11-01. SC-53..SC-55 (audit-steward-sessionwatch-2026-11-10),
+approved 2026-11-10. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.
