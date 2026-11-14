@@ -1123,6 +1123,30 @@ the CLI itself is case-insensitive.
 miss gh api -X/-H", 2 of 3 reviewers; approved by Ron 2026-11-14, decision
 19267a80).
 
+### SC-62 · An attestation accepted as evidence for an action is validated for freshness and authorship but not bound to the target it attests to
+**Shape.** A verification/evidence/sign-off reference (a memory id, an approval
+record, a gate-pass token) is checked for recency and for who authored it, and
+accepted as proof that verification occurred - but the stored record carries no
+link to the specific item, resource, or transaction the verification was
+supposed to cover. One qualifying attestation then authorizes closing,
+approving, or releasing any number of other eligible targets, indefinitely,
+because nothing differentiates "verified THIS" from "verified something, once,
+recently."
+**Check.** For every closure/approval predicate that accepts an evidence
+reference, grep the validation function for what it checks on the referenced
+record (author, timestamp, tag) versus what it checks against the CURRENT
+target (id, hash, resource key). If the predicate has no current-target
+comparison, it is a FINDING. A mechanical test: construct one valid
+attestation, use it to close target A, then attempt to reuse it unmodified on
+unrelated target B - the second close must fail.
+**Fix form.** The attestation must carry the target's own identity (id/hash),
+and the check must verify that identity against the current target, not merely
+that *an* attestation of the right shape and age exists somewhere.
+**Since.** approved 2026-11-14.
+**Origin.** audit-shared-brain-2026-11-14 (MEDIUM "verification attestation not
+bound to the item", shared-brain `lib/work-items.js` `closeEvidenceRefProblem`,
+1 of 3 reviewers; approved by Ron 2026-11-14, decision 2a3eb88e).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -1143,7 +1167,7 @@ approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
 approved 2026-11-01. SC-53..SC-55 (audit-steward-sessionwatch-2026-11-10),
 approved 2026-11-10. SC-56..SC-57 (audit-shared-brain-2026-11-13),
 approved 2026-11-14. SC-58..SC-61 (audit-cortex-hooks-2026-11-14),
-approved 2026-11-14. SC-37 amended 2026-10-27 (same-repo pull requests on
+approved 2026-11-14. SC-62 (audit-shared-brain-2026-11-14), approved 2026-11-14. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.

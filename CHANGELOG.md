@@ -3,6 +3,14 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.8 - 2026-11-14
+
+Security register SC-62 graduated from audit-shared-brain-2026-11-14, approved by Ron 2026-11-14
+(decision 2a3eb88e): an attestation accepted as evidence for an action that is validated for
+freshness and authorship but not bound to the target it attests to (shared-brain
+`closeEvidenceRefProblem`, security-item verification memory accepted by tag+author+recency with
+no item-id binding). Both register copies updated identically (59 rules).
+
 ## 1.1.7 - 2026-11-14
 
 Security register SC-58..SC-61 graduated from audit-cortex-hooks-2026-11-14, approved by Ron
