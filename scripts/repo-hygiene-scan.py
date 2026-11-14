@@ -204,6 +204,50 @@ COMMENT_PREFIXES_BY_SUFFIX: dict[str, tuple[str, ...]] = {
 }
 ADR_PATH_RE = re.compile(r"(^|/)(docs/)?adr[s]?/|(^|/)adr-\d+|(^|/)ADR", re.IGNORECASE)
 MAX_RUNTIME_SOURCE_BYTES = 1024 * 1024  # skip anything bigger; not hand-written code
+# Per-kind cap exception (work item 9871f5ac). Some tracked runtime-source
+# files are not hand-written code and are legitimately larger than 1 MiB:
+# data sets (`.json`, e.g. an engine calibration), minified or bundled
+# artefacts (`*.min.js`, `*.bundle.mjs`) and vendored third-party trees. A
+# `-unexamined` finding on such a file makes the code-standards exporter
+# report the WHOLE repo as not scanned (unknown is never clean), so a
+# calibration table blinded Steward to every other check in that repo.
+# Instead of classifying them out (which would call them clean unread),
+# they are READ under a larger documented cap and examined like any other
+# runtime source; only past 16 MiB are they still reported unexamined, with
+# their kind named. Hand-written source keeps the 1 MiB cap: a 1 MiB .py
+# file is itself a finding worth a human's eyes.
+MAX_DATA_ARTEFACT_BYTES = 16 * 1024 * 1024
+ARTEFACT_PATH_SEGMENTS = {"vendor", "vendored", "third_party", "third-party"}
+_MINIFIED_NAME_RE = re.compile(r"(?:[.-]min|\.bundle)\.(?:m?js|cjs|css)$", re.IGNORECASE)
+
+
+def artefact_kind(rel: str) -> str | None:
+    """Why a runtime-source path may exceed MAX_RUNTIME_SOURCE_BYTES, or None
+    when it is hand-written code: "data" (.json), "minified" (*.min.js,
+    *-min.mjs, *.bundle.js ...) or "vendored" (a vendor/third_party segment).
+    The kind picks the read cap and is named on any unexamined item."""
+    parts = rel.replace("\\", "/").lower().split("/")
+    name = parts[-1]
+    if any(seg in ARTEFACT_PATH_SEGMENTS for seg in parts[:-1]):
+        return "vendored"
+    if _MINIFIED_NAME_RE.search(name):
+        return "minified"
+    if name.endswith(".json"):
+        return "data"
+    return None
+
+
+def read_cap_for(rel: str) -> int:
+    """Byte cap for reading `rel`: the artefact cap for data/minified/vendored
+    files, MAX_RUNTIME_SOURCE_BYTES otherwise (both read at call time)."""
+    return MAX_DATA_ARTEFACT_BYTES if artefact_kind(rel) else MAX_RUNTIME_SOURCE_BYTES
+
+
+def _source_kind(rel: str) -> str:
+    """The `kind` an unexamined runtime-source item reports: "runtime-source"
+    for hand-written code, "<artefact>-artefact" for data/minified/vendored."""
+    kind = artefact_kind(rel)
+    return f"{kind}-artefact" if kind else "runtime-source"
 
 # --- Code-standards checks (Steward code-standards-* positions) -----------
 # Content-only checks: every verdict below is a function of the tracked tree,
@@ -862,8 +906,9 @@ def read_repo_file(repo: Path, rel: str | Path, cap: int | None = None) -> tuple
 
 
 def _read_text_capped(repo: Path, rel: str | Path) -> tuple[str | None, str | None]:
-    """read_repo_file, decoded as UTF-8 (undecodable bytes replaced)."""
-    data, skip = read_repo_file(repo, rel)
+    """read_repo_file under the per-kind cap (read_cap_for), decoded as UTF-8
+    (undecodable bytes replaced)."""
+    data, skip = read_repo_file(repo, rel, cap=read_cap_for(str(rel)))
     if data is None:
         return None, skip
     return data.decode("utf-8", errors="replace"), None
@@ -1003,7 +1048,7 @@ def scan_independence(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
                 continue
             text, skip = _read_text_capped(repo, rel)
             if skip:
-                skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
+                skipped.append({"path": rel, "kind": _source_kind(rel), "reason": skip})
             if not text:
                 continue
             for host in AI_VENDOR_HOSTS:
@@ -1206,7 +1251,7 @@ def scan_stub_markers(repo: Path, tracked: list[str]) -> list[dict[str, Any]]:
             continue
         text, skip = _read_text_capped(repo, rel)
         if skip:
-            skipped.append({"path": rel, "kind": "runtime-source", "reason": skip})
+            skipped.append({"path": rel, "kind": _source_kind(rel), "reason": skip})
         if not text:
             continue
         if lower.endswith(".py") and _py_declares_abc(text):

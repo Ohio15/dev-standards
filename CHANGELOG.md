@@ -3,6 +3,21 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.6 - 2026-11-14
+
+repo-hygiene-scan reads data, minified and vendored runtime-source files under a documented
+16 MiB cap (`MAX_DATA_ARTEFACT_BYTES`; `artefact_kind()` classifies `.json`; `*.min.*`, `*-min.*`
+and `*.bundle.*` with a js/mjs/cjs/css suffix; and any path under a `vendor`, `vendored`,
+`third_party` or `third-party` segment, whatever its suffix) instead of the 1 MiB hand-written-code
+cap. Before, one such file
+(openobd `data/2010_silverado_best.cal.json`, 1.8 MB; pdfmanager
+`src/renderer/public/pdf.worker.min.mjs`, 1.4 MB) produced a `*-unexamined` finding and the
+code-standards exporter reported the whole repo as `repo_scanned 0`, so Steward saw blind-scan on
+every code position of those repos (work item 9871f5ac). Those files are now read and examined by
+the independence and stub-marker passes like any other source; an artefact past 16 MiB is still
+reported unexamined, with its kind named (`data-artefact`, `minified-artefact`,
+`vendored-artefact`). Hand-written source keeps the 1 MiB cap unchanged.
+
 ## 1.1.5 - 2026-11-14
 
 Security register SC-56..SC-57 graduated from audit-shared-brain-2026-11-13, approved by Ron

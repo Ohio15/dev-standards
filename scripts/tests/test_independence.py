@@ -270,6 +270,97 @@ def test_readable_clean_file_is_neither_flagged_nor_unexamined(tmp_path: Path) -
     assert "independence-unexamined" not in found
 
 
+# --- per-kind read cap: data / minified / vendored artefacts (9871f5ac) -------
+# openobd data/2010_silverado_best.cal.json (1.8 MB) and pdfmanager
+# src/renderer/public/pdf.worker.min.mjs (1.4 MB) each blinded the exporter for
+# their whole repo. Such files are READ under MAX_DATA_ARTEFACT_BYTES and
+# examined; hand-written source keeps the 1 MiB cap.
+
+@pytest.mark.parametrize("rel,kind", [
+    ("data/2010_silverado_best.cal.json", "data"),
+    ("package.json", "data"),
+    ("src/renderer/public/pdf.worker.min.mjs", "minified"),
+    ("static/app-min.js", "minified"),
+    ("dist/app.bundle.js", "minified"),
+    ("styles/site.min.css", "minified"),
+    ("vendor/lib/thing.js", "vendored"),
+    ("src/third_party/x.py", "vendored"),
+    ("src/app.ts", None),
+    ("src/minify.ts", None),       # "min" inside a name is not a .min. marker
+    ("src/vendor.ts", None),       # a file named vendor is not a vendor dir
+    ("config/settings.yml", None),
+])
+def test_artefact_kind_classification(rel: str, kind: str | None) -> None:
+    assert hygiene.artefact_kind(rel) == kind
+    assert hygiene._source_kind(rel) == (f"{kind}-artefact" if kind else "runtime-source")
+
+
+def test_oversized_data_file_is_read_and_examined_not_blinded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A data file over the source cap but under the artefact cap is examined:
+    a vendor literal inside it is still found, and a clean one produces no
+    unexamined item (so the exporter no longer reports the repo as not scanned)."""
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    monkeypatch.setattr(hygiene, "MAX_DATA_ARTEFACT_BYTES", 4096)
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "data/cal.json", '{"pad": "' + "x" * 600 + '", "url": "https://api.openai.com"}\n'))
+    found = codes(hygiene.scan_independence(repo, tracked))
+    assert "independence-unexamined" not in found
+    assert found["independence-ai-vendor-runtime"]["items"][0]["path"] == "data/cal.json"
+
+    repo2, tracked2 = conforming(tmp_path / "two")
+    tracked2.append(write(repo2, "data/cal.json", '{"pad": "' + "x" * 600 + '"}\n'))
+    found2 = codes(hygiene.scan_independence(repo2, tracked2))
+    assert "independence-ai-vendor-runtime" not in found2
+    assert "independence-unexamined" not in found2
+
+
+def test_oversized_minified_bundle_is_examined_by_both_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    monkeypatch.setattr(hygiene, "MAX_DATA_ARTEFACT_BYTES", 4096)
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/renderer/public/pdf.worker.min.mjs", "var a=1;" * 100 + "\n"))
+    assert "independence-unexamined" not in codes(hygiene.scan_independence(repo, tracked))
+    stubs = codes(hygiene.scan_stub_markers(repo, tracked))
+    assert "stub-marker-unexamined" not in stubs
+    assert "stub-marker" not in stubs
+    # the minified file is really read: a stub shape inside it is still found
+    tracked.append(write(repo, "dist/app.bundle.js", "x" * 200 + ';throw new Error("not implemented");\n'))
+    assert "dist/app.bundle.js:1" in codes(hygiene.scan_stub_markers(repo, tracked))["stub-marker"]["items"]
+
+
+def test_hand_written_source_over_cap_stays_unexamined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The artefact cap never applies to hand-written code: a 1 MiB .ts file is
+    still unexamined (kind runtime-source), exactly as before."""
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    monkeypatch.setattr(hygiene, "MAX_DATA_ARTEFACT_BYTES", 4096)
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "src/big.ts", "// " + "x" * 80 + "\n"))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-unexamined"]
+    assert f["items"] == [{"path": "src/big.ts", "kind": "runtime-source", "reason": "exceeds 64-byte cap: not read"}]
+
+
+def test_artefact_over_artefact_cap_is_unexamined_with_its_kind_named(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 64)
+    monkeypatch.setattr(hygiene, "MAX_DATA_ARTEFACT_BYTES", 256)
+    repo, tracked = conforming(tmp_path)
+    tracked.append(write(repo, "data/huge.json", '{"pad": "' + "x" * 400 + '"}\n'))
+    tracked.append(write(repo, "vendor/lib.js", "var a=1;" * 60 + "\n"))
+    f = codes(hygiene.scan_independence(repo, tracked))["independence-unexamined"]
+    assert sorted((i["kind"], i["path"], i["reason"]) for i in f["items"]) == [
+        ("data-artefact", "data/huge.json", "exceeds 256-byte cap: not read"),
+        ("vendored-artefact", "vendor/lib.js", "exceeds 256-byte cap: not read"),
+    ]
+
+
+def test_read_cap_is_chosen_per_kind_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hygiene, "MAX_RUNTIME_SOURCE_BYTES", 10)
+    monkeypatch.setattr(hygiene, "MAX_DATA_ARTEFACT_BYTES", 20)
+    assert hygiene.read_cap_for("src/app.ts") == 10
+    assert hygiene.read_cap_for("data/x.json") == 20
+    assert hygiene.read_cap_for("a/b.min.js") == 20
+    assert hygiene.read_cap_for("third_party/y.go") == 20
+
+
 # --- suffix-aware comment rule ----------------------------------------------
 
 def test_json_line_led_by_semicolon_or_hash_is_data_not_comment(tmp_path: Path) -> None:
