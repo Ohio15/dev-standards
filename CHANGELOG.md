@@ -3,6 +3,15 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.7 - 2026-11-14
+
+Security register SC-58..SC-61 graduated from audit-cortex-hooks-2026-11-14, approved by Ron
+2026-11-14 (decision 19267a80): an authorization decision on a URL owner or path taken before
+canonicalisation (SC-58), a per-call approval tier that can reach a control-plane or policy write
+(SC-59), a multi-line operator prompt built from interpolated untrusted values (SC-60), and a
+case-folded flag lookup against a case-sensitive flag table (SC-61). Both register copies updated
+identically (58 rules).
+
 ## 1.1.6 - 2026-11-14
 
 repo-hygiene-scan reads data, minified and vendored runtime-source files under a documented
