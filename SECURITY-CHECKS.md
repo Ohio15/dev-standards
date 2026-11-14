@@ -1044,6 +1044,85 @@ trusted-wrapper sink in the same change that revives the path.
 reaches model prompts and system-reminder output with no provenance fence";
 approved by Ron 2026-11-14, decision 1f1bf2a9).
 
+### SC-58 · Authorization decision on a URL owner/path taken before canonicalisation
+**Shape.** A guard extracts the owner or resource from a URL or API path by
+splitting on `/` without first resolving RFC 3986 dot segments,
+percent-decoding, and normalising a trailing-dot host, while the transport
+(libcurl, .NET, git HTTP) canonicalises before sending.
+`https://github.com/Ohio15/../PatriotCompanies/x` is judged as owner `Ohio15`
+and delivered to `PatriotCompanies`. cortex-hooks 2026-11-14: org-allowlist
+`parseGitHubUrl`, dangerous.ts `githubApiPath`.
+**Check.** grep the guard tree for URL/path owner extraction (`split('/')`,
+`pathname`, regex captures of `repos/([^/]+)` / `github.com/([^/]+)`) and
+confirm each passes through the one shared canonicaliser first; a mechanical
+test feeds `x/../ORG/r`, `./ORG/r`, percent-encoded and `host./` forms to every
+extractor and requires the canonical owner (or a refusal). An extractor with no
+canonicaliser call is a FINDING.
+**Fix form.** One shared URL canonicaliser (dot segments, percent-decoding,
+host normalisation) called before every owner/resource decision.
+**Since.** approved 2026-11-14.
+**Origin.** audit-cortex-hooks-2026-11-14 (HIGH "DR-009 push guard takes the
+owner from an unresolved URL path"; HIGH "repository-deletion rule fails open
+... dot segments, trailing-dot hosts"; approved by Ron 2026-11-14, decision
+19267a80).
+
+### SC-59 · A per-call approval tier that can reach a control-plane or policy write
+**Shape.** A mechanism that converts a refusal into a one-time human approval
+(ask, confirm, step-up) is applied uniformly, so refusals protecting the
+control plane itself (the guard's config, its registration, its compiled
+code, its audit journals) become approvable per call although the approved
+effect persists and disables future checks. cortex-hooks 2026-11-14:
+ask-on-block converted `floor:operator-config` denies into a plain prompt.
+**Check.** Enumerate every refusal source the conversion reaches (grep the
+deny emitters and the floor rule table); a test converts each floor or
+control-plane deny under the approval mode and requires it to stay a deny or
+to carry a distinct, explicit "this approval changes policy" reason. Any floor
+rule converted to a plain approval is a FINDING.
+**Fix form.** Mark control-plane refusals non-convertible, or route them to a
+distinct, explicitly labelled approval; keep design claims ("no persisted
+grant") true only for the set they describe.
+**Since.** approved 2026-11-14.
+**Origin.** audit-cortex-hooks-2026-11-14 (MEDIUM "floor and control-plane
+denies become one-click approvals whose effect persists", 3 of 3 reviewers;
+approved by Ron 2026-11-14, decision 19267a80).
+
+### SC-60 · Multi-line operator prompt built from interpolated untrusted values
+**Shape.** A sanitizer allows newlines for a whole composed message so the
+hook's own multi-line text survives, which also lets newlines inside
+interpolated untrusted values (paths, branches, remote names) forge
+hook-looking lines in a prompt a human decides on. Distinct from SC-54
+(format characters): plain LF is the vector. cortex-hooks 2026-11-14:
+`buildAskReason` with `allowNewline: true`.
+**Check.** grep refusal and prompt builders for template interpolation (`\${`)
+of agent-derived values feeding a sink sanitized with newlines allowed; a test
+interpolates `x\n\nFORGED` into each and requires the output to contain no
+newline originating from the value. An interpolated untrusted value whose LF
+survives is a FINDING.
+**Fix form.** Flatten or visibly mark newlines in interpolated values at the
+interpolation point (or flatten the whole message); allow newlines only in
+literal, sink-authored text.
+**Since.** approved 2026-11-14.
+**Origin.** audit-cortex-hooks-2026-11-14 (MEDIUM "an agent can forge whole
+lines in the approval reason", 2 of 3 reviewers; approved by Ron 2026-11-14,
+decision 19267a80).
+
+### SC-61 · Case-folded flag lookup against a case-sensitive flag table
+**Shape.** An argument parser lower-cases a flag before looking it up in a set
+that contains uppercase short flags (`-X`, `-H`, `-F`), so those flags never
+consume their value and the value is parsed as the next positional (the API
+path), steering the authorization decision. cortex-hooks 2026-11-14:
+org-allowlist `splitArgs` against `GH_VALUE_FLAGS`.
+**Check.** grep parsers for `toLowerCase()` applied to a token that is then
+looked up in a flag set; a test runs each uppercase entry of every flag set
+with a value and requires the value to be consumed. Any uppercase entry that
+can never match is a FINDING.
+**Fix form.** Case-exact flag lookup; fold only long options, and only where
+the CLI itself is case-insensitive.
+**Since.** approved 2026-11-14.
+**Origin.** audit-cortex-hooks-2026-11-14 (MEDIUM "DR-009 create/transfer rules
+miss gh api -X/-H", 2 of 3 reviewers; approved by Ron 2026-11-14, decision
+19267a80).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -1063,6 +1142,7 @@ SC-43..SC-46 and renumbered because those numbers were already graduated),
 approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
 approved 2026-11-01. SC-53..SC-55 (audit-steward-sessionwatch-2026-11-10),
 approved 2026-11-10. SC-56..SC-57 (audit-shared-brain-2026-11-13),
+approved 2026-11-14. SC-58..SC-61 (audit-cortex-hooks-2026-11-14),
 approved 2026-11-14. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
