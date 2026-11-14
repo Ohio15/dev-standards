@@ -1002,6 +1002,48 @@ undelivered page survives every other transition.
 **Origin.** audit-steward-sessionwatch-2026-11-10 (MEDIUM M2, M3; approved by Ron
 2026-11-10, shared-brain b37ab3ef).
 
+### SC-56 · An authorization tier assigned by action NAME where another action reaches the same EFFECT at a lower tier
+**Shape.** A per-action policy table tiers actions (read / write / admin) by
+what they are called, not by what they do, so a lower-tier action produces the
+protected effect by another route: it hides a record, deletes a link, resolves
+a conflict or executes a command. shared-brain 2026-11-13: `update_edge`
+(write) relabels an edge to `supersedes`, the outcome of admin-only
+`resolve_contradiction`; `archive_memory merge_into` (write) deletes edges
+irreversibly; read-tier `preflight` executes caller-supplied commands.
+**Check.** For each admin-tier action, list the persisted effects it produces
+(columns or flags written, rows deleted, enum values set). Grep every
+lower-tier handler for writes of the same column, flag or enum value, for
+`DELETE FROM` the same table, and for `execFile(` / `spawn(`. Any lower-tier
+hit is a FINDING unless the policy table documents why the effect differs. A
+test derived from the policy table asserts no read-tier handler reaches an
+exec call or a mutating SQL statement.
+**Fix form.** Tier by effect: every path to an effect sits in that effect's
+tier, or the lower-tier action refuses the effect-producing inputs.
+**Since.** approved 2026-11-14.
+**Origin.** audit-shared-brain-2026-11-13 (MEDIUM "write-tier actions reach
+admin-tier effects", "legacy preflight read-tier executes caller commands";
+approved by Ron 2026-11-14, decision 1f1bf2a9).
+
+### SC-57 · A fix that revives a dormant data path without re-auditing that path's sinks
+**Shape.** A data stream was always empty because of a bug (a key mismatch, a
+dead branch), so the consumers it feeds rendered untrusted content nowhere and
+were never hardened. The fix makes the stream non-empty and every consumer goes
+live at once, still unfenced. shared-brain 2026-11-13: 7.79.1 fixed
+`recallResult.primary`, reviving raw memory rendering in `get_context`
+system-reminder output and in Cortex research prompts.
+**Check.** When a change modifies the producer of a field, grep every reader
+of that field (`\.<field>\b`) and classify each sink as model prompt
+(`claudeCli(`, prompt templates), trusted wrapper (`system-reminder`,
+notification text) or display. Every model-facing or trusted-wrapper sink must
+fence its input or carry provenance, and the change's PR lists each sink with
+its fence status. A sink with no listed fence status is a FINDING.
+**Fix form.** Fence or provenance-tag every revived model-facing and
+trusted-wrapper sink in the same change that revives the path.
+**Since.** approved 2026-11-14.
+**Origin.** audit-shared-brain-2026-11-13 (MEDIUM "stored memory content
+reaches model prompts and system-reminder output with no provenance fence";
+approved by Ron 2026-11-14, decision 1f1bf2a9).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -1020,7 +1062,8 @@ and renumbered because those numbers were already graduated), approved
 SC-43..SC-46 and renumbered because those numbers were already graduated),
 approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
 approved 2026-11-01. SC-53..SC-55 (audit-steward-sessionwatch-2026-11-10),
-approved 2026-11-10. SC-37 amended 2026-10-27 (same-repo pull requests on
+approved 2026-11-10. SC-56..SC-57 (audit-shared-brain-2026-11-13),
+approved 2026-11-14. SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.
