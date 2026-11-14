@@ -3,6 +3,13 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.5 - 2026-11-14
+
+Security register SC-56..SC-57 graduated from audit-shared-brain-2026-11-13, approved by Ron
+2026-11-14 (decision 1f1bf2a9): an authorization tier assigned by action name where another action
+reaches the same effect at a lower tier (SC-56), and a fix that revives a dormant data path
+without re-auditing that path's sinks (SC-57). Both register copies updated identically.
+
 ## 1.1.4 - 2026-11-10
 
 The code-standards exporter scanned no dependencies: `scripts/npm-audit-weekly.sh` was committed
