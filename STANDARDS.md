@@ -195,7 +195,7 @@ TO-BE: the per-session security gate reports a change that introduces a permissi
 | `tests` | Unit/integration test regressions | All tests green | Test coverage of changed code is not measured; uncovered code passes silently |
 | `gitleaks` | Secret patterns in tracked files | Clean tree | Secrets baked into already-built Docker images; binary blobs; allowlist abuse |
 | `size-guard` | Files >10 MB committed accidentally | All files under threshold | Git LFS objects; many medium files inflating clone size |
-| `npm_audit` | npm-side high/critical vulns | Clean lockfile at root | **Go modules; Python; cargo; multiple package-locks in workspaces; pnpm/yarn lockfile shapes** |
+| `npm_audit` | npm-side vulns at the configured floor, in every tracked npm manifest (1.1.9) | Clean `package-lock.json` in every manifest directory | **pnpm/yarn lockfile shapes (fail as NOT EXAMINED until IMPL-10 pnpm support); Go, Python and cargo are separate gates** |
 | `tag-matches-version` | Tag/version drift | Tag equals root `version.json` | Multiple `version.json` files (the APM bug); built artifact embedded version |
 | `conventional_commits` (default off) | PR title / commit-message lint | Commits follow format | Disabled by default; enforce path varies by repo |
 
@@ -213,7 +213,7 @@ TO-BE: the per-session security gate reports a change that introduces a permissi
 | `secrets-in-binary` | Strings-scan built Docker images | gitleaks against extracted layers | IMPL-8 |
 | `healthcheck-shape-lint` | Healthcheck must be single-shot, no nested retries | yaml-lint custom rule | IMPL-9 |
 
-**Workspace / monorepo lockfile handling (TO-BE — IMPL-10):** `npm_audit` (and equivalents) must walk the repo, find every lockfile (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `Pipfile.lock`, `Cargo.lock`, `poetry.lock`), run the matching auditor for each, report aggregated. Single threshold (high+critical) blocks merge. Currently `npm-audit-weekly.sh` and `release-gates.yml`'s `npm_audit` step both run at repo root only.
+**Workspace / monorepo lockfile handling (TO-BE — IMPL-10):** `npm_audit` (and equivalents) must walk the repo, find every lockfile (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `Pipfile.lock`, `Cargo.lock`, `poetry.lock`), run the matching auditor for each, report aggregated. Single threshold (high+critical) blocks merge. `release-gates.yml`'s `npm_audit` job walks the tree since 1.1.9 (npm lockfiles only; it fails closed on anything it cannot examine). `npm-audit-weekly.sh` still discovers repos by a root `package.json` only.
 
 **SLA for gate runtime:** total gate suite under 10 minutes for a typical repo. Any single gate >5 minutes gets profiled and either parallelized or moved to a nightly cron with weekly aggregate. Tests are exempt from the 10-min ceiling but must surface progress logs.
 
