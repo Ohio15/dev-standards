@@ -3,6 +3,34 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.9 - 2026-11-16
+
+release-gates `npm_audit` examines every tracked npm manifest and fails closed (work item
+6a5ac8ad, audit-keystone-2026-11-16 MEDIUM, brain ac517cd7). Before, the job ran
+`[ ! -f package.json ] && exit 0` at the repo root, so a repo whose manifests live in
+subdirectories (Keystone `frontend/`; ToolVault `backend/` + `frontend/`, brain cb5d82c9) released
+with `npm_audit: high` having audited nothing. Detection is now the shared manifest-detection
+block, byte-identical to `security-audit.yml` and `dep-auto-apply.yml`: tracked manifests only, never
+`node_modules`, workspace members audited once through the root whose lockfile names them. Each
+directory first proves its lockfile is the tree with `npm ci --dry-run --ignore-scripts` (refuses
+when the manifest or any folded workspace member has drifted from the lockfile; installs nothing;
+probed on npm 11.7), which is the frozen check the shared block's member folding relies on (gate
+pass 1, SC-07), then runs `npm audit --package-lock-only --audit-level=<floor>`; an out-of-sync
+lockfile is NOT EXAMINED and fails. A manifest that declares no
+dependencies is examined and clean; dependencies without a `package-lock.json`, a pnpm or yarn
+lockfile (pnpm support is work item b523b182) and an unreadable `package.json` fail as NOT
+EXAMINED. An enabled gate with no tracked `package.json` anywhere fails, including when the key is
+absent (the default is `high`): a repo with no npm dependencies says `gates.npm_audit: off`. An
+unknown level is an error, and the level reaches the script through env, not `${{ }}`.
+
+Same skip-means-pass shape fixed in `cargo_audit`: a `Cargo.toml` with no `Cargo.lock` alongside
+or above it was a warning and `continue`; it is now NOT EXAMINED and fails the job (still
+warn-mode, `continue-on-error`). Its manifest list moved from `/tmp` to `$RUNNER_TEMP`.
+`scripts/tests/test_release_gates_workflow.py` runs the shipped step bodies against throwaway
+repos with recording `npm` / `cargo-audit` shims. Supersedes PR #49 (2026-10-17, unmerged).
+
+Consumers on `@v1` get this only when `v1` is next promoted through the canary.
+
 ## 1.1.8 - 2026-11-14
 
 Security register SC-62 graduated from audit-shared-brain-2026-11-14, approved by Ron 2026-11-14
