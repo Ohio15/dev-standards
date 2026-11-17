@@ -104,9 +104,10 @@ on:
         description: |
           Runner label for the gates, read-docker-config and build-and-push jobs.
           Default: the repository variable CI_RUNNER, else `nexus-ci` when the
-          repository is private, else `ubuntu-latest` (public repositories only;
-          a private repository can never resolve to a hosted label - work item
-          ccfc277b, 1.1.10).
+          repository is private, else `ubuntu-latest` (public repositories only).
+          An unset variable cannot select a hosted label for a private
+          repository (work item ccfc277b, 1.1.10); an explicit runs_on or
+          CI_RUNNER names whatever single label it holds.
           A single label only (e.g. `nexus-ci` for the fenced ephemeral-VM
           fleet in Ohio15/infra ci-vm/). Deploy and notify always run on
           [self-hosted, nexus-deploy] and are not affected by this input.

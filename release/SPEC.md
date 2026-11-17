@@ -277,14 +277,20 @@ repo waits its turn.
 
 ## Runner selection
 
-Reusable release workflows (`docker-release.yml`, `release-gates.yml`) pick
-their runner as
+Reusable release workflows (`docker-release.yml`, `release-gates.yml`,
+`lib-release.yml`, `mcp-release.yml`, `electron-release.yml`) pick their
+runner as
 `${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}`
 (dev-standards 1.1.10, work item ccfc277b): an explicit `runs_on` input wins;
 otherwise a private repository resolves to `CI_RUNNER` or, when the variable
-is unset, to `nexus-ci`, and never to a hosted label; only a public
-repository gets the hosted literal. They are called from tag pushes only (see
-the caller shape above). Synced guard workflows
+is unset, to `nexus-ci`; only a public repository gets the hosted literal. An
+UNSET variable cannot select a hosted label for a private repository; an
+explicit `runs_on` or `CI_RUNNER` names whatever single label it holds. The
+one exception is the `build` matrix job of `electron-release.yml`, whose win
+and mac targets need a Windows or macOS host for the platform build and code
+signing; it stays on the hosted matrix and the test names it as the only
+permitted hosted `runs-on`. They are called from tag pushes only (see the
+caller shape above). Synced guard workflows
 (`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it
 with the guarded SC-37 predicate (audit-dev-standards-2026-10-27; register
 amendment approved by Ron 2026-11-01 on #62):

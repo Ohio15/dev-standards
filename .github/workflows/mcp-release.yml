@@ -29,6 +29,16 @@ name: mcp-release
 on:
   workflow_call:
     inputs:
+      runs_on:
+        type: string
+        default: ''
+        description: |
+          Runner label for every job of this workflow that is not pinned to a
+          host. Default: the repository variable CI_RUNNER, else `nexus-ci`
+          when the repository is private, else `ubuntu-latest` (public
+          repositories only). An unset variable cannot select a hosted label
+          for a private repository (work item ccfc277b, 1.1.10); an explicit
+          runs_on or CI_RUNNER names whatever single label it holds.
       ntfy_topic:
         type: string
         default: nexus-alerts
@@ -54,7 +64,7 @@ jobs:
 
   read-mcp-config:
     needs: gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       images: ${{ steps.parse.outputs.images }}
@@ -144,7 +154,7 @@ jobs:
 
   build-and-push:
     needs: [gates, read-mcp-config]
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     strategy:
       fail-fast: true
       matrix:
