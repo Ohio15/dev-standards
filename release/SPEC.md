@@ -166,7 +166,7 @@ Runs in parallel jobs; any failure aborts the release.
 | `tests` | Runs `npm test` (or `test_command` override). Node is set up and `npm ci` runs only when `package.json` exists; the pinned Rust toolchain is installed only when `Cargo.toml` exists. Coverage threshold not enforced at this layer. | Per-repo by setting `gates.tests: false` (rare; usually done only for documentation-only repos). |
 | `gitleaks` | Re-runs the gitleaks scan on the full tagged commit (not just diff). The pre-commit hook scans staged diffs only; this is the belt-and-suspenders catch. | No. |
 | `size_guard` | Same logic as `workflows/size-guard.yml` but enforced at release time. | Per-file via `.large-files-allowlist`. |
-| `npm_audit` | Runs `npm audit --package-lock-only --audit-level=<gates.npm_audit>` in every directory holding a tracked `package.json` (never `node_modules`; workspace members once, through the root whose lockfile names them; detection is the shared block of `security-audit.yml`). Each lockfile is first proven in sync with its manifest and folded members (`npm ci --dry-run --ignore-scripts`). Fails closed: enabled with no tracked `package.json` anywhere fails, and so does any manifest it cannot examine (dependencies but no `package-lock.json`, a lockfile out of sync, a pnpm/yarn lockfile, unreadable JSON). A manifest declaring no dependencies is examined and clean. Before 1.1.9 it checked the repo root only and passed with "skipping" (audit-keystone-2026-11-16). | Per-repo by setting `npm_audit: off`, which is also how a repo with no npm dependencies declares that. |
+| `npm_audit` | Runs `npm audit --json --package-lock-only --audit-level=<gates.npm_audit>` in every directory holding a tracked `package.json` (never `node_modules`; workspace members once, through the root whose lockfile names them; detection is the shared block of `security-audit.yml`). Each lockfile is first proven in sync with its manifest and folded members (`npm ci --dry-run --ignore-scripts`). Fails closed: enabled with no tracked `package.json` anywhere fails, and so does any manifest it cannot examine (dependencies but no `package-lock.json`, a lockfile out of sync, a pnpm/yarn lockfile, unreadable JSON). A manifest declaring no dependencies is examined and clean. Before 1.1.9 it checked the repo root only and passed with "skipping" (audit-keystone-2026-11-16). Since 1.1.12 an advisory listed in `.github/npm-audit-exceptions.json` is excused, loudly and until its expiry (see [npm audit exceptions](#npm-audit-exceptions)). | Per-repo by setting `npm_audit: off`, which is also how a repo with no npm dependencies declares that. Per-advisory, time-boxed, by an exception entry; never by lowering the level. |
 | `tag_matches_version` | Asserts pushed tag matches `package.json:version`. Catches the "I forgot to bump" case. | No. |
 | `conventional_commits_lint` | Lints commit messages since previous tag. | Per-repo via `gates.conventional_commits: false`. |
 | `independence-note` | STANDARDS §13 (IMPL-34): a `RELEASE.md` or `docs/RELEASE.md` is committed and the CHANGELOG section for the version (see [CHANGELOG sections](#changelog-sections)) has an `independence:` line. Skipped for `independence: harness` and `-rc` tags. | Warn-mode soak (`continue-on-error`) until the soak ends; then no. |
@@ -192,6 +192,81 @@ byte-identical in both workflows (`scripts/tests/test_changelog_section.py`).
 - Before 1.1.11 `independence-note` accepted only `## [x.y.z]` and ran a
   section on to the next `## [` heading (work item 36a8b0d6), and
   `lib-release` carried a second, different heading regex.
+
+### npm audit exceptions
+
+An advisory with no fixed version (incident ab044000, 2026-11-17: picomatch
+GHSA-fc5q-39xc-vjpf, HIGH ReDoS, `<= 4.0.7`, reached through vite/vitest dev
+tooling) fails every npm gate in every repo that pulls it, and npm has no
+native ignore list. The peers each have one: pnpm `auditConfig.ignoreGhsas`,
+cargo-audit `[advisories] ignore`, pip-audit `--ignore-vuln`, audit-ci
+`allowlist`. Ours is one committed file per repo, read by both npm gates
+(`release-gates.yml` `npm_audit` and `security-audit.yml` `npm-audit`) through
+the same shell function (the `# >>> shared npm audit exceptions` block,
+byte-identical in `release-gates.yml`, `security-audit.yml` and
+`templates/.github/workflows/security-audit.yml`; locked by
+`scripts/tests/test_npm_audit_exceptions.py`).
+
+`.github/npm-audit-exceptions.json`:
+
+```json
+{"exceptions": [
+  {"ghsa": "GHSA-fc5q-39xc-vjpf",
+   "reason": "picomatch ReDoS, devDependency via vite/vitest, not in image, no patched version",
+   "expires": "2026-12-17",
+   "dirs": ["frontend"]}
+]}
+```
+
+| Key | Rule |
+|---|---|
+| `ghsa` | Required. `^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$`, as in the advisory URL. Listed once. |
+| `reason` | Required. Non-empty, one line, at most 500 characters. |
+| `expires` | Required. `YYYY-MM-DD`, valid through that day (UTC). Past it, the gate FAILS. More than 180 days out, the gate FAILS: a risk acceptance is re-decided at least twice a year. |
+| `dirs` | Optional. Repo-relative manifest directories (`"."` for the root) the entry applies to; absent means every directory. A workspace member is audited through its root, so name the root. |
+
+Semantics, each fail-closed:
+
+- The gate runs `npm audit --json` (release-gates keeps `--package-lock-only`)
+  and reads advisory ids from the report's `via[].url`, never from a
+  `package.json` or `.npmrc`: the file decides what is excused, never what is
+  audited or where the advisories come from.
+- A vulnerable package at or above the level is excused only when every
+  advisory at or above the level that reaches it, following `via` package
+  names down to their root advisories, is listed. Otherwise it fails exactly
+  as before. An advisory without a GHSA URL cannot be excused.
+- Which copy counts is a trust decision, made by the caller outside the
+  shared block (which takes the list's path as an argument). The list changes
+  what is excused, so a pull request must never excuse its own findings
+  (security-audit R-B; gate pass 1 on PR #96, SC-05):
+  - release-gates runs on a pushed `v*` tag (code a maintainer tagged; on any
+    other ref `tag_matches_version` fails), and reads the checkout's copy;
+  - `security-audit.yml` on a trusted event (schedule, or push or
+    workflow_dispatch on the default branch) reads the checkout's copy;
+  - `security-audit.yml` on a `pull_request` reads the BASE branch's copy:
+    the first parent of the merge commit actions/checkout checks out
+    (`refs/pull/N/merge`, at `fetch-depth: 2`), read from git objects with no
+    fetch and no credential, never the copy the PR carries. A checkout that is
+    not that two-parent merge commit is NOT EXAMINED. A PR that touches the
+    file gets a `::warning::` saying its change is not in effect;
+  - any other untrusted event honours no exception.
+- Consequence: an exception takes effect for pull requests only once it is on
+  the default branch. The PR that adds or changes an exception shows a red npm
+  audit on its `pull_request` run and goes green on the `push` run after
+  merge. Merging that one PR on red is an explicit, recorded reviewer
+  decision: the reviewer reads the exception (id, reason, expiry, dirs), states
+  in the PR that the red npm audit is the exception being added, and merges.
+- The file is PR-controlled, so it is loud: every exception honoured is a
+  `::warning::` and a `$GITHUB_STEP_SUMMARY` row (id, reason, expiry, packages
+  excused); an exception that excused nothing is a `::notice::` (stale).
+- Malformed JSON, a duplicate key, an unknown key, a missing or bad field, a
+  duplicate id, a symlinked file or more than 200 entries is NOT EXAMINED and
+  fails. So is a missing report, an npm error report, or a report that
+  disagrees with npm's own exit code.
+- `gates.npm_audit` is unchanged: the level is never lowered, and `off` stays
+  the only way to disable the gate.
+- `security-audit.yml` honours the file for npm lockfiles only; its pnpm and
+  yarn audits do not read it.
 
 ## Caller workflow shape
 
