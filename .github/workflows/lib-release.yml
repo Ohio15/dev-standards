@@ -178,40 +178,39 @@ jobs:
           NOTES_FILE=release-notes.md
           : > "$NOTES_FILE"
 
-          # Try to slice the matching `## [vX.Y.Z]` or `## vX.Y.Z` or
-          # `## X.Y.Z` section out of the CHANGELOG. Stop at the next H2.
-          # Keep-a-Changelog format is the common shape; we accept several
-          # heading variants so consumers don't have to convert existing
-          # changelogs.
-          #
-          # Regex notes:
-          #   - `\[` / `\]` in awk string literals get downgraded to `[` / `]`
-          #     and the warning eats your weekend. Use `[[]` (char class
-          #     containing `[`) and `[]]` (char class containing `]`) instead.
-          #   - Literal dots in the version string are escaped to `[.]` via
-          #     gsub so `1.2.3` doesn't silently match `1X2X3`.
-          #   - Tail anchor allows ` `, end-of-line, or ` -` after the version
-          #     so `1.2.3` does NOT match `1.2.3-rc.1`.
+          # >>> shared changelog section
+          # One definition, byte-identical in release-gates.yml (independence-note)
+          # and lib-release.yml (release notes); documented in release/SPEC.md
+          # "CHANGELOG sections", locked by scripts/tests/test_changelog_section.py.
+          # `changelog_section VERSION FILE` prints the FIRST section naming
+          # VERSION, its heading line included, up to (not including) the next
+          # level-2 heading. A heading names VERSION when it is `## ` followed by
+          # `[x.y.z]`, `x.y.z`, `vx.y.z` or `[vx.y.z]` and then end of line or a
+          # character that cannot continue a version (` — title`, ` - 2026-11-17`,
+          # `(date)`), so 0.14.80 and 0.14.8-rc.1 never name 0.14.8. Dots and `+`
+          # in VERSION are literal. Lines inside a ``` or ~~~ fence are body text,
+          # never headings. awk: `[[]` / `[]]` match the brackets (an escaped
+          # bracket in an awk string is read differently by mawk and gawk); no
+          # `{m,n}` intervals (older mawk lacks them).
+          changelog_section() {
+            awk -v ver="$1" '
+              BEGIN {
+                gsub(/[.+]/, "[&]", ver)
+                heading = "^##[ \t]+([[]v?" ver "[]]|v?" ver ")([^0-9A-Za-z._+-]|$)"
+              }
+              /^ ? ? ?(```|~~~)/ { fence = !fence }
+              !fence && /^##[ \t]/ { if (inside) exit; inside = ($0 ~ heading) }
+              inside { print }
+            ' "$2"
+          }
+          # <<< shared changelog section
+
+          # Slice this version's section out of the CHANGELOG (any accepted
+          # heading form, release/SPEC.md "CHANGELOG sections"). The heading
+          # line is dropped: GitHub renders the tag as the title.
           extracted=0
           if [ -f "$CHANGELOG_PATH" ]; then
-            # awk: print lines between the matching version header and the
-            # next ^## header (exclusive on both ends — we drop the heading
-            # itself since GitHub renders the tag as the title).
-            awk -v ver="$VERSION" '
-              BEGIN {
-                capture = 0
-                gsub(/\./, "[.]", ver)
-                pattern = "^## +[[]?v?" ver "[]]?( |$| -)"
-              }
-              /^## / {
-                if (capture) { exit }
-                if ($0 ~ pattern) {
-                  capture = 1
-                  next
-                }
-              }
-              capture { print }
-            ' "$CHANGELOG_PATH" > "$NOTES_FILE.tmp"
+            changelog_section "$VERSION" "$CHANGELOG_PATH" | tail -n +2 > "$NOTES_FILE.tmp"
             if [ -s "$NOTES_FILE.tmp" ]; then
               # Trim leading/trailing blank lines.
               awk 'NF { found = 1 } found' "$NOTES_FILE.tmp" \
