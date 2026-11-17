@@ -28,6 +28,14 @@ dev tooling with nothing the repo could change).
   packages excused); one that excused nothing is a `::notice::` (stale).
 - The level is never lowered and `gates.npm_audit: off` stays the only disable. pnpm and yarn
   audits in `security-audit.yml` do not read the file.
+- A pull request never excuses its own findings (gate pass 1, SC-05 MEDIUM): the block takes the
+  list's path, and the caller picks the copy. release-gates (pushed tag) and `security-audit.yml`
+  on a trusted event read the checkout's copy; `security-audit.yml` on a `pull_request` reads the
+  base branch's copy from the merge commit's first parent (checkout `fetch-depth: 2`, git objects,
+  no fetch or credential), and a checkout that is not that merge commit is NOT EXAMINED; any
+  other untrusted event honours none. So the PR that adds or changes an exception is red on its
+  `pull_request` run and green on the `push` run after merge; merging it on red is an explicit,
+  recorded reviewer decision.
 - `scripts/tests/test_npm_audit_exceptions.py` proves the three copies identical and runs the
   shipped block (and both shipped steps) against fixture reports, including the real npm 11.7
   report for picomatch 4.0.7; `test_release_gates_workflow.py` shims now print a report.

@@ -179,7 +179,8 @@ def harness(tmp_path: Path):
             rc = 1 if isinstance(rep, dict) and rep.get("vulnerabilities") else 0
         env["SHIM_EXIT"] = str(rc)
         quoted = " ".join("'" + a + "'" for a in args)
-        script = f'set -euo pipefail\n{BLOCK}npm_audit_gate "$GATE_ROOT" \'{dir_}\' \'{level}\' {quoted}\n'
+        script = (f'set -euo pipefail\n{BLOCK}npm_audit_gate "$GATE_ROOT" \'{dir_}\' \'{level}\' '
+                  f'"$GATE_ROOT/.github/npm-audit-exceptions.json" {quoted}\n')
         env["GATE_ROOT"] = bash_path(repo)
         fd, path = tempfile.mkstemp(suffix=".sh", prefix="npm-exc-")
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
@@ -206,12 +207,21 @@ def test_the_three_copies_are_byte_identical():
     assert len(set(parsed.values())) == 1
 
 
+def test_the_audit_step_bodies_agree():
+    bodies = gate_bodies()
+    assert bodies[OWN_AUDIT] == bodies[TEMPLATE_AUDIT]
+
+
 def test_each_gate_calls_the_block_and_nothing_else_gates_npm():
     bodies = gate_bodies()
     rest = {p: b.replace(block_of(b), "") for p, b in bodies.items()}
-    assert 'npm_audit_gate "$(pwd -P)" "$dir" "$NPM_AUDIT_LEVEL" --package-lock-only' in rest[GATES]
+    assert ('npm_audit_gate "$(pwd -P)" "$dir" "$NPM_AUDIT_LEVEL" "$(pwd -P)/.github/npm-audit-exceptions.json"'
+            ' --package-lock-only') in rest[GATES]
     for p in (OWN_AUDIT, TEMPLATE_AUDIT):
-        assert 'npm_audit_gate "$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)" "$DIR" high' in rest[p]
+        assert 'npm_audit_gate "$root" "$DIR" high "$exceptions"' in rest[p]
+        # Untrusted: the base parent's copy, from git objects; never a fetch.
+        assert "git -C \"$root\" show 'HEAD^1:.github/npm-audit-exceptions.json'" in rest[p]
+        assert "git fetch" not in rest[p] and "git -C \"$root\" fetch" not in rest[p]
     for p, b in rest.items():
         assert not re.search(r"^\s*npm audit .*--audit-level", b, re.M), f"{p.name}: an npm audit gates outside the block"
         assert "npm_audit_gate()" not in b, f"{p.name}: the function is redefined outside the block"
@@ -436,7 +446,7 @@ def test_a_symlinked_exception_file_is_not_examined(harness, tmp_path):
     target.write_text(json.dumps({"exceptions": [exception()]}), encoding="utf-8")
     (tmp_path / "repo" / ".github" / "npm-audit-exceptions.json").symlink_to(target)
     proc = harness(PICOMATCH_REPORT, keep=True)
-    assert proc.returncode == 1 and "is not a regular file inside the checkout" in proc.out, proc.out
+    assert proc.returncode == 1 and "is not a regular file" in proc.out, proc.out
 
 
 # --- the shipped steps, end to end -------------------------------------------
@@ -501,11 +511,189 @@ def test_release_gates_step_honours_the_file(tmp_path, exceptions, ok):
     assert (PICOMATCH in summary) == ok
 
 
-@pytest.mark.parametrize("path", [OWN_AUDIT, TEMPLATE_AUDIT], ids=lambda p: p.relative_to(ROOT).as_posix())
-@pytest.mark.parametrize("exceptions, ok", [(None, False), ([exception(dirs=["frontend"])], True),
-                                            ([exception(dirs=["."])], False)])
-def test_security_audit_step_honours_the_file(tmp_path, path, exceptions, ok):
-    repo = keystone_repo(tmp_path, exceptions)
-    env = {**step_env(tmp_path, PICOMATCH_REPORT, 1), "DIR": "frontend", "GITHUB_WORKSPACE": bash_path(repo)}
-    proc = run_step(gate_bodies()[path], repo / "frontend", env)
-    assert (proc.returncode == 0) == ok, proc.stdout + proc.stderr
+# --- security-audit.yml: which copy of the list counts (gate pass 1, SC-05) --
+#
+# A pull request controls its own .github/npm-audit-exceptions.json, so on an
+# untrusted event the list is read from the BASE branch: the first parent of
+# the merge commit actions/checkout checks out for a pull_request
+# (refs/pull/N/merge), present locally because the job checks out at depth 2.
+# The fixture builds that exactly: a bare `origin` holding main and
+# refs/pull/1/merge, and a depth-2 clone of the merge ref, as checkout makes.
+
+# The own copy's Audit step is the template's byte for byte
+# (test_the_audit_step_bodies_agree), so the git-heavy cases run once.
+AUDIT_PATHS = pytest.mark.parametrize("path", [TEMPLATE_AUDIT],
+                                      ids=lambda p: p.relative_to(ROOT).as_posix())
+EXC_REL = ".github/npm-audit-exceptions.json"
+KS_FILES = {"frontend/package.json": json.dumps({"devDependencies": {"vite": "6.4.6"}}),
+            "frontend/package-lock.json": json.dumps({"lockfileVersion": 3, "packages": {"": {}}})}
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    return subprocess.run(["git", "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false",
+                           "-c", "core.hooksPath=/dev/null", *args],
+                          cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def commit(repo: Path, files: dict[str, str | None], msg: str) -> None:
+    for rel, text in files.items():
+        p = repo / rel
+        if text is None:
+            git("rm", "-q", "--", rel, cwd=repo)
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8", newline="\n")
+        git("add", "-f", "--", rel, cwd=repo)
+    git("commit", "-q", "--allow-empty", "-m", msg, cwd=repo)
+
+
+def exc_json(*entries: dict) -> str:
+    return json.dumps({"exceptions": list(entries)})
+
+
+def pr_checkout(tmp_path: Path, base: dict[str, str | None], pr: dict[str, str | None],
+                depth: int = 2) -> tuple[Path, str]:
+    """origin (bare) with main = base and refs/pull/1/merge = GitHub's merge
+    commit (parent 1 main, parent 2 the PR head); returns a depth-`depth`
+    checkout of the merge ref and its sha (GITHUB_SHA)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    git("init", "-q", str(work))
+    commit(work, {**KS_FILES, **base}, "base")
+    git("checkout", "-q", "-b", "pr", cwd=work)
+    commit(work, pr, "pr")
+    git("checkout", "-q", "--detach", "main", cwd=work)
+    git("merge", "-q", "--no-ff", "-m", "Merge pr into main", "pr", cwd=work)
+    merge = git("rev-parse", "HEAD", cwd=work)
+    origin = tmp_path / "origin.git"
+    git("init", "-q", "--bare", str(origin))
+    git("push", "-q", str(origin), "main:refs/heads/main", f"{merge}:refs/pull/1/merge", cwd=work)
+    co = tmp_path / "checkout"
+    co.mkdir()
+    git("init", "-q", str(co))
+    git("remote", "add", "origin", origin.resolve().as_uri(), cwd=co)
+    git("fetch", "-q", f"--depth={depth}", "origin", "+refs/pull/1/merge:refs/remotes/pull/1/merge", cwd=co)
+    git("checkout", "-q", "--detach", "refs/remotes/pull/1/merge", cwd=co)
+    assert git("rev-parse", "HEAD", cwd=co) == merge
+    return co, merge
+
+
+def audit_step(path: Path, co: Path, tmp_path: Path, **env_extra: str) -> subprocess.CompletedProcess:
+    env = {**step_env(tmp_path, PICOMATCH_REPORT, 1), "DIR": "frontend",
+           "GITHUB_WORKSPACE": bash_path(co), **env_extra}
+    for k in ("TRUSTED_EVENT", "GITHUB_EVENT_NAME", "GITHUB_SHA"):
+        if k not in env_extra:
+            env.pop(k, None)
+    proc = run_step(gate_bodies()[path], co / "frontend", env)
+    proc.out = proc.stdout + proc.stderr
+    return proc
+
+
+def pr_event(sha: str) -> dict[str, str]:
+    return {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": sha}
+
+
+def test_the_npm_audit_checkout_keeps_the_base_parent():
+    for path in (OWN_AUDIT, TEMPLATE_AUDIT):
+        wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+        [co] = [s for s in wf["jobs"]["npm-audit"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")]
+        assert co["with"]["fetch-depth"] == 2 and co["with"]["persist-credentials"] is False
+
+
+@AUDIT_PATHS
+def test_a_pull_request_cannot_excuse_its_own_findings(tmp_path, path):
+    co, sha = pr_checkout(tmp_path, {}, {EXC_REL: exc_json(exception(dirs=["frontend"]))})
+    proc = audit_step(path, co, tmp_path, **pr_event(sha))
+    assert proc.returncode == 1, proc.out
+    assert "::warning::npm audit exception honoured" not in proc.out
+    assert "this pull request changes .github/npm-audit-exceptions.json" in proc.out
+    assert "3 failing" in proc.out
+
+
+@AUDIT_PATHS
+def test_a_pull_request_gets_the_base_branchs_exceptions(tmp_path, path):
+    co, sha = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {"README.md": "x"})
+    proc = audit_step(path, co, tmp_path, **pr_event(sha))
+    assert proc.returncode == 0, proc.out
+    assert f"::warning::npm audit exception honoured in frontend: {PICOMATCH}" in proc.out
+    assert "this pull request changes" not in proc.out
+
+
+@AUDIT_PATHS
+def test_a_pull_request_editing_the_list_is_judged_by_the_base_copy(tmp_path, path):
+    # Base excuses only another advisory; the PR rewrites it to excuse picomatch.
+    co, sha = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(OTHER))},
+                          {EXC_REL: exc_json(exception(dirs=["frontend"]))})
+    proc = audit_step(path, co, tmp_path, **pr_event(sha))
+    assert proc.returncode == 1, proc.out
+    assert f"stale npm audit exception: {OTHER}" in proc.out
+    # ...and a PR deleting a base exception does not remove it either.
+    co2_root = tmp_path / "second"
+    co2_root.mkdir()
+    co2, sha2 = pr_checkout(co2_root, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {EXC_REL: None})
+    proc = audit_step(path, co2, co2_root, **pr_event(sha2))
+    assert proc.returncode == 0, proc.out
+
+
+@AUDIT_PATHS
+def test_a_trusted_event_reads_the_checkouts_copy(tmp_path, path):
+    co, sha = pr_checkout(tmp_path, {}, {EXC_REL: exc_json(exception(dirs=["frontend"]))})
+    proc = audit_step(path, co, tmp_path, TRUSTED_EVENT="true", GITHUB_EVENT_NAME="push", GITHUB_SHA=sha)
+    assert proc.returncode == 0, proc.out
+    assert "::warning::npm audit exception honoured" in proc.out
+
+
+@AUDIT_PATHS
+def test_without_the_base_parent_the_list_is_not_examined(tmp_path, path):
+    # Depth 1: the merge commit's parents never arrived (the "fetch failed" shape).
+    co, sha = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {"README.md": "x"}, depth=1)
+    proc = audit_step(path, co, tmp_path, **pr_event(sha))
+    assert proc.returncode == 1, proc.out
+    assert "::error::not examined:" in proc.out and "base branch" in proc.out
+
+
+@AUDIT_PATHS
+@pytest.mark.parametrize("sha", ["", "0" * 40])
+def test_a_checkout_that_is_not_the_events_merge_commit_is_not_examined(tmp_path, path, sha):
+    co, _ = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {"README.md": "x"})
+    proc = audit_step(path, co, tmp_path, GITHUB_EVENT_NAME="pull_request", GITHUB_SHA=sha)
+    assert proc.returncode == 1 and "not examined" in proc.out, proc.out
+
+
+@AUDIT_PATHS
+def test_a_non_merge_pull_request_head_is_not_examined(tmp_path, path):
+    co, _ = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {"README.md": "x"})
+    git("checkout", "-q", "--detach", "HEAD^2", cwd=co)
+    proc = audit_step(path, co, tmp_path, **pr_event(git("rev-parse", "HEAD", cwd=co)))
+    assert proc.returncode == 1 and "not the pull request's merge commit" in proc.out, proc.out
+
+
+@AUDIT_PATHS
+def test_a_base_list_that_is_not_a_regular_file_is_not_examined(tmp_path, path):
+    co, _ = pr_checkout(tmp_path, {}, {"README.md": "x"})
+    # A symlink blob on the base parent.
+    work = tmp_path / "work"
+    git("checkout", "-q", "main", cwd=work)
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], input="/etc/passwd", cwd=work,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    git("update-index", "--add", "--cacheinfo", f"120000,{blob},{EXC_REL}", cwd=work)
+    git("commit", "-q", "-m", "symlink", cwd=work)
+    # Rebuild the merge on top of the symlinked base, as a second pull ref.
+    git("checkout", "-q", "--detach", "main", cwd=work)
+    git("merge", "-q", "--no-ff", "-m", "m", "pr", cwd=work)
+    merge = git("rev-parse", "HEAD", cwd=work)
+    git("push", "-q", str(tmp_path / "origin.git"), f"{merge}:refs/pull/2/merge", cwd=work)
+    git("fetch", "-q", "--depth=2", "origin", "+refs/pull/2/merge:refs/remotes/pull/2/merge", cwd=co)
+    git("checkout", "-q", "--detach", "refs/remotes/pull/2/merge", cwd=co)
+    proc = audit_step(path, co, tmp_path, **pr_event(merge))
+    assert proc.returncode == 1 and "is not a regular file" in proc.out, proc.out
+
+
+@AUDIT_PATHS
+def test_another_untrusted_event_honours_no_exception(tmp_path, path):
+    co, sha = pr_checkout(tmp_path, {EXC_REL: exc_json(exception(dirs=["frontend"]))}, {"README.md": "x"})
+    proc = audit_step(path, co, tmp_path, GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_SHA=sha)
+    assert proc.returncode == 1, proc.out
+    assert "is not honoured" in proc.out and "::warning::npm audit exception honoured" not in proc.out

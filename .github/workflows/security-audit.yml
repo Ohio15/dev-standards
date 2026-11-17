@@ -61,13 +61,22 @@ name: Security Audit (Layer A)
 #
 # npm advisory exceptions (incident ab044000, 2026-11-17: picomatch
 # GHSA-fc5q-39xc-vjpf, HIGH, no patched version): the npm gate honours
-# `.github/npm-audit-exceptions.json` at the checkout root through the
-# `shared npm audit exceptions` block, byte-identical in release-gates.yml.
-# Each entry names a GHSA id, a reason and an expiry (at most 180 days out;
-# past it the gate fails), optionally scoped to manifest dirs. Ids are
-# matched against the audit report only, so the file cannot steer what is
-# audited, and every exception honoured is a ::warning:: plus a step-summary
-# row. pnpm and yarn audits do not read it.
+# `.github/npm-audit-exceptions.json` through the `shared npm audit
+# exceptions` block, byte-identical in release-gates.yml. Each entry names a
+# GHSA id, a reason and an expiry (at most 180 days out; past it the gate
+# fails), optionally scoped to manifest dirs. Ids are matched against the
+# audit report only, so the file does not change what is audited; it does
+# change what is EXCUSED, so it is PR-controlled config under R-B:
+# - on a trusted event the checkout's copy is read (merged code);
+# - on a pull_request the BASE branch's copy is read, from the merge
+#   commit's first parent (fetch-depth 2; no fetch, no credential), never the
+#   copy the PR carries; any other untrusted event honours no exception.
+# So an exception takes effect for pull requests only once it is on the
+# default branch: the PR that adds or changes one shows a red npm audit on
+# its pull_request run and goes green on the push run after merge. Merging
+# that one PR on red is an explicit, recorded reviewer decision.
+# Every exception honoured is a ::warning:: plus a step-summary row. pnpm and
+# yarn audits do not read the file.
 #
 # Design ref: shared-brain decision 81b962de-3e94-4d67-9093-7dbb5644094d
 # Critique:   shared-brain knowledge 7b258d5c-dcf4-49e9-973a-5e92b951a019
@@ -420,6 +429,9 @@ jobs:
           # The audit installs PR-controlled code; it never pushes, so the token
           # is not persisted where that code could read it.
           persist-credentials: false
+          # Depth 2: on a pull_request the merge commit's base parent, whose
+          # .github/npm-audit-exceptions.json is the one honoured (Audit step).
+          fetch-depth: 2
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -629,16 +641,20 @@ jobs:
           # >>> shared npm audit exceptions: byte-identical in release-gates.yml,
           # security-audit.yml and templates/.github/workflows/security-audit.yml
           # (scripts/tests/test_npm_audit_exceptions.py). Change all three or none.
-          # npm_audit_gate ROOT DIR LEVEL [npm audit args...] runs
+          # npm_audit_gate ROOT DIR LEVEL EXCEPTIONS [npm audit args...] runs
           # `npm audit --json --audit-level=LEVEL` in ROOT/DIR and returns 1 on any
-          # vulnerability at or above LEVEL that ROOT/.github/npm-audit-exceptions.json
-          # does not excuse. npm has no ignore list of its own (peers: pnpm
+          # vulnerability at or above LEVEL that the exception list at path EXCEPTIONS
+          # (a copy of .github/npm-audit-exceptions.json; "" = none) does not excuse.
+          # WHICH copy counts is the caller's trust decision, made outside this block:
+          # merged code only, never the copy a pull request brings with it.
+          # npm has no ignore list of its own (peers: pnpm
           # auditConfig.ignoreGhsas, cargo-audit [advisories] ignore, pip-audit
           # --ignore-vuln, audit-ci allowlist); this is that list, one file per repo:
           #   {"exceptions": [{"ghsa": "GHSA-xxxx-xxxx-xxxx", "reason": "...",
           #                    "expires": "YYYY-MM-DD", "dirs": ["frontend"]}]}
           # - Advisory ids come from the audit report (`via[].url`), never from a
-          #   package.json or .npmrc, so nothing here steers what is audited.
+          #   package.json or .npmrc. The list decides what is EXCUSED, so the caller
+          #   passes a copy from merged code (the base branch on a pull request).
           # - A vulnerable package is excused only when EVERY advisory at or above
           #   LEVEL that reaches it (via strings followed to their root advisories) is
           #   listed; anything else fails exactly as a plain `npm audit` would.
@@ -651,13 +667,13 @@ jobs:
           #   A missing report, an npm error, or a report that disagrees with npm's
           #   exit code is NOT EXAMINED.
           npm_audit_gate() {
-            local root="$1" dir="$2" level="$3" report rc=0 verdict=0
-            shift 3
+            local root="$1" dir="$2" level="$3" exceptions_path="$4" report rc=0 verdict=0
+            shift 4
             report="$(mktemp)"
             ( cd -- "$root/$dir" && npm audit --json --audit-level="$level" "$@" < /dev/null ) > "$report" || rc=$?
-            python3 -I - "$report" "$rc" "$root" "$dir" "$level" <<'PY' || verdict=$?
+            python3 -I - "$report" "$rc" "$exceptions_path" "$dir" "$level" <<'PY' || verdict=$?
           import datetime, html, json, os, re, sys
-          report_path, npm_rc, root, audit_dir, level = sys.argv[1:6]
+          report_path, npm_rc, path, audit_dir, level = sys.argv[1:6]
           NAME = ".github/npm-audit-exceptions.json"
           LEVELS = ("info", "low", "moderate", "high", "critical")
           RANK = {s: i for i, s in enumerate(LEVELS)}
@@ -711,11 +727,9 @@ jobs:
           errors = []
           exceptions = {}
           listed = set()
-          path = os.path.join(root, ".github", "npm-audit-exceptions.json")
-          if os.path.lexists(path):
-              if os.path.islink(path) or not os.path.isfile(path) or \
-                      not os.path.realpath(path).startswith(os.path.realpath(root) + os.sep):
-                  not_examined(f"{NAME} is not a regular file inside the checkout")
+          if path and os.path.lexists(path):
+              if os.path.islink(path) or not os.path.isfile(path):
+                  not_examined(f"{NAME} is not a regular file")
               with open(path, "rb") as fh:
                   raw = fh.read(65537)
               if len(raw) > 65536:
@@ -936,8 +950,48 @@ jobs:
           if [ -f pnpm-lock.yaml ]; then
             pnpm audit --audit-level=high --config.ignore-pnpmfile=true
           else
-            # Exceptions: .github/npm-audit-exceptions.json at the checkout root (shared block above).
-            npm_audit_gate "$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)" "$DIR" high
+            # Which .github/npm-audit-exceptions.json counts is a trust decision
+            # (header, "npm advisory exceptions"): the exception list decides
+            # what is excused, so a pull request never excuses its own findings.
+            root="$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)"
+            list_not_examined() {
+              echo "::error::not examined: npm audit in $DIR: $1"
+              printf -- '- npm (%s): **NOT EXAMINED**: %s\n' "$DIR" "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              exit 1
+            }
+            exceptions=""
+            if [ "${TRUSTED_EVENT:-}" = "true" ]; then
+              # Merged code: the checkout's own copy.
+              exceptions="$root/.github/npm-audit-exceptions.json"
+            elif [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+              # The checkout is GitHub's merge commit (refs/pull/N/merge, GITHUB_SHA):
+              # parent 1 is the base branch, parent 2 the PR head, and fetch-depth 2
+              # brought both. The base copy is read from git objects: no fetch, no
+              # credential (persist-credentials is false), never the PR's copy.
+              head="$(git -C "$root" rev-parse --verify -q HEAD)" || head=""
+              parents="$(git -C "$root" rev-list --parents -n 1 HEAD 2> /dev/null | wc -w)" || parents=0
+              if [ -z "$head" ] || [ "$head" != "${GITHUB_SHA:-}" ] || [ "$parents" -ne 3 ] || \
+                  ! git -C "$root" cat-file -e 'HEAD^1^{tree}' 2> /dev/null; then
+                list_not_examined "the checkout is not the pull request's merge commit with its base parent, so the base branch's .github/npm-audit-exceptions.json cannot be read"
+              fi
+              entry="$(git -C "$root" ls-tree 'HEAD^1' -- .github/npm-audit-exceptions.json)" || \
+                list_not_examined "cannot list .github/npm-audit-exceptions.json on the base branch"
+              if [ -n "$entry" ]; then
+                case "$entry" in
+                  "100644 blob "*|"100755 blob "*) ;;
+                  *) list_not_examined "the base branch's .github/npm-audit-exceptions.json is not a regular file" ;;
+                esac
+                exceptions="$(mktemp)"
+                git -C "$root" show 'HEAD^1:.github/npm-audit-exceptions.json' > "$exceptions" || \
+                  list_not_examined "cannot read .github/npm-audit-exceptions.json from the base branch"
+              fi
+              if ! git -C "$root" diff --quiet 'HEAD^1' HEAD -- .github/npm-audit-exceptions.json; then
+                echo "::warning::this pull request changes .github/npm-audit-exceptions.json; the change takes effect only once merged (the base branch's copy is used here)"
+              fi
+            else
+              echo "::notice::untrusted ${GITHUB_EVENT_NAME:-unknown} event with no base branch to read: .github/npm-audit-exceptions.json is not honoured"
+            fi
+            npm_audit_gate "$root" "$DIR" high "$exceptions"
           fi
 
   go-vulncheck:

@@ -235,6 +235,27 @@ Semantics, each fail-closed:
   advisory at or above the level that reaches it, following `via` package
   names down to their root advisories, is listed. Otherwise it fails exactly
   as before. An advisory without a GHSA URL cannot be excused.
+- Which copy counts is a trust decision, made by the caller outside the
+  shared block (which takes the list's path as an argument). The list changes
+  what is excused, so a pull request must never excuse its own findings
+  (security-audit R-B; gate pass 1 on PR #96, SC-05):
+  - release-gates runs on a pushed `v*` tag (code a maintainer tagged; on any
+    other ref `tag_matches_version` fails), and reads the checkout's copy;
+  - `security-audit.yml` on a trusted event (schedule, or push or
+    workflow_dispatch on the default branch) reads the checkout's copy;
+  - `security-audit.yml` on a `pull_request` reads the BASE branch's copy:
+    the first parent of the merge commit actions/checkout checks out
+    (`refs/pull/N/merge`, at `fetch-depth: 2`), read from git objects with no
+    fetch and no credential, never the copy the PR carries. A checkout that is
+    not that two-parent merge commit is NOT EXAMINED. A PR that touches the
+    file gets a `::warning::` saying its change is not in effect;
+  - any other untrusted event honours no exception.
+- Consequence: an exception takes effect for pull requests only once it is on
+  the default branch. The PR that adds or changes an exception shows a red npm
+  audit on its `pull_request` run and goes green on the `push` run after
+  merge. Merging that one PR on red is an explicit, recorded reviewer
+  decision: the reviewer reads the exception (id, reason, expiry, dirs), states
+  in the PR that the red npm audit is the exception being added, and merges.
 - The file is PR-controlled, so it is loud: every exception honoured is a
   `::warning::` and a `$GITHUB_STEP_SUMMARY` row (id, reason, expiry, packages
   excused); an exception that excused nothing is a `::notice::` (stale).
