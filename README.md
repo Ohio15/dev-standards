@@ -125,7 +125,7 @@ Drop-in CI gate that runs on every pull request, every push to `main`/`master`, 
 
 | Ecosystem | Trigger (any directory) | Tool | Gate |
 |---|---|---|---|
-| npm    | `package.json` | `npm audit` (or `pnpm audit`) | fails on **high** or **critical** |
+| npm    | `package.json` | `npm audit` (or `pnpm audit`) | fails on **high** or **critical**, less any advisory listed in `.github/npm-audit-exceptions.json` (npm only) |
 | Go     | `go.mod`       | `govulncheck`                 | fails on any reachable vulnerability |
 | Python | `requirements*.txt` or `pyproject.toml` | `pip-audit --strict` (`pip-audit --strict .` for a pyproject) | fails on any vuln |
 
@@ -135,6 +135,8 @@ Drop-in CI gate that runs on every pull request, every push to `main`/`master`, 
 - a job ran for an ecosystem that was not detected.
 
 A repo with no manifest at all fails too, unless it says why in `.github/security-audit-no-manifests`, which must not be empty. Until 2026-09-28 detection looked only at the repo root, and `skipped` counted as a pass. ai-console, whose manifests live in `console/`, was green on every PR having examined nothing (audit-ai-console-2026-09-28, proposed SC-26). `scripts/tests/test_security_audit_workflow.py` runs the shipped `detect` and `summary` scripts against throwaway repos, so that regression cannot return silently.
+
+**npm advisory exceptions are declared, expiring and loud.** An advisory with no fixed version can be excused per repo in `.github/npm-audit-exceptions.json` (`ghsa`, `reason`, `expires` at most 180 days out, optional `dirs`), honoured by this gate and by release-gates `npm_audit` through one shared block. Ids are matched against the audit report only; an expired or malformed entry fails; every exception honoured is a `::warning::` and a step-summary row. Schema and rules: `release/SPEC.md` "npm audit exceptions". Origin: picomatch GHSA-fc5q-39xc-vjpf, 2026-11-17 (incident ab044000).
 
 **Workspace members are audited once, through their root.** A directory with no lockfile of its own that a tracked ancestor lockfile's workspace declares (pnpm-workspace.yaml `packages:` beside pnpm-lock.yaml, else package.json `workspaces`; `!` globs exclude) and that the lockfile actually names (pnpm importer, package-lock.json `packages` key, yarn berry `@workspace:` locator) gets no job of its own: the root's frozen install checks it and the root's audit reads the whole lockfile (verified for `npm audit` on a workspace root, 2026-10-26). The summary lists each member with the root that covered it, and a member fails unless the npm audit result is `success`; a member credited to a root no job ran for is NOT EXAMINED. Anything not provably covered keeps its own job. Before this, openclaw-1's 37 pnpm members each ran `npm install` and failed on `workspace:*` (discovery 54c58aa3).
 

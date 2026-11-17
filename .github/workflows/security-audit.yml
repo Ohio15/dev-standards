@@ -59,6 +59,16 @@ name: Security Audit (Layer A)
 #   On a trusted event the repo's own configuration is honoured.
 # - The token is contents: read and nothing else.
 #
+# npm advisory exceptions (incident ab044000, 2026-11-17: picomatch
+# GHSA-fc5q-39xc-vjpf, HIGH, no patched version): the npm gate honours
+# `.github/npm-audit-exceptions.json` at the checkout root through the
+# `shared npm audit exceptions` block, byte-identical in release-gates.yml.
+# Each entry names a GHSA id, a reason and an expiry (at most 180 days out;
+# past it the gate fails), optionally scoped to manifest dirs. Ids are
+# matched against the audit report only, so the file cannot steer what is
+# audited, and every exception honoured is a ::warning:: plus a step-summary
+# row. pnpm and yarn audits do not read it.
+#
 # Design ref: shared-brain decision 81b962de-3e94-4d67-9093-7dbb5644094d
 # Critique:   shared-brain knowledge 7b258d5c-dcf4-49e9-973a-5e92b951a019
 
@@ -616,6 +626,228 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # >>> shared npm audit exceptions: byte-identical in release-gates.yml,
+          # security-audit.yml and templates/.github/workflows/security-audit.yml
+          # (scripts/tests/test_npm_audit_exceptions.py). Change all three or none.
+          # npm_audit_gate ROOT DIR LEVEL [npm audit args...] runs
+          # `npm audit --json --audit-level=LEVEL` in ROOT/DIR and returns 1 on any
+          # vulnerability at or above LEVEL that ROOT/.github/npm-audit-exceptions.json
+          # does not excuse. npm has no ignore list of its own (peers: pnpm
+          # auditConfig.ignoreGhsas, cargo-audit [advisories] ignore, pip-audit
+          # --ignore-vuln, audit-ci allowlist); this is that list, one file per repo:
+          #   {"exceptions": [{"ghsa": "GHSA-xxxx-xxxx-xxxx", "reason": "...",
+          #                    "expires": "YYYY-MM-DD", "dirs": ["frontend"]}]}
+          # - Advisory ids come from the audit report (`via[].url`), never from a
+          #   package.json or .npmrc, so nothing here steers what is audited.
+          # - A vulnerable package is excused only when EVERY advisory at or above
+          #   LEVEL that reaches it (via strings followed to their root advisories) is
+          #   listed; anything else fails exactly as a plain `npm audit` would.
+          # - The file is PR-controlled, so it is loud: each exception honoured is a
+          #   ::warning:: and a step-summary row (id, reason, expiry, packages), and one
+          #   that excused nothing is a ::notice:: (stale).
+          # - Fail closed: an unreadable or malformed file, an unknown key, a duplicate
+          #   id, a bad id, an empty reason or a bad date is NOT EXAMINED; an exception
+          #   past its `expires` date (UTC), or expiring more than 180 days out, fails.
+          #   A missing report, an npm error, or a report that disagrees with npm's
+          #   exit code is NOT EXAMINED.
+          npm_audit_gate() {
+            local root="$1" dir="$2" level="$3" report rc=0 verdict=0
+            shift 3
+            report="$(mktemp)"
+            ( cd -- "$root/$dir" && npm audit --json --audit-level="$level" "$@" < /dev/null ) > "$report" || rc=$?
+            python3 -I - "$report" "$rc" "$root" "$dir" "$level" <<'PY' || verdict=$?
+          import datetime, html, json, os, re, sys
+          report_path, npm_rc, root, audit_dir, level = sys.argv[1:6]
+          NAME = ".github/npm-audit-exceptions.json"
+          LEVELS = ("info", "low", "moderate", "high", "critical")
+          RANK = {s: i for i, s in enumerate(LEVELS)}
+          GHSA = re.compile(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}")
+          URL = re.compile(r"https://github\.com/advisories/(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})")
+          DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+          SEGMENT = re.compile(r"[A-Za-z0-9._@+-]+")
+          MAX_DAYS = 180
+          today = datetime.datetime.now(datetime.timezone.utc).date()
+
+          def cmd(s):
+              # Workflow-command data: a newline in PR-controlled text must not start a new command.
+              return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          def md(s):
+              return html.escape(" ".join(str(s).split()), quote=False).replace("|", "\\|").replace("`", "'")
+
+          def summary(lines):
+              with open(os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          def not_examined(why):
+              print(f"::error::not examined: npm audit in {cmd(audit_dir)}: {cmd(why)}")
+              summary([f"- npm audit `{md(audit_dir)}`: **NOT EXAMINED**: {md(why)}"])
+              sys.exit(1)
+
+          def norm_dir(d):
+              if not d:
+                  return None
+              while d.startswith("./"):
+                  d = d[2:]
+              parts = [] if d in ("", ".") else d.rstrip("/").split("/")
+              if d.startswith("/") or any(p in ("", ".", "..") or not SEGMENT.fullmatch(p) for p in parts):
+                  return None
+              return "/".join(parts) or "."
+
+          def unique_keys(pairs):
+              keys = [k for k, _ in pairs]
+              if len(keys) != len(set(keys)):
+                  raise ValueError("duplicate key")
+              return dict(pairs)
+
+          here = norm_dir(audit_dir)
+          if here is None:
+              not_examined(f"audit directory {audit_dir!r} is not a plain relative path")
+          if level not in RANK:
+              not_examined(f"audit level {level!r} is not one of {', '.join(LEVELS)}")
+          floor = RANK[level]
+
+          # The exception file.
+          errors = []
+          exceptions = {}
+          listed = set()
+          path = os.path.join(root, ".github", "npm-audit-exceptions.json")
+          if os.path.lexists(path):
+              if os.path.islink(path) or not os.path.isfile(path) or \
+                      not os.path.realpath(path).startswith(os.path.realpath(root) + os.sep):
+                  not_examined(f"{NAME} is not a regular file inside the checkout")
+              with open(path, "rb") as fh:
+                  raw = fh.read(65537)
+              if len(raw) > 65536:
+                  not_examined(f"{NAME} is larger than 64 KiB")
+              try:
+                  doc = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys)
+              except (UnicodeDecodeError, ValueError) as exc:
+                  not_examined(f"{NAME} is not valid JSON with unique keys ({exc.__class__.__name__}), so none of its exceptions can be read")
+              if not isinstance(doc, dict) or set(doc) != {"exceptions"} or not isinstance(doc["exceptions"], list):
+                  not_examined(f'{NAME} must be an object whose only key is "exceptions", a list')
+              if len(doc["exceptions"]) > 200:
+                  not_examined(f"{NAME} lists more than 200 exceptions")
+              for i, e in enumerate(doc["exceptions"]):
+                  at = f"{NAME} exceptions[{i}]"
+                  if not isinstance(e, dict):
+                      not_examined(f"{at} is not an object")
+                  if set(e) - {"ghsa", "reason", "expires", "dirs"} or not {"ghsa", "reason", "expires"} <= set(e):
+                      not_examined(f"{at} must have ghsa, reason and expires, optionally dirs, and nothing else (has {sorted(e)})")
+                  ghsa, reason, expires = e["ghsa"], e["reason"], e["expires"]
+                  if not isinstance(ghsa, str) or not GHSA.fullmatch(ghsa):
+                      not_examined(f"{at}.ghsa {ghsa!r} is not a GHSA-xxxx-xxxx-xxxx id (lower case after GHSA-, as in the advisory URL)")
+                  if ghsa in listed:
+                      not_examined(f"{at}.ghsa {ghsa} is listed twice")
+                  listed.add(ghsa)
+                  if not isinstance(reason, str) or not reason.strip() or len(reason) > 500 or \
+                          any(ord(c) < 32 or ord(c) == 127 for c in reason):
+                      not_examined(f"{at}.reason must be a non-empty single line of at most 500 characters")
+                  try:
+                      if not isinstance(expires, str) or not DATE.fullmatch(expires):
+                          raise ValueError(expires)
+                      until = datetime.date.fromisoformat(expires)
+                  except ValueError:
+                      not_examined(f"{at}.expires {expires!r} is not a YYYY-MM-DD date")
+                  dirs = None
+                  if "dirs" in e:
+                      if not isinstance(e["dirs"], list) or not e["dirs"] or not all(isinstance(d, str) for d in e["dirs"]):
+                          not_examined(f"{at}.dirs must be a non-empty list of repo-relative directories")
+                      dirs = [norm_dir(d) for d in e["dirs"]]
+                      if None in dirs or len(set(dirs)) != len(dirs):
+                          not_examined(f"{at}.dirs holds a path that is not a plain relative directory, or a duplicate")
+                  if until < today:
+                      errors.append(f"npm audit exception {ghsa} expired on {expires} (UTC); fix the dependency, or renew the exception with a new expiry and reason")
+                  elif (until - today).days > MAX_DAYS:
+                      errors.append(f"npm audit exception {ghsa} expires {expires}, more than {MAX_DAYS} days out; a risk acceptance is re-decided at least every {MAX_DAYS} days")
+                  elif dirs is None or here in dirs:
+                      exceptions[ghsa] = {"reason": reason, "expires": expires, "covers": set()}
+
+          # The audit report.
+          try:
+              with open(report_path, encoding="utf-8") as fh:
+                  rep = json.load(fh)
+          except (OSError, UnicodeDecodeError, ValueError):
+              not_examined(f"npm audit (exit {npm_rc}) wrote no JSON report")
+          if not isinstance(rep, dict):
+              not_examined("the npm audit report is not a JSON object")
+          if "error" in rep:
+              err = rep["error"] if isinstance(rep["error"], dict) else {}
+              not_examined(f"npm audit could not run (exit {npm_rc}): {err.get('code', '?')}: {err.get('summary', rep['error'])}")
+          vulns = rep.get("vulnerabilities")
+          if rep.get("auditReportVersion") != 2 or not isinstance(vulns, dict) or npm_rc not in ("0", "1"):
+              not_examined(f"unrecognised npm audit report (auditReportVersion {rep.get('auditReportVersion')!r}, exit {npm_rc})")
+          for name, v in vulns.items():
+              if not isinstance(v, dict) or v.get("severity") not in RANK or not isinstance(v.get("via"), list):
+                  not_examined(f"report entry {name!r} has no known severity or via list")
+
+          def advisories(start):
+              """Every advisory that reaches `start`; a via string names another report entry."""
+              found, seen, stack = {}, set(), [start]
+              while stack:
+                  name = stack.pop()
+                  if name in seen:
+                      continue
+                  seen.add(name)
+                  if name not in vulns:
+                      not_examined(f"{start!r} is reached through {name!r}, which the report does not list")
+                  for via in vulns[name]["via"]:
+                      if isinstance(via, str):
+                          stack.append(via)
+                          continue
+                      if not isinstance(via, dict) or via.get("severity") not in RANK:
+                          not_examined(f"report entry {name!r} has an advisory without a known severity")
+                      m = URL.fullmatch(via["url"]) if isinstance(via.get("url"), str) else None
+                      key = m.group(1) if m else f"advisory source {via.get('source')!r} ({via.get('url')!r})"
+                      found[key] = {"ghsa": m.group(1) if m else None, "severity": via["severity"], "title": via.get("title", "")}
+              return found
+
+          at_level = sorted(n for n, v in vulns.items() if RANK[v["severity"]] >= floor)
+          if (npm_rc == "1") != bool(at_level):
+              not_examined(f"npm audit exit {npm_rc} disagrees with its report ({len(at_level)} package(s) at or above {level})")
+          failing = []
+          for name in at_level:
+              reach = {k: a for k, a in advisories(name).items() if RANK[a["severity"]] >= floor}
+              if not reach:
+                  not_examined(f"{name!r} is {vulns[name]['severity']} but no advisory at or above {level} reaches it")
+              unexcused = {k: a for k, a in reach.items() if a["ghsa"] not in exceptions}
+              if unexcused:
+                  failing.append((name, vulns[name]["severity"], unexcused))
+              else:
+                  for a in reach.values():
+                      exceptions[a["ghsa"]]["covers"].add(name)
+
+          lines = []
+          honoured = {g: x for g, x in sorted(exceptions.items()) if x["covers"]}
+          if honoured:
+              lines += [f"#### npm audit exceptions honoured in `{md(here)}`", "",
+                        "| Advisory | Reason | Expires | Packages excused |", "|---|---|---|---|"]
+          for g, x in honoured.items():
+              covers = ", ".join(sorted(x["covers"]))
+              print(f"::warning::npm audit exception honoured in {cmd(here)}: {g} (expires {x['expires']}): {cmd(x['reason'])}; excuses: {cmd(covers)}")
+              lines.append(f"| [{g}](https://github.com/advisories/{g}) | {md(x['reason'])} | {x['expires']} | {md(covers)} |")
+          for g, x in sorted(exceptions.items()):
+              if not x["covers"]:
+                  print(f"::notice::stale npm audit exception: {g} excused nothing at or above {level} in {cmd(here)}; remove it if it is no longer needed")
+                  lines.append(f"- stale npm audit exception `{g}`: excused nothing at or above {level} in `{md(here)}`")
+          for name, sev, unexcused in failing[:50]:
+              ids = "; ".join(f"{k} {a['title']}" for k, a in sorted(unexcused.items()))
+              print(f"::error::npm audit in {cmd(here)}: {cmd(name)} ({sev}): {cmd(ids)}")
+          if len(failing) > 50:
+              print(f"::error::npm audit in {cmd(here)}: and {len(failing) - 50} more package(s)")
+          for msg in errors:
+              print(f"::error::{cmd(msg)}")
+              lines.append(f"- **{md(msg)}**")
+          if lines:
+              summary(lines)
+          print(f"npm audit {here}: {len(at_level)} package(s) at or above {level}: "
+                f"{len(failing)} failing, {len(at_level) - len(failing)} excused by exception")
+          sys.exit(1 if failing or errors else 0)
+          PY
+            rm -f -- "$report"
+            [ "$verdict" -eq 0 ]
+          }
+          # <<< shared npm audit exceptions
           # yarn: `npm audit` needs a package-lock.json, so a yarn repo used to
           # fail here on every run. Each yarn flavour reports through its own
           # audit, and its exit code alone cannot tell "found something" from
@@ -704,7 +936,8 @@ jobs:
           if [ -f pnpm-lock.yaml ]; then
             pnpm audit --audit-level=high --config.ignore-pnpmfile=true
           else
-            npm audit --audit-level=high
+            # Exceptions: .github/npm-audit-exceptions.json at the checkout root (shared block above).
+            npm_audit_gate "$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)" "$DIR" high
           fi
 
   go-vulncheck:

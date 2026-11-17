@@ -82,6 +82,13 @@ def shared_detection(body: str) -> str:
     return body[start:body.index(SHARED_END, start) + len(SHARED_END)]
 
 
+CLEAN_REPORT = json.dumps({"auditReportVersion": 2, "vulnerabilities": {}, "metadata": {}})
+HIGH_REPORT = json.dumps({"auditReportVersion": 2, "vulnerabilities": {"left-pad": {
+    "name": "left-pad", "severity": "high", "via": [{
+        "source": 1, "name": "left-pad", "title": "t", "severity": "high",
+        "url": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc"}]}}, "metadata": {}})
+
+
 @pytest.fixture
 def env(tmp_path: Path) -> dict:
     """PATH with python3 bound to this interpreter, git reachable, and
@@ -93,13 +100,16 @@ def env(tmp_path: Path) -> dict:
     exe = Path(sys.executable).as_posix()
     shims = {
         "python3": f'#!/usr/bin/env bash\nexec "{exe}" "$@"\n',
-        # Records "npm /<dir-within-repo> <args>" and exits $SHIM_EXIT. The
+        # Records "npm /<dir-within-repo> <args>", prints the audit report in
+        # $SHIM_REPORT (a clean v2 report when unset) and exits $SHIM_EXIT. The
         # directory comes from git, so it is the same on every path form.
         # `npm ci` (the lockfile sync check) is logged as "npm-ci /<dir>" and
         # exits $SHIM_CI_EXIT, so audit expectations stay about the audit.
         "npm": ('#!/usr/bin/env bash\nrel=$(git rev-parse --show-prefix)\n'
                 'if [ "$1" = ci ]; then printf "npm-ci /%s %s\\n" "${rel%/}" "$*" >> "$CALL_LOG"; exit "${SHIM_CI_EXIT:-0}"; fi\n'
-                'printf "npm /%s %s\\n" "${rel%/}" "$*" >> "$CALL_LOG"\nexit "${SHIM_EXIT:-0}"\n'),
+                'printf "npm /%s %s\\n" "${rel%/}" "$*" >> "$CALL_LOG"\n'
+                'if [ -n "${SHIM_REPORT:-}" ]; then cat "$SHIM_REPORT"; else echo \'@CLEAN@\'; fi\n'
+                'exit "${SHIM_EXIT:-0}"\n').replace("@CLEAN@", CLEAN_REPORT),
         "cargo-audit": '#!/usr/bin/env bash\nprintf "cargo-audit %s\\n" "$*" >> "$CALL_LOG"\nexit "${SHIM_EXIT:-0}"\n',
     }
     for name, body in shims.items():
@@ -208,7 +218,7 @@ def test_nested_manifest_is_audited(tmp_path, env):
     })
     assert detect.returncode == 0, detect.stdout + detect.stderr
     assert audit.returncode == 0, audit.stdout + audit.stderr
-    assert calls == ["npm /frontend audit --package-lock-only --audit-level=high"]
+    assert calls == ["npm /frontend audit --json --audit-level=high --package-lock-only"]
     assert "`frontend`: clean at high" in summary
 
 
@@ -219,7 +229,7 @@ def test_every_manifest_is_audited(tmp_path, env):
         "web/node_modules/x/package.json": DEPS,
     })
     assert audit.returncode == 0, audit.stdout + audit.stderr
-    assert calls == ["npm / audit --package-lock-only --audit-level=high", "npm /web audit --package-lock-only --audit-level=high"]
+    assert calls == ["npm / audit --json --audit-level=high --package-lock-only", "npm /web audit --json --audit-level=high --package-lock-only"]
 
 
 def test_enabled_gate_with_no_manifest_fails(tmp_path, env):
@@ -252,14 +262,16 @@ def test_each_npm_level_is_passed_through(tmp_path, env, level):
     _, audit, calls, _ = gate(tmp_path, env, {"package.json": DEPS, "package-lock.json": LOCK},
                               NPM_AUDIT_LEVEL=level)
     assert audit.returncode == 0
-    assert calls == [f"npm / audit --package-lock-only --audit-level={level}"]
+    assert calls == [f"npm / audit --json --audit-level={level} --package-lock-only"]
 
 
 # --- examination -------------------------------------------------------------
 
 def test_an_advisory_fails_the_gate(tmp_path, env):
+    report = tmp_path / "report.json"
+    report.write_text(HIGH_REPORT, encoding="utf-8")
     _, audit, _, summary = gate(tmp_path, env, {"app/package.json": DEPS, "app/package-lock.json": LOCK},
-                                SHIM_EXIT="1")
+                                SHIM_EXIT="1", SHIM_REPORT=bash_path(report))
     assert audit.returncode == 1
     assert "`app`: **FAILED**" in summary
 
@@ -274,12 +286,13 @@ def test_one_failing_directory_fails_the_gate_but_all_run(tmp_path, env):
     npm.write_text('#!/usr/bin/env bash\nrel=$(git rev-parse --show-prefix)\n'
                    '[ "$1" = ci ] && exit 0\n'
                    'printf "npm /%s\\n" "${rel%/}" >> "$CALL_LOG"\n'
-                   'case "$rel" in a/) exit 1 ;; esac\nexit 0\n', encoding="utf-8", newline="\n")
+                   'case "$rel" in a/) exit 1 ;; esac\necho \'@CLEAN@\'\nexit 0\n'.replace("@CLEAN@", CLEAN_REPORT), encoding="utf-8", newline="\n")
     audit = run(step("npm-audit", "Run npm audit on every manifest")["run"], repo, env)
     assert audit.returncode == 1
     assert Path(env["_log"]).read_text(encoding="utf-8").splitlines() == ["npm /a", "npm /b"]
     summary = Path(env["_summary"]).read_text(encoding="utf-8")
     assert "`a`: **FAILED**" in summary and "`b`: clean at high" in summary
+    assert "wrote no JSON report" in audit.stdout, "a/ printed nothing: not examined, never clean"
 
 
 def test_a_lockfile_out_of_sync_is_not_examined(tmp_path, env):
@@ -339,7 +352,7 @@ def test_workspace_members_are_audited_through_their_root(tmp_path, env):
         "package.json": root_manifest, "package-lock.json": lock, "packages/a/package.json": DEPS,
     })
     assert audit.returncode == 0, audit.stdout + audit.stderr
-    assert calls == ["npm / audit --package-lock-only --audit-level=high"]
+    assert calls == ["npm / audit --json --audit-level=high --package-lock-only"]
     assert "`packages/a`: workspace member, audited through `.`" in summary
 
 
