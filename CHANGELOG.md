@@ -3,6 +3,26 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.10 - 2026-11-17
+
+Reusable release workflows fail closed on runner selection and verify gitleaks (work items
+ccfc277b and 67dbdbfb, GitHub-dependency audit 2026-11-17, brain ef2f6119).
+
+- `docker-release.yml` and `release-gates.yml` pick their runner as
+  `${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}`.
+  Before, a private repository whose `CI_RUNNER` variable was missing released on GitHub-hosted
+  compute with `packages: write` and the job token. Now a private repository resolves to
+  `CI_RUNNER` or `nexus-ci` and never to a hosted label (a missing variable queues on `nexus-ci`
+  instead of releasing elsewhere); a public repository keeps the hosted label. Deploy and notify
+  keep `[self-hosted, nexus-deploy]`. `scripts/tests/test_release_runner_selection.py` locks the
+  shape of every `runs-on` in both files and the gitleaks step.
+- `release-gates.yml` gitleaks: version 8.18.4 stays pinned and the archive's SHA-256 is now
+  pinned beside it and checked with `sha256sum -c` before `tar` touches it (before: `curl | tar`
+  straight into `/usr/local/bin`, unverified). When the runner image already carries gitleaks
+  8.18.4 (the nexus-ci golden image does from infra ci-vm user-data 2026-11-17) nothing is
+  downloaded; any other baked version refuses. cargo-audit already verified its archive the same
+  way (unchanged).
+
 ## 1.1.9 - 2026-11-16
 
 release-gates `npm_audit` examines every tracked npm manifest and fails closed (work item

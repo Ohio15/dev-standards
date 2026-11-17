@@ -103,7 +103,10 @@ on:
         default: ''
         description: |
           Runner label for the gates, read-docker-config and build-and-push jobs.
-          Default keeps GitHub-hosted behaviour for every existing consumer.
+          Default: the repository variable CI_RUNNER, else `nexus-ci` when the
+          repository is private, else `ubuntu-latest` (public repositories only;
+          a private repository can never resolve to a hosted label - work item
+          ccfc277b, 1.1.10).
           A single label only (e.g. `nexus-ci` for the fenced ephemeral-VM
           fleet in Ohio15/infra ci-vm/). Deploy and notify always run on
           [self-hosted, nexus-deploy] and are not affected by this input.
@@ -153,11 +156,14 @@ jobs:
       # Resolved here, not in release-gates: the gates call is pinned at @v1,
       # whose runs_on has no fallback, and an empty label fails the called
       # workflow at validation with no job created (canary v1-rc1, 2026-10-02).
-      runs_on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
+      # Private repository: CI_RUNNER or nexus-ci, never a hosted label (a
+      # missing variable queues on nexus-ci instead of releasing on GitHub-hosted
+      # compute with packages: write; ccfc277b). Public repository: hosted.
+      runs_on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
 
   read-docker-config:
     needs: gates
-    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       images: ${{ steps.parse.outputs.images }}
@@ -220,7 +226,7 @@ jobs:
 
   build-and-push:
     needs: [gates, read-docker-config]
-    runs-on: ${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     strategy:
       fail-fast: true
       matrix:
