@@ -784,20 +784,43 @@ jobs:
             exit 1
           fi
 
-          # The section for this version: from its '## [<version>]' heading to
-          # the next '## [' heading. Keep a Changelog shape, which §3 requires.
-          section=$(awk -v v="$VERSION" '
-            /^## \[/ { inside = (index($0, "[" v "]") > 0) }
-            inside { print }
-          ' CHANGELOG.md)
+          # >>> shared changelog section
+          # One definition, byte-identical in release-gates.yml (independence-note)
+          # and lib-release.yml (release notes); documented in release/SPEC.md
+          # "CHANGELOG sections", locked by scripts/tests/test_changelog_section.py.
+          # `changelog_section VERSION FILE` prints the FIRST section naming
+          # VERSION, its heading line included, up to (not including) the next
+          # level-2 heading. A heading names VERSION when it is `## ` followed by
+          # `[x.y.z]`, `x.y.z`, `vx.y.z` or `[vx.y.z]` and then end of line or a
+          # character that cannot continue a version (` — title`, ` - 2026-11-17`,
+          # `(date)`), so 0.14.80 and 0.14.8-rc.1 never name 0.14.8. Dots and `+`
+          # in VERSION are literal. Lines inside a ``` or ~~~ fence are body text,
+          # never headings. awk: `[[]` / `[]]` match the brackets (an escaped
+          # bracket in an awk string is read differently by mawk and gawk); no
+          # `{m,n}` intervals (older mawk lacks them).
+          changelog_section() {
+            awk -v ver="$1" '
+              BEGIN {
+                gsub(/[.+]/, "[&]", ver)
+                heading = "^##[ \t]+([[]v?" ver "[]]|v?" ver ")([^0-9A-Za-z._+-]|$)"
+              }
+              /^ ? ? ?(```|~~~)/ { fence = !fence }
+              !fence && /^##[ \t]/ { if (inside) exit; inside = ($0 ~ heading) }
+              inside { print }
+            ' "$2"
+          }
+          # <<< shared changelog section
+
+          # The section for this version, in any accepted heading form.
+          section=$(changelog_section "$VERSION" CHANGELOG.md)
           if [ -z "$section" ]; then
-            echo "::error::CHANGELOG.md has no '## [$VERSION]' section; the release notes must exist to carry the independence line."
+            echo "::error::CHANGELOG.md has no section for $VERSION (a '## [$VERSION]', '## $VERSION', '## v$VERSION' or '## [v$VERSION]' heading); the release notes must exist to carry the independence line."
             fail=1
           elif printf '%s\n' "$section" | grep -qiE '^[[:space:]]*[-*]?[[:space:]]*\**independence\**[[:space:]]*:'; then
             line=$(printf '%s\n' "$section" | grep -iE '^[[:space:]]*[-*]?[[:space:]]*\**independence\**[[:space:]]*:' | head -1 | sed 's/^[[:space:]]*//')
             echo "✓ release notes: $line" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::error::CHANGELOG.md section [$VERSION] has no 'independence:' line. Add 'independence: AI-1..AI-8 pass' or list the failing items with their IMPL numbers (STANDARDS §13.3 item 4)."
+            echo "::error::CHANGELOG.md section $VERSION has no 'independence:' line. Add 'independence: AI-1..AI-8 pass' or list the failing items with their IMPL numbers (STANDARDS §13.3 item 4)."
             fail=1
           fi
 

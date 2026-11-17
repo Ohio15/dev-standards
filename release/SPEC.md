@@ -169,6 +169,29 @@ Runs in parallel jobs; any failure aborts the release.
 | `npm_audit` | Runs `npm audit --package-lock-only --audit-level=<gates.npm_audit>` in every directory holding a tracked `package.json` (never `node_modules`; workspace members once, through the root whose lockfile names them; detection is the shared block of `security-audit.yml`). Each lockfile is first proven in sync with its manifest and folded members (`npm ci --dry-run --ignore-scripts`). Fails closed: enabled with no tracked `package.json` anywhere fails, and so does any manifest it cannot examine (dependencies but no `package-lock.json`, a lockfile out of sync, a pnpm/yarn lockfile, unreadable JSON). A manifest declaring no dependencies is examined and clean. Before 1.1.9 it checked the repo root only and passed with "skipping" (audit-keystone-2026-11-16). | Per-repo by setting `npm_audit: off`, which is also how a repo with no npm dependencies declares that. |
 | `tag_matches_version` | Asserts pushed tag matches `package.json:version`. Catches the "I forgot to bump" case. | No. |
 | `conventional_commits_lint` | Lints commit messages since previous tag. | Per-repo via `gates.conventional_commits: false`. |
+| `independence-note` | STANDARDS §13 (IMPL-34): a `RELEASE.md` or `docs/RELEASE.md` is committed and the CHANGELOG section for the version (see [CHANGELOG sections](#changelog-sections)) has an `independence:` line. Skipped for `independence: harness` and `-rc` tags. | Warn-mode soak (`continue-on-error`) until the soak ends; then no. |
+
+## CHANGELOG sections
+
+`independence-note` (release-gates) and the release notes of `lib-release`
+find a version's section in `CHANGELOG.md` with one shared detector, the
+`changelog_section` block marked `# >>> shared changelog section`,
+byte-identical in both workflows (`scripts/tests/test_changelog_section.py`).
+
+- A level-2 heading names version `x.y.z` in any of four forms:
+  `## [x.y.z]`, `## x.y.z`, `## vx.y.z`, `## [vx.y.z]`. Any suffix may follow
+  (` — title`, ` - 2026-11-17`, `(2026-11-17)`) as long as its first character
+  cannot continue a version: `## 0.14.80`, `## 0.14.8-rc.1` and `## 0.14.8.1`
+  do not name `0.14.8`. The awk pattern, with dots and `+` in the version made
+  literal, is
+  `^##[ 	]+([[]v?VER[]]|v?VER)([^0-9A-Za-z._+-]|$)`.
+- The section runs from that heading to the next `## ` heading, bracketed or
+  not; `### ` subheadings stay inside it. The first matching section wins.
+- Lines inside a ```` ``` ```` or `~~~` fence are body text: a heading shown in
+  a code example neither starts nor ends a section.
+- Before 1.1.11 `independence-note` accepted only `## [x.y.z]` and ran a
+  section on to the next `## [` heading (work item 36a8b0d6), and
+  `lib-release` carried a second, different heading regex.
 
 ## Caller workflow shape
 

@@ -3,6 +3,24 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.11 - 2026-11-17
+
+release-gates `independence-note` recognises every common CHANGELOG heading (work item
+36a8b0d6; n3xus-identity v0.14.8 release run 44152729472).
+
+- The gate found a version's section only under `## [x.y.z]`, so repos writing `## 0.14.8 — title`
+  (n3xus-identity, Keystone) failed with "CHANGELOG.md has no '## [VERSION]' section" although the
+  section and its `independence:` line existed; it also ran a section on to the next `## [`
+  heading, so in a bracket-free changelog an older release's independence line could count. One
+  shared detector, `changelog_section` (block `# >>> shared changelog section`, byte-identical in
+  `release-gates.yml` and `lib-release.yml`, which had its own different regex), now accepts
+  `## [x.y.z]`, `## x.y.z`, `## vx.y.z` and `## [vx.y.z]` with any suffix that cannot continue a
+  version (`## 0.14.80` and `## 0.14.8-rc.1` never name 0.14.8), bounds the section at the next
+  `## ` heading, and ignores headings inside ``` / ~~~ fences. Documented in `release/SPEC.md`
+  "CHANGELOG sections"; `scripts/tests/test_changelog_section.py` runs the block and both shipped
+  steps on every style, near misses and fences, under default awk, POSIX-mode gawk and mawk when
+  present. Still warn-mode soak.
+
 ## 1.1.10 - 2026-11-17
 
 Reusable release workflows fail closed on runner selection and verify gitleaks (work items
