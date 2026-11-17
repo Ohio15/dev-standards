@@ -3,6 +3,32 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.10 - 2026-11-17
+
+Reusable release workflows fail closed on runner selection and verify gitleaks (work items
+ccfc277b and 67dbdbfb, GitHub-dependency audit 2026-11-17, brain ef2f6119).
+
+- Every reusable release workflow (`docker-release.yml`, `release-gates.yml`, `lib-release.yml`,
+  `mcp-release.yml`, `electron-release.yml`) picks its runner as
+  `${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}`,
+  and each now declares the `runs_on` input. Before, a private repository whose `CI_RUNNER`
+  variable was missing released on GitHub-hosted compute with `packages: write`, `NPM_TOKEN` or
+  the signing secrets and the job token. Now an unset variable cannot select a hosted label for a
+  private repository (a missing variable queues on `nexus-ci` instead of releasing elsewhere); an
+  explicit `runs_on` or `CI_RUNNER` names whatever single label it holds; a public repository
+  keeps the hosted label. Deploy and notify keep `[self-hosted, nexus-deploy]`. The one hosted
+  `runs-on` left is the `electron-release.yml` build matrix (win and mac need a Windows or macOS
+  host for the platform build and code signing). `scripts/tests/test_release_runner_selection.py`
+  derives the file list from every `workflow_call` workflow, parses the YAML (every `runs-on`
+  spelling), names that matrix as the only permitted exception, proves the check goes red on a
+  reverted expression, and locks the gitleaks step.
+- `release-gates.yml` gitleaks: version 8.18.4 stays pinned and the archive's SHA-256 is now
+  pinned beside it and checked with `sha256sum -c` before `tar` touches it (before: `curl | tar`
+  straight into `/usr/local/bin`, unverified). When the runner image already carries gitleaks
+  8.18.4 (the nexus-ci golden image does from infra ci-vm user-data 2026-11-17) nothing is
+  downloaded; any other baked version refuses. cargo-audit already verified its archive the same
+  way (unchanged).
+
 ## 1.1.9 - 2026-11-16
 
 release-gates `npm_audit` examines every tracked npm manifest and fails closed (work item

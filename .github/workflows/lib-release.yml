@@ -21,6 +21,17 @@ name: lib-release
 
 on:
   workflow_call:
+    inputs:
+      runs_on:
+        type: string
+        default: ''
+        description: |
+          Runner label for every job of this workflow that is not pinned to a
+          host. Default: the repository variable CI_RUNNER, else `nexus-ci`
+          when the repository is private, else `ubuntu-latest` (public
+          repositories only). An unset variable cannot select a hosted label
+          for a private repository (work item ccfc277b, 1.1.10); an explicit
+          runs_on or CI_RUNNER names whatever single label it holds.
     secrets:
       NPM_TOKEN:
         required: false
@@ -41,7 +52,7 @@ jobs:
 
   read-lib-config:
     needs: gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     outputs:
       project: ${{ steps.parse.outputs.project }}
       changelog_path: ${{ steps.parse.outputs.changelog_path }}
@@ -86,7 +97,7 @@ jobs:
   npm-publish:
     needs: [gates, read-lib-config]
     if: needs.read-lib-config.outputs.npm_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,7 +160,7 @@ jobs:
       needs.gates.result == 'success' &&
       needs.read-lib-config.result == 'success' &&
       (needs.npm-publish.result == 'success' || needs.npm-publish.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

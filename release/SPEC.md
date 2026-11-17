@@ -277,9 +277,20 @@ repo waits its turn.
 
 ## Runner selection
 
-Reusable release workflows pick their runner as
-`${{ inputs.runs_on || vars.CI_RUNNER || 'ubuntu-latest' }}`; they are called
-from tag pushes only (see the caller shape above). Synced guard workflows
+Reusable release workflows (`docker-release.yml`, `release-gates.yml`,
+`lib-release.yml`, `mcp-release.yml`, `electron-release.yml`) pick their
+runner as
+`${{ inputs.runs_on || (github.event.repository.private && (vars.CI_RUNNER || 'nexus-ci')) || 'ubuntu-latest' }}`
+(dev-standards 1.1.10, work item ccfc277b): an explicit `runs_on` input wins;
+otherwise a private repository resolves to `CI_RUNNER` or, when the variable
+is unset, to `nexus-ci`; only a public repository gets the hosted literal. An
+UNSET variable cannot select a hosted label for a private repository; an
+explicit `runs_on` or `CI_RUNNER` names whatever single label it holds. The
+one exception is the `build` matrix job of `electron-release.yml`, whose win
+and mac targets need a Windows or macOS host for the platform build and code
+signing; it stays on the hosted matrix and the test names it as the only
+permitted hosted `runs-on`. They are called from tag pushes only (see the
+caller shape above). Synced guard workflows
 (`security-audit.yml`, `size-guard.yml`), which run on `pull_request`, pick it
 with the guarded SC-37 predicate (audit-dev-standards-2026-10-27; register
 amendment approved by Ron 2026-11-01 on #62):
@@ -292,10 +303,12 @@ literal. The variable only toggles between those two literals; it can never
 name another label. `install.sh` writes the hosted literal instead into any
 repository it cannot confirm is private, and dev-standards (public) carries
 the hosted literal in its own copies.
-For the reusable release workflows, set the repository variable `CI_RUNNER`
-to a self-hosted label (for example `nexus-ci`, the fenced ephemeral-VM
-runners on NEXUS) to move gates, tests and image builds there without editing
-any workflow; unset it to fall back to GitHub-hosted runners. Deploy and
+For the reusable release workflows, a private repository runs gates, tests
+and image builds on `nexus-ci` (the fenced ephemeral-VM runners on NEXUS) by
+default; set the repository variable `CI_RUNNER` to another self-hosted label
+to move them, or pass `runs_on` from the caller. Unsetting the variable does
+NOT fall back to GitHub-hosted runners for a private repository: a missing
+variable queues on `nexus-ci` instead of releasing elsewhere. Deploy and
 notify jobs keep their explicit `[self-hosted, nexus-deploy]` label because
 they must reach the host.
 The rule is mechanical, not a convention: a guard job reached from a FORK pull
