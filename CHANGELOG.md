@@ -3,6 +3,13 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.13 - 2026-11-18
+
+Decision binding: corrective plan and proposed STANDARDS §18 (docs only; no rule is in force until Ron ratifies).
+
+- `docs/plans/2026-11-18-decision-binding.md`: Rigor-format survey, root cause, options (incremental / rewrite the decision layer / full rewrite), recommendation B, phases P0-P7, SPEND, and the six 2026-11-18 cases as replay acceptance tests.
+- `docs/adr/0001-decision-binding-standard.md`: proposed §18 text (decisions are ledger records with scope and assertions; binding is computed, not recalled; artifacts are checked where written; Steward verifies independently and pages Ron; unknown is not clean).
+
 ## 1.1.12 - 2026-11-17
 
 npm advisory exceptions: one declarative, expiring, loud exception list honoured by both npm
