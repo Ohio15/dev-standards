@@ -3,6 +3,10 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.14 - 2026-11-18
+
+Decision binding, amendment (docs only): plan section 10 "Redesign for AI independence" answers Ron's two follow-ups. Seven principles (typed records; rules become code; the model proposes, deterministic code decides; Ron's decisions captured at the source by the APM answer form; recall is discovery only; model-agnostic harness with eval-gated autonomy; one verifier plus a scheduled blackhole drill), the stage sequence (stages 1-4 = P0-P7; stages 5-7 filed as work items f33dea53, 9e5391f8, bc458d2b), SPEND for stages 5-7 (~15-20 agent-days, ~2.5 h of Ron's time) and the residual risk (semantic contradictions outside the vocabulary are reported as "bound but unmatched", never clean; lesson `4c5ebec0`). Bound by `7e8c4616`, `111bfdb1`, `8bc6294e`.
+
 ## 1.1.13 - 2026-11-18
 
 Decision binding: corrective plan and proposed STANDARDS §18 (docs only; no rule is in force until Ron ratifies).

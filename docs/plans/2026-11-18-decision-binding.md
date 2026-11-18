@@ -294,3 +294,57 @@ SEAT CHECK: before anything was handed to Ron, the following were tried from thi
 No capability gap was handed over. Every gap above is a phase item.
 
 **GO on B**, subject to Ron's go on the decision item. P0 steps 3-4, and P1 design and implementation on a branch, can start before his answer. Neither changes behaviour until it is deployed, and deploying P1 adds routes without changing an existing one. Nothing here touches `35cb82ec`.
+
+---
+
+## 10. Redesign for AI independence (amendment, 2026-11-18)
+
+Ron asked two follow-ups after the plan was delivered. (1) "Are the things in place today the best approach?" No; the gaps are lesson `4c5ebec0` and are folded into the ADRs with this amendment (Shared-Brain ADR 0006 §3 coverage, sessionwatch ADR-0002 §3 scope sampling). (2) "How would you redesign with everything you know, planning for a future where you're unavailable and local AI is depended on?" This section is that answer, written so it can be ranked and built.
+
+**ASSUMED OBJECTIVE:** the system must hold its guarantees with no frontier model in the loop, and must get *slower*, never *less safe*, when the only model available is the local tier. That is the §13 AI-independence floor (AI-1..AI-8) applied to governance. The order of stages 5-7 below, and whether they run at all before P6 flips, is Ron's call; the seat recommends the order given.
+
+**Standing decisions this amendment is bound by (checked by hand, since the ledger does not exist yet):**
+- `7e8c4616` (Ron, 2026-10-28): Steward is a local agent of Ron's; reasoning goes to a frontier provider behind a provider abstraction, with a local model for triage, redaction and offline degraded mode; the provider and egress policy are open in the design workbook and nothing is built until Ron settles it. Stage 6 keeps that split and builds nothing provider-specific before the workbook is settled.
+- `111bfdb1` / `a14d5fed` (Ron, 2026-11-14): the local tier is Qwen3-Next-80B-A3B Q5_K_M on the llama.cpp server, kit `Ohio15/steward-inference` v0.1.0, weights on NEXUS. Stage 6's local model is that tier; nothing here picks a different one.
+- `8bc6294e`: option B. Stages 5-7 extend B; none of them reopens the rejected option C rewrite, and `35cb82ec` stays untouched.
+
+### 10.1 Principles
+
+The system drives the agent, not the reverse. Every guarantee lives in deterministic code at a boundary the model cannot skip; the model only proposes.
+
+1. **Typed records, not prose.** Decisions (ADR 0006), standards (§18), canonical docs, objectives, handoff steps and plans each get a schema. A handoff's EXACT NEXT STEPS and a plan's phases become ordered step records with `scope`, `practices_touched` and `mutates: bool`, not paragraphs the successor must parse. Prose remains as narrative attached to the record, never as the thing checked.
+2. **Rules become code.** Every CLAUDE.md rule that a machine can check moves to a server check, a hook, or an OPA policy (steward `governance/policy-schema/`). The count of instruction-only rules is a tracked metric that goes to zero; a rule that cannot be made checkable is labelled `human-only` and listed as such, so its reliance on the model is visible rather than assumed.
+3. **The model proposes, deterministic code decides.** A structured plan's steps go through the ledger checker (ADR 0006 §3) and then an executor that runs only checked steps. That is Steward's planner / PDP / executor loop (ADR-0004, `decision-model.md`) applied to sessions. P3's text-level binding gate is the first form of this; the step checker is its typed form and lands with the stage-2 records.
+4. **Capture Ron's decisions at the source.** The APM decision drawer gets a structured answer form (choice, scope dims, practices prohibited / required, governed docs). Submitting it calls `brain_decisions record` with `answers`, so the ledger record is written by the form, with no model involved. Case 2 (re-asking an answered question) becomes impossible without any AI in the path. This is scope added to P2 (`07bd74ea`) and an APM change filed alongside it.
+5. **Recall is discovery only.** `brain_recall` (local embeddings plus reranker, already AI-independent under §13) is for finding context. Obligations come only from the ledger's `binding` query. Domain, type and project are declared fields at write time; the LLM classification heuristic is retired for new writes.
+6. **Model-agnostic harness with eval-gated autonomy.** The session harness (cortex-hooks, the proxy, Steward) exposes one provider abstraction. Each task class (plan amendment, code change, release, board ranking, verification) has an eval suite; the six-case replay is the first. A model is admitted to autonomous operation of a task class by its eval score against a threshold Ron sets once; a class with no admitted model is `human-only` and shows up that way on the board and in the morning report. The frontier provider remains primary while it is reachable; the local tier (`111bfdb1`) runs whatever classes it has passed, and the rest queue for a human.
+7. **One verifier, everything on Ron's hardware, and a scheduled blackhole drill.** Steward is the single verifier; the sessionwatch Rust positions consolidate into the signed Steward bundle once the act plane is admitted (`93834cbb`). Shared-Brain, Steward, n3xus-notify and the local tier all run on NEXUS and the Steward rig. A scheduled drill (Steward ADR-0001 AI-1) cuts every frontier endpoint and proves that: binding still computes, stamps still land, pages still reach Ron, the board still ranks, and a release can still be cut from the committed runbook.
+
+### 10.2 Stage sequence
+
+| Stage | Content | Maps to |
+|---|---|---|
+| 1 | Ledger, write-time stamps, APM decision capture (principles 1, 4, 5) | P0, P1, P2 (+ the APM answer form) |
+| 2 | Typed handoffs, objectives and plans (principle 1) | P2 schema, P3 consumer |
+| 3 | Gates and the step checker (principle 3) | P3, P4 |
+| 4 | Steward verifies and pages (principle 7, first half) | P5, P6, P7 |
+| 5 | Rule migration: CLAUDE.md and STANDARDS rules to server, hook and OPA checks; instruction-only count tracked to zero (principle 2) | work item `f33dea53` |
+| 6 | Model-agnostic harness, per-class eval suites, admission by score; local tier runs admitted classes (principle 6) | work item `9e5391f8`; gated on the design workbook (`7e8c4616`) and on the rig bring-up (`111bfdb1`) |
+| 7 | Blackhole drill, scheduled; sessionwatch positions consolidate into the Steward bundle (principle 7, second half) | work item `bc458d2b`; gated on bundle admission (`93834cbb`) |
+
+Stages 1-4 are the plan as already filed (P0-P7). Stages 5-7 are filed as three work items with this amendment and ranked from the seat; they do not start before P6 unless Ron ranks them ahead.
+
+### 10.3 SPEND (stages 5-7)
+
+| Stage | Agent-days | Tokens (est.) | Gates / audits | Ron's time |
+|---|---|---|---|---|
+| 5 | 6-8 | ~8M | one gate per repo whose hooks change (cortex-hooks, Shared-Brain, steward); 1 audit before any rule is enforced in block mode | ~1 h (ratify the migrated rule set once; decide the `human-only` list) |
+| 6 | 6-8 (less if the rig is up and the workbook settled) | ~8M | 1 audit (provider abstraction is a runtime path, §13 AI-6 ADR) | ~45 min (eval thresholds; workbook answers already owed) |
+| 7 | 2-3, then a recurring drill of ~1 h agent time | ~2M | gate on the drill automation | ~45 min (observe the first drill; sign the drill runbook) |
+| **Total** | **~15-20 agent-days** | **~18M tokens** | **~4 gates, 2 audits** | **~2.5 h** |
+
+Dollars: $0 marginal for session work on the subscription; the only new runtime cost is the Steward rig's power when the local tier serves, which `111bfdb1` already accepted. Reviewer rounds are inside the gate and audit counts above.
+
+### 10.4 Residual risk
+
+A contradiction that is purely semantic, expressed in words outside every practice's vocabulary and not caught by scope intersection, is still invisible to the deterministic path. The amended ADR 0006 §3 makes that gap *reportable* (a decision that binds the artifact but matches nothing is "bound but unmatched", never clean), and the amended ADR-0002 makes it *sampled* (Steward checks scope against Ron's own words). What closes the gap is Ron confirming a miss, which feeds the vocabulary, or an advisory model reading the bound-but-unmatched set. The advisory read is allowed only as a proposer under principle 3 and only from an admitted model under principle 6; it is never the control. The measure of the residual is the count of contradictions Ron catches that the system did not, reported weekly in the morning report, with zero as the target and any non-zero week filed as an issue.
