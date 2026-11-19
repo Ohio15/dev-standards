@@ -289,7 +289,8 @@ jobs:
         run: |
           set -euo pipefail
           # >>> shared manifest detection: byte-identical in security-audit.yml and
-          # dep-auto-apply.yml (scripts/tests/test_dep_auto_apply_workflow.py).
+          # dep-auto-apply.yml (enforced in Ohio15/dev-standards by
+          # scripts/tests/test_dep_auto_apply_workflow.py).
           # Change both or neither.
           # Directories (repo-relative, "." for the root) that hold a tracked
           # manifest matching the pathspecs, as a JSON array.
@@ -1213,8 +1214,9 @@ jobs:
   # does to $GITHUB_PATH/$GITHUB_ENV reaches every later step of its job, so
   # the notification secrets live in the separate `notify` job. It runs no
   # dependency code. Do not add an install, build, test or setup-* step here;
-  # scripts/tests/test_dep_auto_apply_workflow.py fails the build if you do
-  # (it also pins the exact run: bodies of this job).
+  # in Ohio15/dev-standards, scripts/tests/test_dep_auto_apply_workflow.py
+  # fails the build if the template gains one (it also pins the exact run:
+  # bodies of this job). Change the template there, not a consumer copy.
   publish:
     needs: apply
     if: >-

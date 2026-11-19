@@ -314,7 +314,8 @@ jobs:
             *) echo "::error::release-config.yml gates.npm_audit: '${NPM_AUDIT_LEVEL:-}' is not one of off, info, low, moderate, high, critical"; exit 1 ;;
           esac
           # >>> shared manifest detection: byte-identical in security-audit.yml and
-          # dep-auto-apply.yml (scripts/tests/test_dep_auto_apply_workflow.py).
+          # dep-auto-apply.yml (enforced in Ohio15/dev-standards by
+          # scripts/tests/test_dep_auto_apply_workflow.py).
           # Change both or neither.
           # Directories (repo-relative, "." for the root) that hold a tracked
           # manifest matching the pathspecs, as a JSON array.
