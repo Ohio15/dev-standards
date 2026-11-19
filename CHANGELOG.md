@@ -3,6 +3,10 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.15 - 2026-11-19
+
+Workflow comments (no behaviour change): the citations of `scripts/tests/test_dep_auto_apply_workflow.py` in `templates/.github/workflows/dep-auto-apply.yml` (shared manifest detection block and the `publish` job note), `templates/.github/workflows/security-audit.yml`, and the own copies in `.github/workflows/` (`dep-auto-apply.yml`, `security-audit.yml`, `release-gates.yml`) now name the repo that holds the test (Ohio15/dev-standards). install.sh copies the templates byte-identical into consumer repos, where a bare repo-relative path pointed at a test that does not exist there and a consumer's security gate flagged it as SC-13 (claim without enforcement). The shared block stays byte-identical across all copies. Work item 9ed35b63.
+
 ## 1.1.14 - 2026-11-18
 
 Decision binding, amendment (docs only): plan section 10 "Redesign for AI independence" answers Ron's two follow-ups. Seven principles (typed records; rules become code; the model proposes, deterministic code decides; Ron's decisions captured at the source by the APM answer form; recall is discovery only; model-agnostic harness with eval-gated autonomy; one verifier plus a scheduled blackhole drill), the stage sequence (stages 1-4 = P0-P7; stages 5-7 filed as work items f33dea53, 9e5391f8, bc458d2b), SPEND for stages 5-7 (~15-20 agent-days, ~2.5 h of Ron's time) and the residual risk (semantic contradictions outside the vocabulary are reported as "bound but unmatched", never clean; lesson `4c5ebec0`). Bound by `7e8c4616`, `111bfdb1`, `8bc6294e`.
