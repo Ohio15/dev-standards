@@ -1,6 +1,6 @@
 # Ron's Dev/Deployment Standards
 
-**Scope:** Canonical reference for how code moves from author keystrokes to production-validated state across all Ron-owned repos. Covers memory conventions, repo hygiene, versioning, release gates, reusable-workflow promotion, build provenance, deploy contracts, observability, maintenance cadences, cleanup, incident protocols, explicit open questions, the application independence floor, discovered-issue triage, session objectives, shared services, and ownership of code and infra (sections 13-17).
+**Scope:** Canonical reference for how code moves from author keystrokes to production-validated state across all Ron-owned repos. Covers memory conventions, repo hygiene, versioning, release gates, reusable-workflow promotion, build provenance, deploy contracts, observability, maintenance cadences, cleanup, incident protocols, explicit open questions, the application independence floor, discovered-issue triage, session objectives, shared services, ownership of code and infra, and session handoff (sections 13-17 and 19).
 
 **Audience:** Ron, future supervisors of any AI session, and any human collaborator inheriting a Ron-owned project.
 
@@ -33,7 +33,7 @@ The shared-brain at `https://shared-brain.us` is the system of record for cross-
 | `feedback` | brain + ideally `~/.claude/projects/.../memory/feedback_*.md` | permanent, versioned | rigor-format, correct-over-easy |
 | `project` | brain with `project:<name>` tag | until project retired | APM port mappings |
 | `reference` | brain + `reference_*.md` where applicable | until invalidated | CF tunnel IDs |
-| `session-handoff` | brain with `session:<date>` tag | rolling 90 days | "this session shipped APM v0.9.2" |
+| `session-handoff` | brain, episodic, tags `["handoff","<id>"]` + `chain:<chain_id>` (§19) | open question, see §12 item 9 | "HANDOFF - AIBrowser 1Password lock state" |
 
 **Disk vs brain reality (current gap):** the `feedback_*.md` set on disk is incomplete. Only six files exist locally (`build-deployment-rule`, `capability-gap-build`, `correct-over-easy`, `rigor-format`, `shared-brain-token-burn`, `version-control-everything`). MEMORY.md and CLAUDE.md reference many additional rules (`proactive-brain-rules` / T1.x, `root-cause-analysis-required`, `realtime-brain-sync`, `data_preservation`, `dont_over_extend`, `measure_before_building`, `fix_self_review`, `shared-brain-updates`, `credential-rotation-protocol`, `implementation-guardrails`) — these survive only in shared-brain. Tracked as IMPL-1 in the implementation ledger.
 
@@ -780,6 +780,37 @@ New cross-cutting services join this table by PR when they are ratified. A capab
 |-----------|-------|--------|
 | Session rule in global `CLAUDE.md` + framework `feedback_own-the-code-and-infra.md` | every AI session | ACTIVE 2026-11-03 |
 | Plan review: a recommendation to adopt a vendor product for an estate platform component, without Ron's recorded decision and outside the §13 AI-6 list, is non-conforming. Audit signal: such a recommendation, or an owned component shipped without its conformance or audit evidence. | every plan, routine audit | ACTIVE 2026-11-03 (norm) |
+
+---
+
+## 19. Session Handoff
+
+(§18 is reserved for the decision-binding standard proposed in `docs/adr/0001-decision-binding-standard.md`.)
+
+**Ratified:** single-store rule, Ron 2026-08-22 (global `CLAUDE.md`, "Session handoffs live ONLY in shared-brain"). Delivery contract, lineage and observation amendments, Ron 2026-11-20 ("go with recommendations", panel synthesis `107560b5`, circumvention finding `12d4fa26`). This section is the canonical text of the handoff rule. The other places that state it (global `CLAUDE.md`, the cortex-hooks README, the `handoff.ts` and `session-hygiene.ps1` headers, and the directive text) must agree with it and point here.
+
+**Motivating case (2026-11-19 and 2026-11-20):** two successors inherited a stale shared-brain token and could not read their briefs (upstream 401). In the second case, handoff `cortex-20261120-134347-8729446fd58a` was recorded as consumed by the successor that could not read it. The parent's model told Ron the session was closing before any acknowledgement existed, the parent was closed, and nothing redelivered the brief. Both parents then bypassed the proxy with hand-written HTTP clients, so Steward never saw those writes. Steward's watchdog graded both sessions clear.
+
+**Rule:**
+
+1. **One record.** A handoff brief is a shared-brain memory: type episodic, tags `["handoff","<id>"]` plus `chain:<chain_id>`, verified by recall before the marker is written. The only file is the `<id>.ready.json` launch-trigger marker. Only the armed hygiene directive writes it, and it must carry a `memory_id`. No brief content goes in any file, and there is no degraded file mode. If the brain store fails, the handoff aborts and the parent stays open.
+2. **One path to shared-brain.** Every read and write goes through the brain-mcp-proxy MCP tools. A hand-written HTTP client to the shared-brain API, from a shell, a script or a scratch file, is forbidden. A broken MCP path means stop and report. The only allowed direct call is `GET /health`.
+3. **Delivered means acknowledged.** Directive delivery is at-least-once. A handoff counts as DELIVERED only when the successor's `handoff-consumed` memory, echoing the marker's ack-nonce, is verified. `consumed` (directive injected) and the verified ACK are separate gates and stay separate (decision `47b38ba9`). With no verified ACK by the deadline and the consuming session not alive, the retirement watcher alone redelivers the same nonce, under a compare-and-swap epoch, at most 3 times. After that the handoff is marked exhausted and Ron is paged through n3xus-notify. While the consumer is alive with no ACK, the watcher only alerts: both sessions alive is the safe failure mode.
+4. **The parent stays open until delivery.** The parent is never closed automatically without a verified ACK. Its model never tells the user the session is closing before that; it says the window stays open until the successor acknowledges.
+5. **Availability is not authorization.** The proxy's local replica serves reads during an upstream outage only. A credential rejection (401) is not an outage, and the replica never serves it (brain-mcp-proxy ADR 0001). Writes refused for a credential are never replayed under another principal. Stale credentials are fixed by bearer re-resolution, and only to the same principal.
+6. **Every lineage has a name.** A lineage carries `chain_id`, `chain_label` and `hop`. The successor is launched with `claude -n "<chain_label> - hop N"`, an allow-listed single argument, and its registry `label` is set. The current owner of a lineage is derived from shared-brain (the chain tag plus the latest verified ACK). No local ownership file is kept.
+7. **Steward watches.** Whether a handoff was acknowledged, a brain call failed, or a brain write went around MCP is judged by Steward's session watchdog (`steward-sessionwatch` positions), per §16. cortex-hooks does not build a second judge or a second paging path.
+
+### 19.1 Enforcement
+
+| Mechanism | Scope | Status |
+|-----------|-------|--------|
+| Single-store rule in global `CLAUDE.md`; `handoff.ts` refuses markers without `memory_id` | every AI session | ACTIVE 2026-08-22 |
+| Watcher-only capped redelivery, CAS epoch, honest parent wording (cortex-hooks, items `2c01e4c2`, `f7905127`) | every handoff | BUILDING 2026-11-20 |
+| PreToolUse guard denying direct shared-brain API calls (cortex-hooks, item `28b9a287`); activation in `settings.json` is human-run (protected floor) | every AI session | BUILDING 2026-11-20 |
+| Lineage labels and `claude -n` (cortex-hooks, item `65caf3e2`) | every successor launch | BUILDING 2026-11-20 |
+| Same-principal binding on bearer re-resolution (brain-mcp-proxy, item `0daab66a`); `CREDENTIAL_RECOVERY` stays off until the routine audit passes | every proxy | BUILDING 2026-11-20 |
+| Steward positions for unacknowledged handoffs, failed sync and writes outside MCP (steward-sessionwatch, item `606e970b`) | every session, every 5 minutes | BUILDING 2026-11-20 |
 
 ---
 
