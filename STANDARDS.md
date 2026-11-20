@@ -806,11 +806,11 @@ New cross-cutting services join this table by PR when they are ratified. A capab
 | Mechanism | Scope | Status |
 |-----------|-------|--------|
 | Single-store rule in global `CLAUDE.md`; `handoff.ts` refuses markers without `memory_id` | every AI session | ACTIVE 2026-08-22 |
-| Watcher-only capped redelivery, CAS epoch, honest parent wording (cortex-hooks, items `2c01e4c2`, `f7905127`) | every handoff | BUILDING 2026-11-20 |
-| PreToolUse guard denying direct shared-brain API calls (cortex-hooks, item `28b9a287`); activation in `settings.json` is human-run (protected floor) | every AI session | BUILDING 2026-11-20 |
-| Lineage labels and `claude -n` (cortex-hooks, item `65caf3e2`) | every successor launch | BUILDING 2026-11-20 |
-| Same-principal binding on bearer re-resolution (brain-mcp-proxy, item `0daab66a`); `CREDENTIAL_RECOVERY` stays off until the routine audit passes | every proxy | BUILDING 2026-11-20 |
-| Steward positions for unacknowledged handoffs, failed sync and writes outside MCP (steward-sessionwatch, item `606e970b`) | every session, every 5 minutes | BUILDING 2026-11-20 |
+| Watcher-only capped redelivery, CAS epoch, honest parent wording (cortex-hooks, items `2c01e4c2`, `f7905127`) | every handoff | ACTIVE 2026-11-20 (Ohio15/cortex-hooks#169, v0.101.0) |
+| PreToolUse guard denying direct shared-brain API calls (cortex-hooks, item `28b9a287`); activation in `settings.json` is human-run (protected floor) | every AI session | SHIPPED 2026-11-20 (Ohio15/cortex-hooks#171, v0.103.0); enforcing only once Ron registers it in `settings.json` |
+| Lineage labels and `claude -n` (cortex-hooks, item `65caf3e2`) | every successor launch | ACTIVE 2026-11-20 (Ohio15/cortex-hooks#171, v0.103.0) |
+| Same-principal binding on bearer re-resolution (brain-mcp-proxy, item `0daab66a`); `CREDENTIAL_RECOVERY` stays off until the routine audit passes | every proxy | ACTIVE 2026-11-20 (Ohio15/brain-mcp-proxy#27, 0.3.0-alpha.34); `CREDENTIAL_RECOVERY` still off |
+| Steward positions for unacknowledged handoffs, failed sync and writes outside MCP (steward-sessionwatch, item `606e970b`) | every session, every 5 minutes | ACTIVE 2026-11-20 (Ohio15/steward-sessionwatch#7, v0.2.1) |
 
 ---
 
