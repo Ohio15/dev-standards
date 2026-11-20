@@ -3,6 +3,14 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.17 - 2026-11-20
+
+Session handoff standard, enforcement status (docs): STANDARDS section 19.1 rows now cite what shipped. ACTIVE: watcher-only capped redelivery (Ohio15/cortex-hooks#169, v0.101.0), lineage labels and `claude -n` (Ohio15/cortex-hooks#171, v0.103.0), same-principal binding (Ohio15/brain-mcp-proxy#27, 0.3.0-alpha.34; `CREDENTIAL_RECOVERY` still off), Steward positions (Ohio15/steward-sessionwatch#7, v0.2.1). SHIPPED but not enforcing: the brain-direct PreToolUse guard (Ohio15/cortex-hooks#171); its `settings.json` registration is human-run and waits for the routine security audit (follow-up e0d4e152).
+
+## 1.1.16 - 2026-11-20
+
+Session handoff standard (docs): new STANDARDS §19 is the canonical handoff rule. It covers: one record in shared-brain; one path to it (no hand-written HTTP clients); delivered means a verified nonce ACK, with watcher-only capped redelivery; the parent stays open and says so; a credential rejection is never served from the replica or replayed under another principal; named lineages via `claude -n`; Steward's watchdog is the judge. The §1 `session-handoff` storage-class row now matches the real tags. §18 is left reserved for the proposed decision-binding standard. Ratified by Ron 2026-11-20 ("go with recommendations"); panel synthesis `107560b5`, circumvention finding `12d4fa26`.
+
 ## 1.1.15 - 2026-11-19
 
 Workflow comments (no behaviour change): the citations of `scripts/tests/test_dep_auto_apply_workflow.py` in `templates/.github/workflows/dep-auto-apply.yml` (shared manifest detection block and the `publish` job note), `templates/.github/workflows/security-audit.yml`, and the own copies in `.github/workflows/` (`dep-auto-apply.yml`, `security-audit.yml`, `release-gates.yml`) now name the repo that holds the test (Ohio15/dev-standards). install.sh copies the templates byte-identical into consumer repos, where a bare repo-relative path pointed at a test that does not exist there and a consumer's security gate flagged it as SC-13 (claim without enforcement). The shared block stays byte-identical across all copies. Work item 9ed35b63.
