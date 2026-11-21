@@ -3,6 +3,28 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.18 - 2026-11-21
+
+Security register SC-63..SC-68 graduated from audit-n3xus-notify-2026-11-21.2, approved by Ron
+2026-11-21 (decision 29e9eb74): tag-triggered release deploying without proving the tagged commit
+passed the default-branch gates (SC-63); caller text forwarded to a downstream that parses an
+inline directive grammar (SC-64); a network-facing service holding a credential wider than its one
+action (SC-65); authorization by bare string prefix with no delimiter (SC-66); a globally capped
+shared store whose eviction crosses tenants (SC-67); a rate limiter keyed only on authenticated
+identity (SC-68). SC-54 amended: its enumerated invisible code points now include U+115F, U+1160,
+U+3164, U+FFA0, U+2800, U+034F, U+FE00-U+FE0F and private use. Both register copies updated
+identically (65 rules). Consumer copies installed by install.sh need re-sync.
+
+Board approval rule (docs): new STANDARDS §14.7. No agent action on the work-queue board ends in
+an outright block; what needs Ron becomes an approval request he approves in batches with a
+passkey, and agents never use the board key. Ratified by Ron 2026-11-21 (decisions f5575b41,
+5d4cddb1). Enforcement rows cite shared-brain 7.96.0 (flag off until its routine audit) and
+cortex-hooks DR-041 (warn) and DR-042 (block), v0.104.0.
+
+Pre-commit test bound: `.pre-commit-tests` TEST_TIMEOUT 900 -> 1800. The full scripts/tests suite
+now measures 955 s on paxson (1422 passed, 33 skipped; slowest single test 14 s), so the 900 s
+bound killed a green suite and refused every commit touching a tested path.
+
 ## 1.1.17 - 2026-11-20
 
 Session handoff standard, enforcement status (docs): STANDARDS section 19.1 rows now cite what shipped. ACTIVE: watcher-only capped redelivery (Ohio15/cortex-hooks#169, v0.101.0), lineage labels and `claude -n` (Ohio15/cortex-hooks#171, v0.103.0), same-principal binding (Ohio15/brain-mcp-proxy#27, 0.3.0-alpha.34; `CREDENTIAL_RECOVERY` still off), Steward positions (Ohio15/steward-sessionwatch#7, v0.2.1). SHIPPED but not enforcing: the brain-direct PreToolUse guard (Ohio15/cortex-hooks#171); its `settings.json` registration is human-run and waits for the routine security audit (follow-up e0d4e152).
