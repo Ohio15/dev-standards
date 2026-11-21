@@ -696,6 +696,28 @@ The weights and goals file is Ron's: Steward and sessions change it only on his 
 | Norm coverage | cortex-hooks DR-032 (§14), tier `norm` |
 | Seat ranking in the norm text | ALIGNED 2026-11-09 (cortex-hooks v0.95.5; this section, §14, §14.3 and §15). Ron corrected sessions three times (2026-11-02, 2026-11-05, 2026-11-09) for ending by handing him the Inbox to rank: this rubric was ratified, but the governing text still said "until Ron ranks it" and "Ron ranking the board", and sessions followed the text. Lessons `59361a42`, `8d454362` |
 
+### 14.7 Board actions are requested, never blocked
+
+**Ratified 2026-11-21 (Ron, decision `f5575b41`):** "fix the board so that NOTHING is blocked by an agent. instead, items that require me are approved by me - not outright blocked ... global policy, rule, hook." Design: decision `5d4cddb1`.
+
+**Rule.**
+
+1. No agent action on the work-queue board ends in an outright block. An action that needs Ron's authority (closing, editing, re-ranking or moving an item Ron ranked or is working, a board-only change) becomes an **approval request**. The request is stored with the exact change and the agent continues.
+2. A request is **not done**. The agent reports it as `NOT APPLIED — awaiting Ron (request <uuid>)`, cites the request id, and never claims the change as made.
+3. Where the server cannot yet store a request, the agent files a `kind: decision` item with the exact change and continues. It never hands the change to Ron in prose.
+4. Ron approves with a passkey through n3xus-identity, in **batches**: one touch signs a digest over a selected set, and he is told by digest notification, never one prompt per request.
+5. **Agents never use the board key.** Board authority is Ron's; an agent seat that can read the key is a defect (security finding `7bc188d2`, work item `6f071ba3`), not a route.
+6. Input-validation errors are not approvals: a malformed call stays an error the agent fixes.
+
+**Enforcement.**
+
+| Mechanism | Scope | Status |
+|---|---|---|
+| Shared-brain approval requests (7.96.0, flag `WORK_QUEUE_APPROVAL_REQUESTS`): an approvable refusal is stored as a request and returned as `NOT APPLIED`; close capacity is reserved so no append can make an item uncloseable (incident `906cb149`) | shared-brain work queue | SHIPPED off; the flag flip waits for the routine shared-brain audit |
+| cortex-hooks DR-041 (warn): `board-request-backstop` on `brain_commitments` results, plus claim-check CHECK 5 (`board_claim`, `board_handoff`) | every AI session | SHIPPED (cortex-hooks v0.104.0); `settings.json` registration is human-run |
+| cortex-hooks DR-042 (block): `board-key-guard` refuses reads of board key material through shell, file and Windows-MCP channels | every AI session | SHIPPED (cortex-hooks v0.104.0), interim containment; `settings.json` registration is human-run |
+| Phase 2: passkey-bound batch approval, APM "Needs you" queue, board key removed from agent reach | shared-brain + APM + n3xus-identity | PENDING (work item `227339d8`) |
+
 ## 15. Session Objective
 
 **Ratified 2026-10-28 (Ron):** "Every session declares an objective and its done criteria in the first response and stops once they are met." Decision memory `52817d26`, superseding proposal `77a3272c`.

@@ -976,14 +976,24 @@ leaving bidi overrides, isolates, zero-width characters and line or paragraph
 separators, which reorder, hide or forge lines. steward-sessionwatch
 2026-11-10: the notifier's sanitizer (M13).
 **Check.** For each sanitizer feeding a trusted sink, assert it removes or
-escapes U+200B-U+200D, U+2028-U+2029, U+202A-U+202E, U+2066-U+2069 and U+FEFF
-(grep the function for these ranges, or a unit test with each code point).
-Absent = FINDING.
+escapes U+200B-U+200D, U+2028-U+2029, U+202A-U+202E, U+2066-U+2069 and U+FEFF,
+plus the invisible letters and marks outside Cf that `\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}`
+admits: U+115F, U+1160, U+3164 and U+FFA0 (Hangul fillers), U+2800 (braille
+blank), U+034F (combining grapheme joiner), U+FE00-U+FE0F (variation
+selectors) and private-use characters (grep the function for these ranges, or
+a unit test with each code point). Absent = FINDING.
 **Fix form.** Strip or escape the Unicode format (Cf) and line/paragraph
 separator (Zl/Zp) classes alongside C0/C1, with a unit test per code point.
 **Since.** approved 2026-11-10.
 **Origin.** audit-steward-sessionwatch-2026-11-10 (MEDIUM M13; approved by Ron
 2026-11-10, shared-brain b37ab3ef).
+**Amended.** 2026-11-21, approved by Ron (decision 29e9eb74;
+audit-n3xus-notify-2026-11-21.2, LOW, `http/src/validate.ts:52-60` and
+`sink-email/src/index.ts:298-299`, 1 of 3 reviewers). A sanitizer built on
+`\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}` passed the original enumeration while
+admitting characters that render invisibly but are letters or marks; the
+Check now lists them. Fix form: explicit ranges for those code points, or an
+allow-list character class for trusted titles.
 
 ### SC-55 · A finding is marked resolved on absence rather than on a satisfied predicate
 **Shape.** A monitor clears an open finding (and its retry or undelivered
@@ -1147,6 +1157,121 @@ that *an* attestation of the right shape and age exists somewhere.
 bound to the item", shared-brain `lib/work-items.js` `closeEvidenceRefProblem`,
 1 of 3 reviewers; approved by Ron 2026-11-14, decision 2a3eb88e).
 
+### SC-63 · A tag-triggered release that deploys without proving the tagged commit passed the default-branch gates
+**Shape.** A workflow on `push: tags` builds, publishes and deploys, while
+tests and audits run only on `pull_request` and pushes to the default branch,
+and the release itself disables them (`tests: false`, `npm_audit: off`).
+Nothing checks that the tagged commit is an ancestor of the default branch or
+carries a passing CI status, so any pusher can tag an unreviewed commit and
+ship it. A comment asserting "the PR gates cover what a tag can be cut from"
+is the usual companion.
+**Check.** `grep -nE "^\s*tags:" .github/workflows/*.yml`; for each
+release/deploy job so triggered (including reusable workflows it calls), grep
+for `merge-base --is-ancestor`, a commit-status/check-run query on
+`github.sha`, or a re-run of the test job. None present = FINDING. Mechanical
+test: tag a commit that exists only on a side branch; the release must refuse
+before build.
+**Fix form.** The release job refuses a tag whose commit is not an ancestor of
+the default branch, and requires a passing CI status for that SHA (or re-runs
+the tests on the tag).
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (MEDIUM, `release.yml:16,24` +
+`release-config.yml:18,21`, 1 of 3 reviewers; approved by Ron 2026-11-21,
+decision 29e9eb74).
+
+### SC-64 · Caller text forwarded to a downstream that parses an inline directive grammar
+**Shape.** A sink forwards caller-supplied text to a consumer that interprets
+in-band directives (`MEDIA:` attachment tokens, `[[reply_to:...]]`, escape
+sequences such as a literal `\n` it expands, template or markdown commands).
+This side validates the text as inert (control/format characters only), but
+the consumer lifts directives out of it and acts on them: fetching URLs,
+reading files, threading replies, under the sender's trusted identity.
+**Check.** For every sink that forwards caller text to another program,
+identify the consumer's parser for that field (grep the consumer for
+`parse.*Directive|MEDIA:|\[\[` or its documented directive syntax) and assert
+the sink neutralises every directive token, or uses a consumer mode that does
+not parse them. A mechanical test: send each directive form through the sink
+and assert the consumer receives it as literal text.
+**Fix form.** Neutralise the consumer's directive grammar at the sink, or
+select a send mode that treats the field as plain text.
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (MEDIUM,
+`sink-signal/src/index.ts:129-151` → OpenClaw
+`message-action-runner.ts:406-447`, 1 of 3 reviewers; approved by Ron
+2026-11-21, decision 29e9eb74).
+
+### SC-65 · A network-facing service holds a credential whose scope exceeds the one action it performs
+**Shape.** A service that performs one narrow action on a peer (send a
+message, publish to a topic) is configured with that peer's general-purpose
+credential (a gateway-wide auth token, an admin key). Compromise of the
+service, of its environment, or of the token in transit then grants every
+capability of the peer, not just the action. Typical when a local, single-user
+tool is promoted to a network service and keeps the local tool's credential.
+**Check.** For each credential a network-facing service resolves (grep config
+for `*_env`/`tokenEnv`/secret references), find the issuer's documentation or
+policy for that credential's scope and compare it with the set of
+endpoints/tools the service actually calls (grep the client code). Scope wider
+than the call set = FINDING.
+**Fix form.** Issue a credential scoped to the single action (per-caller,
+tool-restricted), or route through a send-only relay that holds the broad
+credential on the peer's side.
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (MEDIUM, `http/src/dispatch.ts:59`
+OpenClaw `gateway.auth.token`, 2 of 3 reviewers; approved by Ron 2026-11-21,
+decision 29e9eb74).
+
+### SC-66 · Authorization by bare string prefix with no delimiter
+**Shape.** A policy grants access to a namespace by `startsWith(prefix)` on
+caller-supplied names (topics, paths, bucket keys, channels) without requiring
+the prefix to end in a delimiter or the name to continue with one. `keystone`
+then also grants `keystoneadmin`, a different tenant's namespace.
+**Check.** `grep -rnE "startsWith\(|\.HasPrefix\(|LIKE\s+'[^']*%'" ` on
+authorization paths; every hit must either require the configured prefix to
+end in a delimiter (validated at config load) or check that the character
+after the prefix is a delimiter. Fixture: prefix `abc` must refuse `abcd` and
+accept `abc-x`.
+**Fix form.** Require a trailing delimiter on configured prefixes, or match on
+whole path segments / exact allow-lists.
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (LOW, `http/src/validate.ts:198` +
+`config.ts:371-377`, 1 of 3 reviewers; approved by Ron 2026-11-21, decision
+29e9eb74).
+
+### SC-67 · A globally capped shared store whose eviction crosses tenants
+**Shape.** A cache, idempotency or dedupe store shared by several
+authenticated callers is bounded by one global entry cap with LRU/oldest-first
+eviction. One caller within its own rate limit fills the cap and evicts other
+callers' unexpired entries, breaking their guarantee (duplicate delivery, lost
+dedupe, cache-poisoning windows) with only a warning logged.
+**Check.** For each store keyed by caller identity, grep the eviction path
+(`maxEntries`, `evict`, `delete(` on overflow) for a per-tenant count or
+quota. A single global counter with cross-tenant eviction = FINDING.
+Mechanical test: caller A inserts one key, caller B inserts `maxEntries` keys;
+A's key must survive until its TTL.
+**Fix form.** Per-tenant quota inside the global cap; refuse (429) the tenant
+at its quota instead of evicting others.
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (LOW,
+`http/src/idempotency.ts:207-216`, 2 of 3 reviewers; approved by Ron
+2026-11-21, decision 29e9eb74).
+
+### SC-68 · A rate limiter keyed only on authenticated identity
+**Shape.** The limiter's key is the caller's token id, so it applies only
+after authentication succeeds. Unauthenticated and failed-authentication
+traffic is unlimited, each failure writes a log line without bound, and behind
+a reverse proxy the logged source is the proxy, hiding the attacker.
+**Check.** Locate the limiter call in the request pipeline (`grep -n
+"rateLimit\|limiter\|take(" `); if it runs after the auth check and is keyed
+on the authenticated principal, confirm a separate pre-auth limiter keyed on
+source address exists. Absent = FINDING. Confirm failure logs record the
+forwarded client address, trusted only from the known proxy.
+**Fix form.** Add a per-source limiter before authentication, and log the
+forwarded client address from trusted proxies only.
+**Since.** approved 2026-11-21.
+**Origin.** audit-n3xus-notify-2026-11-21.2 (LOW,
+`http/src/server.ts:119-121`, 1 of 3 reviewers; approved by Ron 2026-11-21,
+decision 29e9eb74).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -1167,7 +1292,10 @@ approved 2026-10-29. SC-51..SC-52 (audit-dev-standards-2026-10-30),
 approved 2026-11-01. SC-53..SC-55 (audit-steward-sessionwatch-2026-11-10),
 approved 2026-11-10. SC-56..SC-57 (audit-shared-brain-2026-11-13),
 approved 2026-11-14. SC-58..SC-61 (audit-cortex-hooks-2026-11-14),
-approved 2026-11-14. SC-62 (audit-shared-brain-2026-11-14), approved 2026-11-14. SC-37 amended 2026-10-27 (same-repo pull requests on
+approved 2026-11-14. SC-62 (audit-shared-brain-2026-11-14), approved 2026-11-14.
+SC-63..SC-68 (audit-n3xus-notify-2026-11-21.2), approved 2026-11-21, decision
+29e9eb74; SC-54 amended 2026-11-21 (invisible code points beyond Cf, same
+decision). SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.
