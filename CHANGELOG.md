@@ -3,6 +3,13 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.19 - 2026-11-21
+
+Seat ranks are proposals (docs): STANDARDS 14.5 no longer tells sessions to apply rubric ranks through the APM
+board key. Under 14.7 rule 5 agents never use the board key, so until the proposed-rank write ships (018a4cf5)
+a session records its ranks as a proposal memory and Ron or Steward applies them. Ron chose this 2026-11-21
+(work item cf7b2b5b, option "Proposals only").
+
 ## 1.1.18 - 2026-11-21
 
 Security register SC-63..SC-68 graduated from audit-n3xus-notify-2026-11-21.2, approved by Ron
