@@ -2,10 +2,16 @@
 # Weekly npm-audit roll-up across all Node.js repos under one or more roots.
 #
 # For each repo containing package.json:
-#   * runs `npm audit --json`
-#   * runs `npm audit --omit=dev --json`
-#   * captures totals by severity
+#   * picks the auditor from the committed lockfile: npm-shrinkwrap.json or
+#     package-lock.json -> npm; pnpm-lock.yaml -> pnpm (npm wins when both)
+#   * runs `npm audit --json` + `npm audit --omit=dev --json`, or
+#     `pnpm audit --json` + `pnpm audit --prod --json`
+#   * captures totals by severity (both tools emit .metadata.vulnerabilities)
 #   * best-effort cross-references against CISA KEV
+#
+# A repo with no lockfile is reason "no-lockfile" (its dependencies are not
+# pinned, so there is nothing to audit: a repo defect). A yarn or bun lockfile
+# is "unsupported-lockfile:<tool>" (an exporter gap). Both are unexamined.
 #
 # Writes per-repo + roll-up to <output-dir>/npm-audit-<YYYY-MM-DD>.json.
 #
@@ -32,6 +38,31 @@
 # files this script creates, the public registry, strict-ssl on, proxies off
 # and scripts off. A tree that cannot be staged is status "error", never ok.
 #
+# pnpm gets the same isolation, adapted to what pnpm actually reads (probed
+# against pnpm 12.21.0 under corepack 0.34.6 on NEXUS, 2026-11-22):
+#   * pnpm-workspace.yaml is config, not only a package list: its `registry:`
+#     redirects the audit (probed: a dead registry there hangs the audit) and
+#     it can carry auditConfig, overrides and configDependencies. The repo's
+#     copy is never staged. The script writes its own `packages: []`, which
+#     also ends pnpm's search for a workspace root above the scratch dir. The
+#     audit reads the dependency graph from the lockfile's importers (workspace
+#     packages included), so workspace manifests are not staged either:
+#     probed, staging them plus the repo's yaml gives identical counts on all
+#     three estate pnpm repos.
+#   * package.json is rebuilt by jq from its name, version and dependency
+#     fields only, dropping "pnpm" (overrides, auditConfig ignores),
+#     "packageManager" and "devEngines" (corepack and pnpm fetch and run the
+#     version a repo names). COREPACK_ENABLE_PROJECT_SPEC=0 keeps corepack on
+#     the operator's pnpm whatever a parent dir's package.json names.
+#   * pnpm 12 ignores npm_config_* for settings and reads pnpm_config_*, but
+#     still takes registry from npm_config_userconfig and settings from
+#     $XDG_CONFIG_HOME/pnpm/config.yaml (all probed). Both prefixes are pinned
+#     (older pnpm reads npm_config_*), the userconfig is the empty file and
+#     XDG_CONFIG_HOME an empty dir. .npmrc and .pnpmfile.cjs are never staged.
+#   * repo audit ignores (pnpm auditConfig) are dropped on purpose: this is the
+#     operator's estate count, and accepted risk lives in the operator's
+#     .github/npm-audit-exceptions.json, never in the scanned repo.
+#
 # Designed to run from cron weekly. Idempotent.
 
 set -uo pipefail
@@ -54,7 +85,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help)
       cat <<USAGE
-npm-audit-weekly.sh — weekly npm audit roll-up
+npm-audit-weekly.sh — weekly npm/pnpm audit roll-up
 
 Usage: $0 [--root <path>]... [--output-dir <dir>] [--brain-store] [--dry-run]
 
@@ -136,7 +167,7 @@ json_str() {
   printf '"%s"' "$s"
 }
 
-# Validate one `npm audit --json` result. Prints "" when it carries a usable
+# Validate one `npm audit --json` / `pnpm audit --json` result. Prints "" when it carries a usable
 # severity summary, else a short reason token. A result is usable only if it is
 # a JSON object with no .error and .metadata.vulnerabilities holding all five
 # numeric severities. "Nothing found" and "the audit never ran" are different
@@ -144,7 +175,13 @@ json_str() {
 audit_file_problem() {
   local file="$1" rc="$2"
   if [[ "$rc" == "124" ]]; then echo "audit-timeout"; return; fi
-  if [[ ! -s "$file" ]]; then echo "audit-no-output(rc=$rc)"; return; fi
+  if [[ ! -s "$file" ]]; then
+    # pnpm reports its failures (ERR_PNPM_BROKEN_LOCKFILE, ...) on stderr only.
+    local code=""
+    [[ -f "$file.err" ]] && code="$(grep -o 'ERR_PNPM_[A-Z0-9_]*' "$file.err" 2>/dev/null | head -1 | cut -c1-80)"
+    if [[ -n "$code" ]]; then echo "audit-error:$code"; else echo "audit-no-output(rc=$rc)"; fi
+    return
+  fi
   if ! jq -e 'type == "object"' < "$file" >/dev/null 2>&1; then
     echo "audit-output-unparseable(rc=$rc)"; return
   fi
@@ -177,6 +214,24 @@ repo_regular_file() {
     [[ -L "$cur" ]] && return 1
   done
   [[ -f "$cur" ]]
+}
+
+# The lockfile a repo commits, as "<tool>:<file>", or "" for none.
+# npm-shrinkwrap.json wins over package-lock.json as npm itself prefers it,
+# and npm over pnpm so a repo carrying both keeps its npm result. Presence
+# counts a symlink too, so a symlinked lockfile is refused at staging rather
+# than read as absent.
+lockfile_kind() {
+  local repo="$1" f
+  for f in npm-shrinkwrap.json package-lock.json; do
+    if [[ -e "$repo/$f" || -L "$repo/$f" ]]; then echo "npm:$f"; return; fi
+  done
+  if [[ -e "$repo/pnpm-lock.yaml" || -L "$repo/pnpm-lock.yaml" ]]; then echo "pnpm:pnpm-lock.yaml"; return; fi
+  if [[ -e "$repo/yarn.lock" || -L "$repo/yarn.lock" ]]; then echo "yarn:yarn.lock"; return; fi
+  for f in bun.lock bun.lockb; do
+    if [[ -e "$repo/$f" || -L "$repo/$f" ]]; then echo "bun:$f"; return; fi
+  done
+  echo ""
 }
 
 # Copy what `npm audit` reads (package.json, the lockfile, every workspace
@@ -213,12 +268,32 @@ stage_audit_tree() {
   done <<<"$keys"
 }
 
-# Run one audit of the staged tree $1 into $2 with a timeout; echoes the exit
-# code. The environment is the whole npm configuration (header).
+# Stage what `pnpm audit` reads from repo $1 into the empty dir $2: the
+# lockfile verbatim, a package.json rebuilt from its dependency fields only,
+# and a pnpm-workspace.yaml this script writes (header). Echoes "" when staged,
+# else a reason token. Never copies the repo's pnpm-workspace.yaml, .npmrc,
+# .pnpmfile.cjs, workspace manifests or anything else.
+stage_pnpm_tree() {
+  local repo="$1" dest="$2" f
+  for f in package.json pnpm-lock.yaml; do
+    if ! repo_regular_file "$repo" "$f"; then echo "stage-refused:$f-not-a-regular-file"; return; fi
+  done
+  if ! cp -- "$repo/pnpm-lock.yaml" "$dest/pnpm-lock.yaml"; then echo "stage-copy-failed:pnpm-lock.yaml"; return; fi
+  if ! jq -e 'type == "object"' < "$repo/package.json" >/dev/null 2>&1 \
+     || ! jq '{name, version, dependencies, devDependencies, optionalDependencies, peerDependencies}
+              | with_entries(select(.value != null))' < "$repo/package.json" > "$dest/package.json" 2>/dev/null; then
+    echo "stage-manifest-unparseable"; return
+  fi
+  if ! printf 'packages: []\n' > "$dest/pnpm-workspace.yaml"; then echo "stage-copy-failed:pnpm-workspace.yaml"; return; fi
+}
+
+# Run one audit by tool $1 ("npm" or "pnpm") of the staged tree $2 into $3
+# (stderr into $3.err) with a timeout; echoes the exit code. The environment
+# is the whole package-manager configuration (header).
 run_audit() {
-  local tree="$1" out="$2"; shift 2
+  local tool="$1" tree="$2" out="$3"; shift 3
   local rc=0
-  local -a npm_env=(
+  local -a pm_env=(
     npm_config_userconfig="$NPM_USERCONFIG"
     npm_config_globalconfig="$NPM_GLOBALCONFIG"
     npm_config_registry="https://registry.npmjs.org/"
@@ -229,10 +304,27 @@ run_audit() {
     npm_config_update_notifier=false
     npm_config_fund=false
   )
+  if [[ "$tool" == "pnpm" ]]; then
+    pm_env+=(
+      pnpm_config_registry="https://registry.npmjs.org/"
+      pnpm_config_strict_ssl=true
+      pnpm_config_proxy=false
+      pnpm_config_https_proxy=false
+      pnpm_config_ignore_scripts=true
+      pnpm_config_update_notifier=false
+      npm_config_manage_package_manager_versions=false
+      pnpm_config_manage_package_manager_versions=false
+      XDG_CONFIG_HOME="$PNPM_XDG_CONFIG"
+      COREPACK_ENABLE_PROJECT_SPEC=0
+      COREPACK_ENABLE_AUTO_PIN=0
+      COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+      COREPACK_DEFAULT_TO_LATEST=0
+    )
+  fi
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    ( cd "$tree" && env "${npm_env[@]}" "$TIMEOUT_BIN" "$AUDIT_TIMEOUT" npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
+    ( cd "$tree" && env "${pm_env[@]}" "$TIMEOUT_BIN" "$AUDIT_TIMEOUT" "$tool" audit "$@" --json > "$out" 2>"$out.err" ) || rc=$?
   else
-    ( cd "$tree" && env "${npm_env[@]}" npm audit "$@" --json > "$out" 2>/dev/null ) || rc=$?
+    ( cd "$tree" && env "${pm_env[@]}" "$tool" audit "$@" --json > "$out" 2>"$out.err" ) || rc=$?
   fi
   echo "$rc"
 }
@@ -247,6 +339,8 @@ NPM_USERCONFIG="$TMP_DIR/npmrc-user"
 NPM_GLOBALCONFIG="$TMP_DIR/npmrc-global"
 : > "$NPM_USERCONFIG"
 : > "$NPM_GLOBALCONFIG"
+PNPM_XDG_CONFIG="$TMP_DIR/xdg-config"
+mkdir -p "$PNPM_XDG_CONFIG"
 
 AUDIT_TIMEOUT="${AUDIT_TIMEOUT:-180}"
 TIMEOUT_BIN=""
@@ -254,6 +348,7 @@ if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="$(command -v timeout)";
 
 HAVE_JQ="false"; command -v jq >/dev/null 2>&1 && HAVE_JQ="true"
 HAVE_NPM="false"; command -v npm >/dev/null 2>&1 && HAVE_NPM="true"
+HAVE_PNPM="false"; command -v pnpm >/dev/null 2>&1 && HAVE_PNPM="true"
 KEV_CHECKED="false"; [[ -n "$KEV_CVES" ]] && KEV_CHECKED="true"
 
 declare -A SEV_TOTALS
@@ -278,28 +373,37 @@ for repo in "${REPOS[@]}"; do
   reason=""
   full_json="$RAW_DIR/$name.full.json"
   prod_json="$RAW_DIR/$name.prod.json"
+  lock="$(lockfile_kind "$repo")"
+  tool="${lock%%:*}"
+  lockfile="${lock#*:}"
 
-  if [[ "$HAVE_NPM" != "true" ]]; then
+  if [[ -z "$lock" ]]; then
+    # Nothing pins the dependency tree, so no auditor can examine it.
+    reason="no-lockfile"
+  elif [[ "$tool" != "npm" && "$tool" != "pnpm" ]]; then
+    reason="unsupported-lockfile:$tool"
+  elif [[ "$tool" == "npm" && "$HAVE_NPM" != "true" ]]; then
     reason="npm-missing"
+  elif [[ "$tool" == "pnpm" && "$HAVE_PNPM" != "true" ]]; then
+    reason="pnpm-missing"
   elif [[ "$HAVE_JQ" != "true" ]]; then
     reason="jq-missing"
-  elif [[ ! -f "$repo/package-lock.json" && ! -f "$repo/npm-shrinkwrap.json" ]]; then
-    # npm audit reads the lockfile only; without one it errors ENOLOCK, and a
-    # repo that locks with yarn/pnpm cannot be examined by this script.
-    reason="missing-lockfile"
   else
     tree="$STAGE_DIR/$repo_idx"
     if ! mkdir -- "$tree"; then
       reason="stage-dir-failed"
+    elif [[ "$tool" == "pnpm" ]]; then
+      reason="$(stage_pnpm_tree "$repo" "$tree")"
     else
       reason="$(stage_audit_tree "$repo" "$tree")"
     fi
   fi
   if [[ -z "$reason" ]]; then
-    # npm audit exits non-zero on findings, so the exit code alone says nothing;
+    # Both audits exit non-zero on findings, so the exit code alone says nothing;
     # the JSON body decides (audit_file_problem). Only 124 (timeout) is read from rc.
-    full_rc="$(run_audit "$tree" "$full_json")"
-    prod_rc="$(run_audit "$tree" "$prod_json" --omit=dev)"
+    if [[ "$tool" == "pnpm" ]]; then prod_flag="--prod"; else prod_flag="--omit=dev"; fi
+    full_rc="$(run_audit "$tool" "$tree" "$full_json")"
+    prod_rc="$(run_audit "$tool" "$tree" "$prod_json" "$prod_flag")"
     problem="$(audit_file_problem "$full_json" "$full_rc")"
     [[ -n "$problem" ]] && reason="full:$problem"
     if [[ -z "$reason" ]]; then
@@ -313,8 +417,9 @@ for repo in "${REPOS[@]}"; do
     REPOS_ERROR=$(( REPOS_ERROR + 1 ))
     ERROR_LINES+=("$name: $reason")
     echo "  UNEXAMINED $name: $reason" >&2
-    entry=$(printf '{"repo":%s,"path":%s,"status":"error","reason":%s,"critical":null,"high":null,"moderate":null,"low":null,"info":null,"prod_critical":null,"prod_high":null,"kev_cves":null,"kev_checked":false}' \
-      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$reason")")
+    lock_json="null"; [[ -n "$lock" ]] && lock_json="$(json_str "$lockfile")"
+    entry=$(printf '{"repo":%s,"path":%s,"status":"error","reason":%s,"lockfile":%s,"critical":null,"high":null,"moderate":null,"low":null,"info":null,"prod_critical":null,"prod_high":null,"kev_cves":null,"kev_checked":false}' \
+      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$reason")" "$lock_json")
   else
     REPOS_OK=$(( REPOS_OK + 1 ))
     crit=$(jq -r '.metadata.vulnerabilities.critical' < "$full_json")
@@ -327,9 +432,11 @@ for repo in "${REPOS[@]}"; do
 
     # Collect CVE IDs from advisory entries; intersect with KEV (best effort,
     # reported via kev_checked so a failed KEV fetch is not read as "no KEV hits").
+    # npm: .vulnerabilities[].via[].url; pnpm: .advisories[].cves[] and .url.
     cves=$(jq -r '
-      [ .vulnerabilities[]?.via[]? | select(type=="object") | .url // empty ]
-      | map(capture("CVE-[0-9]{4}-[0-9]+"; "g")?.[]?)
+      ( [ .vulnerabilities[]?.via[]? | select(type=="object") | .url // empty ]
+        + [ .advisories[]? | ((.cves // [])[]?), (.url // empty) ] )
+      | map(strings | capture("CVE-[0-9]{4}-[0-9]+"; "g")?.[]?)
       | unique[]?
     ' < "$full_json" 2>/dev/null | sort -u || true)
     kev_hits=""
@@ -343,8 +450,8 @@ for repo in "${REPOS[@]}"; do
     SEV_TOTALS[low]=$(( SEV_TOTALS[low] + low ))
     SEV_TOTALS[info]=$(( SEV_TOTALS[info] + info ))
 
-    entry=$(printf '{"repo":%s,"path":%s,"status":"ok","reason":null,"critical":%s,"high":%s,"moderate":%s,"low":%s,"info":%s,"prod_critical":%s,"prod_high":%s,"kev_cves":%s,"kev_checked":%s}' \
-      "$(json_str "$name")" "$(json_str "$repo")" "$crit" "$high" "$mod" "$low" "$info" "$pcrit" "$phigh" \
+    entry=$(printf '{"repo":%s,"path":%s,"status":"ok","reason":null,"lockfile":%s,"critical":%s,"high":%s,"moderate":%s,"low":%s,"info":%s,"prod_critical":%s,"prod_high":%s,"kev_cves":%s,"kev_checked":%s}' \
+      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$lockfile")" "$crit" "$high" "$mod" "$low" "$info" "$pcrit" "$phigh" \
       "$(json_str "$kev_hits")" "$KEV_CHECKED")
   fi
 

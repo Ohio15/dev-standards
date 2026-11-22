@@ -19,7 +19,7 @@ Shared enforcement artifacts for Ron-owned repos. Drop-in protection against the
 | `install.sh` | One-shot installer that wires the guards into a target repo. |
 | `scripts/repo-hygiene-scan.py` | Weekly hygiene scanner — drift, misconfig, noise, idle repos. Scans top-level repos plus one namespace level (`<root>/<ns>/<repo>`). |
 | `scripts/hygiene-scan-cron.sh` | Cron entry point: fast-forwards the dev-standards checkout, then runs the scanner. The NEXUS checkout was found 46 commits behind on 2026-09-11 because nothing else advanced it. |
-| `scripts/npm-audit-weekly.sh` | Weekly `npm audit` roll-up + KEV cross-reference. |
+| `scripts/npm-audit-weekly.sh` | Weekly `npm audit` / `pnpm audit` roll-up + KEV cross-reference. |
 | `credential-rotation/PROTOCOL.md` | Credential rotation protocol v1. |
 | `security/SECURITY-CHECKS.md` | The per-session security REGISTER: enumerated defect shapes (SC-01…SC-38; SC-26…SC-28 reserved), each with a mechanical check. `install.sh` copies it to the target repo root; `/security-gate` reviews every change against it. |
 | `security/REVIEW-MODEL.md` | The two-tier review model (capped per-session gate + scheduled routine audit with dead-man), operator knobs, and the load-bearing rule. Ratified 2026-09-04. |
@@ -285,9 +285,9 @@ python scripts/repo-hygiene-scan.py \
 
 ### `scripts/npm-audit-weekly.sh`
 
-Weekly `npm audit` roll-up across every Node.js repo under the configured roots. Per-repo it runs `npm audit --json` (full) and `npm audit --omit=dev --json` (prod-only), aggregates totals by severity, and best-effort cross-references the CISA KEV (Known Exploited Vulnerabilities) feed for each finding.
+Weekly `npm audit` roll-up across every Node.js repo under the configured roots. The committed lockfile picks the auditor: `package-lock.json`/`npm-shrinkwrap.json` runs `npm audit --json` (full) and `npm audit --omit=dev --json` (prod-only); `pnpm-lock.yaml` runs `pnpm audit --json` and `pnpm audit --prod --json` (npm wins when a repo has both). It aggregates totals by severity and best-effort cross-references the CISA KEV (Known Exploited Vulnerabilities) feed for each finding. Neither tool ever runs inside a scanned repo or reads its config (`.npmrc`, `pnpm-workspace.yaml`, package.json `pnpm`/`packageManager`); see the script header for the probed isolation model.
 
-Unknown is never clean. Each repo entry has `status` `ok` or `error` (+ `reason`). `ok` requires both audits to return a numeric `.metadata.vulnerabilities` summary with no `.error`; any failure (ENOLOCK, network, registry, timeout, empty or unparseable output, no `package-lock.json`/`npm-shrinkwrap.json`, `npm` or `jq` missing) yields `status:"error"` with every count `null`, never 0. The roll-up carries the same `status` plus `repos_ok`/`repos_error`; its totals cover examined repos only. Consumers must read a count only from `status:"ok"` entries.
+Unknown is never clean. Each repo entry has `status` `ok` or `error` (+ `reason`) and `lockfile` (the file audited, or null). `ok` requires both audits to return a numeric `.metadata.vulnerabilities` summary with no `.error`; any failure (ENOLOCK, `ERR_PNPM_*`, network, registry, timeout, empty or unparseable output, `no-lockfile`, `unsupported-lockfile:yarn`/`:bun`, `npm`, `pnpm` or `jq` missing) yields `status:"error"` with every count `null`, never 0. The roll-up carries the same `status` plus `repos_ok`/`repos_error`; its totals cover examined repos only. Consumers must read a count only from `status:"ok"` entries.
 
 Exit codes: 3 if `THRESH_CRIT` (default 1) or `THRESH_HIGH` (default 3) thresholds are crossed; 4 if any repo (or the whole run) could not be examined. Both are non-zero so cron mail picks them up, and a report is written either way. `AUDIT_TIMEOUT` (default 180) bounds each audit in seconds.
 

@@ -136,9 +136,10 @@ if (( ${#reports[@]} != 1 )); then
   exit 1
 fi
 
-# 4. npm audit (degradable, bounded). npm-audit-weekly.sh owns the npm
-#    configuration: it never runs npm inside a mirrored repo (package.json and
-#    the lockfiles are staged into an operator tree with no .npmrc) and pins
+# 4. npm audit (degradable, bounded). npm-audit-weekly.sh owns the npm and
+#    pnpm configuration: it never runs either inside a mirrored repo
+#    (package.json and the lockfile are staged into an operator tree with no
+#    .npmrc and, for pnpm, a script-written pnpm-workspace.yaml) and pins
 #    userconfig/globalconfig to empty files, the registry, strict-ssl, proxies
 #    and scripts itself (audit 2026-11-10.2 M3). The pins below are redundant
 #    belt-and-braces for any npm call made before the script's own.
