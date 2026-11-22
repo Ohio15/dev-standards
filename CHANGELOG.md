@@ -3,6 +3,29 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.20 - 2026-11-22
+
+`scripts/npm-audit-weekly.sh` audits pnpm repos. Steward's pos-code-dependency-vulns read blind-scan for
+five repos because the script only knew npm lockfiles and labelled every other repo "missing-lockfile".
+Three of them (n3xus-identity, n3xus-notify, nexus-realervnc) commit `pnpm-lock.yaml`; the other two
+(notification-service, openclaw) commit no lockfile at all.
+
+- pnpm-lock.yaml repos run `pnpm audit --json` and `pnpm audit --prod --json`; the entry fields are
+  unchanged, so `code-standards-facts.py` needs no change. npm still wins when a repo has both.
+- Same isolation model as npm (audit 2026-11-10.2 M3, SC-07/SC-12), fitted to what pnpm 12.21.0 was
+  probed to read: the repo's pnpm-workspace.yaml is never staged (its `registry:` redirects the audit
+  and beats npm_config_* env; the script writes `packages: []`), package.json is rebuilt by jq from its
+  dependency fields (drops "pnpm" overrides/auditConfig, "packageManager", "devEngines"), pnpm_config_*
+  pins alongside npm_config_*, XDG_CONFIG_HOME an empty dir, COREPACK_ENABLE_PROJECT_SPEC=0. Lockfile
+  and manifest must be regular files with no symlink on the path. Workspace manifests are not staged:
+  the audit reads importers from the lockfile, and staging them gives identical counts on all three repos.
+- Reasons split: "no-lockfile" (nothing pins the tree, a repo defect), "unsupported-lockfile:yarn" /
+  ":bun", "pnpm-missing", and pnpm's stderr-only failures as "audit-error:ERR_PNPM_*". All unexamined.
+- Each entry carries `lockfile` (the file audited, or null).
+
+Probed against the NEXUS mirrors 2026-11-22: the three pnpm repos go from error to ok, the two others
+read no-lockfile, and the eleven npm repos are identical to that day's cron run.
+
 ## 1.1.19 - 2026-11-21
 
 Seat ranks are proposals (docs): STANDARDS 14.5 no longer tells sessions to apply rubric ranks through the APM

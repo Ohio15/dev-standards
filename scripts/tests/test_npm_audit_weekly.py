@@ -69,6 +69,52 @@ exit 99
 
 FAKE_CURL = "#!/usr/bin/env bash\nexit 1\n"  # KEV fetch fails fast; the script tolerates it.
 
+# The fake pnpm reads its mode from the staged lockfile, the one file staged
+# verbatim (package.json is rebuilt from its dependency fields, so a mode key
+# there would be dropped). Same JSON shape as pnpm 12.21.0's `audit --json`
+# (advisories + metadata.vulnerabilities); failures go to stderr only, as real
+# pnpm's do (probed 2026-11-22).
+FAKE_PNPM = r"""#!/usr/bin/env bash
+mode="$(sed -n 's/^# fake_mode: *\([a-z]*\).*/\1/p' pnpm-lock.yaml 2>/dev/null | head -1)"
+prod="$(sed -n 's/^# fake_mode_prod: *\([a-z]*\).*/\1/p' pnpm-lock.yaml 2>/dev/null | head -1)"
+for a in "$@"; do
+  if [ "$a" = "--prod" ] && [ -n "$prod" ]; then mode="$prod"; fi
+done
+mode="${mode:-clean}"
+if [ -n "${FAKE_NPM_LOG:-}" ]; then
+  log="$FAKE_NPM_LOG/pnpm-$$.log"
+  { echo "cwd=$(pwd)"; echo "args=$*"; env | grep -E '^(npm_config_|pnpm_config_|COREPACK_|XDG_CONFIG_HOME=)' | sort
+    echo "--- ls"; ls -A; echo "--- manifest"; cat package.json; echo; echo "--- workspace"; cat pnpm-workspace.yaml
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then echo "--- xdg"; ls -A "$XDG_CONFIG_HOME"; fi; } > "$log"
+fi
+vuln() {
+  printf '{"advisories":{},"metadata":{"vulnerabilities":{"info":0,"low":%s,"moderate":%s,"high":%s,"critical":%s},"dependencies":1,"devDependencies":0,"optionalDependencies":0,"totalDependencies":1}}' "$1" "$2" "$3" "$4"
+}
+case "$mode" in
+  clean)      vuln 0 0 0 0; exit 0 ;;
+  findings)   vuln 1 2 3 4; exit 1 ;;
+  devonly)    vuln 0 0 0 0; exit 0 ;;
+  brokenlock) printf 'Error: ERR_PNPM_BROKEN_LOCKFILE\n\n  x load the lockfile\n' >&2; exit 1 ;;
+  silent)     exit 1 ;;
+esac
+exit 99
+"""
+
+
+def _make_pnpm_repo(root: Path, name: str, mode: str, *, prod_mode: str | None = None,
+                    manifest_extra: dict | None = None) -> Path:
+    repo = root / name
+    (repo / ".git").mkdir(parents=True)
+    manifest = {"name": name, "version": "1.0.0", "dependencies": {"a": "^1.0.0"},
+                "devDependencies": {"b": "^2.0.0"}}
+    manifest.update(manifest_extra or {})
+    (repo / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    lock = f"lockfileVersion: '9.0'\n# fake_mode: {mode}\n"
+    if prod_mode is not None:
+        lock += f"# fake_mode_prod: {prod_mode}\n"
+    (repo / "pnpm-lock.yaml").write_text(lock, encoding="utf-8")
+    return repo
+
 
 def _make_repo(root: Path, name: str, mode: str, *, lockfile: bool = True, prod_mode: str | None = None) -> None:
     repo = root / name
@@ -84,19 +130,21 @@ def _make_repo(root: Path, name: str, mode: str, *, lockfile: bool = True, prod_
 def _fake_bin(tmp_path: Path) -> Path:
     bindir = tmp_path / "fakebin"
     bindir.mkdir()
-    for name, body in (("npm", FAKE_NPM), ("curl", FAKE_CURL)):
+    for name, body in (("npm", FAKE_NPM), ("pnpm", FAKE_PNPM), ("curl", FAKE_CURL)):
         path = bindir / name
         path.write_text(body, encoding="utf-8", newline="\n")
         path.chmod(0o755)
     return bindir
 
 
-def _run(tmp_path: Path, repos: dict[str, str | tuple], *, env_extra: dict[str, str] | None = None,
+def _run(tmp_path: Path, repos: dict[str, object], *, env_extra: dict[str, str] | None = None,
          path_override: str | None = None):
     root = tmp_path / "root"
     root.mkdir()
     for name, spec in repos.items():
-        if isinstance(spec, tuple):
+        if callable(spec):
+            spec(root, name)
+        elif isinstance(spec, tuple):
             _make_repo(root, name, spec[0], **spec[1])
         else:
             _make_repo(root, name, spec)
@@ -160,7 +208,10 @@ def test_every_failure_mode_is_unexamined_not_zero(mixed_run) -> None:
     for mode, reason in FAILURE_MODES.items():
         _assert_unexamined(_entry(report, mode), reason)
     _assert_unexamined(_entry(report, "prodonly"), "prod:audit-error:ENOLOCK")
-    _assert_unexamined(_entry(report, "nolock"), "missing-lockfile")
+    _assert_unexamined(_entry(report, "nolock"), "no-lockfile")
+    assert _entry(report, "nolock")["reason"] == "no-lockfile"
+    assert _entry(report, "nolock")["lockfile"] is None
+    assert _entry(report, "good")["lockfile"] == "package-lock.json"
     assert "UNEXAMINED" in proc.stdout
 
 
@@ -218,7 +269,7 @@ def _tools_dir(tmp_path: Path, *, jq: bool) -> Path:
     tools = tmp_path / "tools"
     tools.mkdir()
     wanted = ["bash", "mktemp", "date", "mkdir", "rm", "sort", "comm", "sed", "tr", "cut", "basename",
-              "uname", "cat", "dirname", "sleep", "timeout", "env", "head"]
+              "uname", "cat", "dirname", "sleep", "timeout", "env", "head", "cp", "grep", "ls"]
     if jq:
         wanted.append("jq")
     for tool in wanted:
@@ -395,3 +446,177 @@ def test_a_symlinked_lockfile_is_unexamined_never_read(tmp_path: Path) -> None:
         globals()["_make_repo"] = orig
     assert proc.returncode == 4
     _assert_unexamined(_entry(report, "lnk"), "package-lock.json-not-a-regular-file")
+
+
+# ── pnpm-lock.yaml repos (Steward blind-scan, 2026-11-22) ──
+# The same isolation as npm: pnpm never runs in the repo, and none of the repo's
+# pnpm config (pnpm-workspace.yaml, package.json "pnpm"/"packageManager",
+# .npmrc, .pnpmfile.cjs) reaches the audit.
+
+HOSTILE_WORKSPACE = ("packages:\n  - 'packages/*'\nregistry: http://127.0.0.1:9/\n"
+                     "auditConfig:\n  ignoreGhsas:\n    - GHSA-xxxx-xxxx-xxxx\n")
+
+
+def _pnpm(mode: str, **kw):
+    return lambda root, name: _make_pnpm_repo(root, name, mode, **kw)
+
+
+@pytest.fixture(scope="module")
+def lockfile_kinds_run(tmp_path_factory: pytest.TempPathFactory):
+    def yarn(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean", lockfile=False)
+        (root / name / "yarn.lock").write_text("# yarn lockfile v1\n", encoding="utf-8")
+
+    def bun(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean", lockfile=False)
+        (root / name / "bun.lock").write_text("{}", encoding="utf-8")
+
+    def both(root: Path, name: str) -> None:
+        _make_repo(root, name, "findings")  # npm lockfile, npm fake reports findings
+        (root / name / "pnpm-lock.yaml").write_text("# fake_mode: clean\n", encoding="utf-8")
+
+    def badmanifest(root: Path, name: str) -> None:
+        _make_pnpm_repo(root, name, "clean")
+        (root / name / "package.json").write_text("{not json", encoding="utf-8")
+
+    repos = {
+        "pclean": _pnpm("clean"),
+        "pfind": _pnpm("findings", prod_mode="devonly"),
+        "pbroken": _pnpm("brokenlock"),
+        "psilent": _pnpm("silent"),
+        "pprodbroken": _pnpm("clean", prod_mode="brokenlock"),
+        "pbadmanifest": badmanifest,
+        "yarnrepo": yarn,
+        "bunrepo": bun,
+        "bothlocks": both,
+        "nolock": ("clean", {"lockfile": False}),
+    }
+    return _run(tmp_path_factory.mktemp("kinds"), repos)
+
+
+@needs_jq
+def test_pnpm_lockfile_is_audited_with_prod_counts(lockfile_kinds_run) -> None:
+    _, report = lockfile_kinds_run
+    clean = _entry(report, "pclean")
+    assert (clean["status"], clean["reason"], clean["lockfile"]) == ("ok", None, "pnpm-lock.yaml")
+    assert all(clean[k] == 0 for k in COUNT_KEYS)
+    found = _entry(report, "pfind")
+    assert found["status"] == "ok"
+    assert (found["critical"], found["high"], found["moderate"], found["low"], found["info"]) == (4, 3, 2, 1, 0)
+    # --prod is a separate audit: dev-only findings drop out of the prod counts.
+    assert (found["prod_critical"], found["prod_high"]) == (0, 0)
+
+
+@needs_jq
+def test_pnpm_failures_are_unexamined(lockfile_kinds_run) -> None:
+    _, report = lockfile_kinds_run
+    _assert_unexamined(_entry(report, "pbroken"), "full:audit-error:ERR_PNPM_BROKEN_LOCKFILE")
+    _assert_unexamined(_entry(report, "psilent"), "full:audit-no-output")
+    _assert_unexamined(_entry(report, "pprodbroken"), "prod:audit-error:ERR_PNPM_BROKEN_LOCKFILE")
+    _assert_unexamined(_entry(report, "pbadmanifest"), "stage-manifest-unparseable")
+
+
+@needs_jq
+def test_lockfile_reasons_are_distinct(lockfile_kinds_run) -> None:
+    proc, report = lockfile_kinds_run
+    assert _entry(report, "nolock")["reason"] == "no-lockfile"
+    _assert_unexamined(_entry(report, "nolock"), "no-lockfile")
+    assert _entry(report, "yarnrepo")["reason"] == "unsupported-lockfile:yarn"
+    _assert_unexamined(_entry(report, "yarnrepo"), "unsupported-lockfile:yarn")
+    assert _entry(report, "yarnrepo")["lockfile"] == "yarn.lock"
+    _assert_unexamined(_entry(report, "bunrepo"), "unsupported-lockfile:bun")
+    assert proc.returncode == 3  # pfind/bothlocks findings exceed thresholds; unexamined still reported
+    assert report["status"] == "error"
+
+
+@needs_jq
+def test_npm_lockfile_wins_over_pnpm(lockfile_kinds_run) -> None:
+    _, report = lockfile_kinds_run
+    both = _entry(report, "bothlocks")
+    assert both["lockfile"] == "package-lock.json"
+    assert (both["status"], both["critical"]) == ("ok", 4)  # the npm fake's findings, not pnpm's clean
+
+
+@needs_jq
+def test_pnpm_never_runs_in_the_repo_and_repo_config_never_reaches_it(tmp_path: Path) -> None:
+    log_dir = tmp_path / "npmlog"
+    log_dir.mkdir()
+
+    def hostile(root: Path, name: str) -> None:
+        repo = _make_pnpm_repo(root, name, "clean", manifest_extra={
+            "packageManager": "pnpm@1.0.0+sha512.deadbeef",
+            "devEngines": {"packageManager": {"name": "pnpm", "version": "1.0.0"}},
+            "pnpm": {"auditConfig": {"ignoreGhsas": ["GHSA-xxxx-xxxx-xxxx"]}, "overrides": {"a": "9"}},
+            "scripts": {"preaudit": "touch pwned"},
+        })
+        (repo / "pnpm-workspace.yaml").write_text(HOSTILE_WORKSPACE, encoding="utf-8")
+        (repo / ".npmrc").write_text(HOSTILE_NPMRC, encoding="utf-8")
+        (repo / ".pnpmfile.cjs").write_text("module.exports = {}", encoding="utf-8")
+        (repo / "packages" / "a").mkdir(parents=True)
+        (repo / "packages" / "a" / "package.json").write_text('{"name":"a"}', encoding="utf-8")
+
+    proc, report = _run(tmp_path, {"hostile": hostile}, env_extra={"FAKE_NPM_LOG": log_dir.as_posix()})
+    assert proc.returncode == 0, proc.stderr
+    assert _entry(report, "hostile")["status"] == "ok"
+    logs = [p.read_text(encoding="utf-8", errors="replace") for p in sorted(log_dir.glob("pnpm-*.log"))]
+    assert len(logs) == 2, logs  # full + --prod
+    assert sorted("--prod" in log.splitlines()[1] for log in logs) == [False, True]
+    norm = (lambda q: q.as_posix().lower()) if IS_WINDOWS else (lambda q: q.as_posix())
+    for log in logs:
+        cwd = _from_bash(log.splitlines()[0].removeprefix("cwd="))
+        assert not norm(cwd).startswith(norm(tmp_path / "root")), f"pnpm ran inside the scanned tree: {cwd}"
+        listing = log.split("--- ls\n", 1)[1].split("--- manifest", 1)[0].split()
+        assert set(listing) == {"package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"}, listing
+        manifest = json.loads(log.split("--- manifest\n", 1)[1].split("\n--- workspace", 1)[0])
+        assert manifest == {"name": "hostile", "version": "1.0.0", "dependencies": {"a": "^1.0.0"},
+                            "devDependencies": {"b": "^2.0.0"}}, manifest
+        workspace = log.split("--- workspace\n", 1)[1].split("--- xdg", 1)[0]
+        assert workspace.strip() == "packages: []", workspace
+        for pin in ("pnpm_config_registry=https://registry.npmjs.org/", "pnpm_config_strict_ssl=true",
+                    "pnpm_config_proxy=false", "pnpm_config_https_proxy=false", "pnpm_config_ignore_scripts=true",
+                    "pnpm_config_manage_package_manager_versions=false",
+                    "npm_config_registry=https://registry.npmjs.org/", "npm_config_ignore_scripts=true",
+                    "COREPACK_ENABLE_PROJECT_SPEC=0", "COREPACK_ENABLE_AUTO_PIN=0"):
+            assert pin in log.splitlines(), f"{pin} missing\n{log}"
+        for key in ("npm_config_userconfig=", "XDG_CONFIG_HOME="):
+            line = next(ln for ln in log.splitlines() if ln.startswith(key))
+            assert line.split("=", 1)[1], f"{key} not pinned"
+        # XDG_CONFIG_HOME is a fresh, empty, operator-owned dir.
+        assert log.split("--- xdg\n", 1)[1].split() == [], log
+        assert "127.0.0.1:9" not in log and "GHSA-xxxx" not in log and "deadbeef" not in log
+
+
+@needs_jq
+@pytest.mark.skipif(IS_WINDOWS, reason="needs a real symlink, which msys cp/test -L handle differently")
+@pytest.mark.parametrize("target", ["pnpm-lock.yaml", "package.json"])
+def test_a_symlinked_pnpm_file_is_unexamined_never_read(tmp_path: Path, target: str) -> None:
+    secret = tmp_path / "secret"
+    secret.write_text(json.dumps({"name": "s"}) + "\n# fake_mode: clean\n", encoding="utf-8")
+    log_dir = tmp_path / "npmlog"
+    log_dir.mkdir()
+
+    def linked(root: Path, name: str) -> None:
+        repo = _make_pnpm_repo(root, name, "clean")
+        (repo / target).unlink()
+        (repo / target).symlink_to(secret)
+
+    proc, report = _run(tmp_path, {"lnk": linked}, env_extra={"FAKE_NPM_LOG": log_dir.as_posix()})
+    assert proc.returncode == 4
+    _assert_unexamined(_entry(report, "lnk"), f"stage-refused:{target}-not-a-regular-file")
+    assert list(log_dir.glob("pnpm-*.log")) == [], "pnpm ran against a symlinked input"
+
+
+@pytest.mark.skipif(IS_WINDOWS or shutil.which("jq") is None, reason="symlinked tool dir + jq needed")
+def test_missing_pnpm_is_unexamined(tmp_path: Path) -> None:
+    tools = _tools_dir(tmp_path, jq=True)
+    assert shutil.which("pnpm", path=str(tools)) is None
+    npm_only = tmp_path / "npmonly"
+    npm_only.mkdir()
+    for name, body in (("npm", FAKE_NPM), ("curl", FAKE_CURL)):
+        (npm_only / name).write_text(body, encoding="utf-8", newline="\n")
+        (npm_only / name).chmod(0o755)
+    proc, report = _run(tmp_path, {"p": _pnpm("clean"), "n": "clean"},
+                        path_override=f"{npm_only}{os.pathsep}{tools}")
+    assert proc.returncode == 4
+    _assert_unexamined(_entry(report, "p"), "pnpm-missing")
+    assert _entry(report, "n")["status"] == "ok", _entry(report, "n")["reason"]
