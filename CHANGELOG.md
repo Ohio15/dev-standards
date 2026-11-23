@@ -3,6 +3,34 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.0 - 2026-11-23
+
+This release adds a local scan meant to replace GitHub Dependabot alerts. It adds a local, all-ecosystem
+dependency-vulnerability scan on NEXUS, and `docs/github-dependencies.md`, the inventory of what still runs
+on or arrives from GitHub (Ron, brief e26f9441).
+
+- `scripts/osv-deps-facts.py`: runs OSV-Scanner over the code-standards mirror for every ecosystem it reads
+  (npm, pnpm, Go, crates.io, PyPI, NuGet and the rest) against the offline OSV database. It writes a
+  separate textfile, `code_deps.prom`, with these series: `code_deps_repo_scanned`, `code_deps_packages`,
+  `code_deps_vulns{ecosystem,severity}` and `code_deps_last_run_timestamp_seconds`. It also writes a JSON
+  report. The file is separate because Steward refuses `code_standards.prom` whole if it contains any
+  series outside its allow-list.
+- Fail-closed: a repo reads as scanned only when its mirror refreshed this run and the pinned scanner
+  completed with output that parses. A timeout, a crash, a wrong binary version, unparseable JSON, or an
+  exit code that disagrees with the output each count as not scanned.
+- Isolation, in the same class as the npm audit staging (SC-07/SC-12): the scanner runs with
+  `--offline --download-offline-databases --no-resolve --no-call-analysis=all`. Its cwd is outside the
+  repo, and its environment is scrubbed, with no Go toolchain on PATH. No repo code is built or run, and
+  no package list leaves the host.
+- `scripts/install-osv-scanner.sh` builds the version pinned in `estate/osv-scanner.version` with
+  `go install` under `env -i` (no inherited GOINSECURE, GONOSUMDB or go.env), verified by the Go
+  checksum database, and swaps `current` atomically.
+- `scripts/code-standards-cron.sh` step 6 runs the scanner after the code-standards export. The step is
+  degradable: a failure never blocks that export.
+- No consumer exists yet. Steward ingestion (work item 8276fa8d) and APM Phase 4 (brain d04159db) are
+  pending, and so is a staleness alert on `code_deps_last_run_timestamp_seconds`. Until those land, the feed
+  is a report, not a control, and GitHub alerts stay on (security gate pass 1, SC-53 LOW).
+
 ## 1.1.21 - 2026-11-22
 
 Register: graduate SC-69 and SC-70 and amend SC-54 again, from audit-shared-brain-2026-11-22.

@@ -15,6 +15,11 @@
 #   4. scripts/npm-audit-weekly.sh       -> <work>/npm/npm-audit-<date>.json
 #      (`npm audit` only: no install, no lifecycle script; no --brain-store)
 #   5. scripts/code-standards-facts.py   -> <output> (atomic replace)
+#   6. scripts/osv-deps-facts.py         -> <deps-output> + <work>/osv/osv-report.json
+#      (OSV-Scanner over the same mirror, every ecosystem, offline database;
+#      a separate textfile because Steward refuses code_standards.prom whole
+#      on any series outside its allow-list. Degradable: a failure here never
+#      blocks step 5; the old code_deps.prom keeps its old last_run.)
 #
 # Fail-closed: if the mirror cannot be set up, the security roster or the
 # canonical register was not refreshed this run, the scanner crashes, or the
@@ -24,6 +29,7 @@
 #
 # One-time setup on NEXUS (user ohio_):
 #   sudo install -d -o ohio_ -g ohio_ -m 0755 /var/lib/estate-code
+#   scripts/install-osv-scanner.sh            (pinned in estate/osv-scanner.version)
 # crontab (NEXUS, user ohio_):
 #   0 */6 * * * /home/ohio_/dev-standards/scripts/code-standards-cron.sh > /var/lib/estate-code/code-standards-cron.log 2>&1
 #
@@ -32,6 +38,8 @@
 #   --work <dir>     work dir (reports, lock)  [/var/lib/estate-code/work]
 #   --output <file>  textfile                  [/var/lib/node_exporter/textfile_collector/code_standards.prom]
 #   --roster <file>  roster                    [<checkout>/estate/code-standards-roster.txt]
+#   --deps-output <file> OSV textfile         [<output dir>/code_deps.prom]
+#   --osv-scanner <bin>  pinned scanner       [~/.local/lib/osv-scanner/current/osv-scanner]
 #   --no-pull        skip step 1 (local runs)
 set -euo pipefail
 
@@ -42,6 +50,8 @@ mirror="/var/lib/estate-code/repos"
 work="/var/lib/estate-code/work"
 output="/var/lib/node_exporter/textfile_collector/code_standards.prom"
 roster="$checkout/estate/code-standards-roster.txt"
+deps_output=""
+osv_bin="${HOME}/.local/lib/osv-scanner/current/osv-scanner"
 pull="true"
 orig_args=("$@")
 
@@ -51,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --work) work="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     --roster) roster="$2"; shift 2 ;;
+    --deps-output) deps_output="$2"; shift 2 ;;
+    --osv-scanner) osv_bin="$2"; shift 2 ;;
     --no-pull) pull="false"; shift ;;
     *) echo "code-standards-cron: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -58,7 +70,9 @@ done
 
 log() { echo "code-standards-cron: $*"; }
 
-mkdir -p -- "$mirror" "$work" "$work/hygiene" "$work/npm" \
+[[ -n "$deps_output" ]] || deps_output="$(dirname "$output")/code_deps.prom"
+
+mkdir -p -- "$mirror" "$work" "$work/hygiene" "$work/npm" "$work/osv" \
   || { log "ERROR cannot create $mirror / $work (see the one-time setup in this header)"; exit 2; }
 
 # One run at a time: a 6-hourly cron plus a manual run must not interleave
@@ -170,4 +184,13 @@ python3 -I "$here/code-standards-facts.py" \
   --hygiene-report "${reports[0]}" \
   "${npm_args[@]}" \
   --output "$output"
-log "done (mirror rc $mirror_rc, scan rc $scan_rc, npm rc $npm_rc)"
+
+# 6. OSV dependency facts (degradable, bounded; runs after step 5 so a slow
+#    or failing scanner can never delay or suppress the code-standards export).
+osv_rc=0
+timeout --kill-after=60 5400 python3 -I "$here/osv-deps-facts.py"   --roster "$roster"   --mirror "$mirror"   --mirror-status "$status_file"   --osv-scanner "$osv_bin"   --db-dir "$work/osv/db"   --report "$work/osv/osv-report.json"   --output "$deps_output"   2> "$work/osv/osv-deps.err" || osv_rc=$?
+if (( osv_rc != 0 )); then
+  log "WARNING osv-deps-facts.py exit $osv_rc (see $work/osv/osv-deps.err); $deps_output not refreshed"
+fi
+tail -n 1 "$work/osv/osv-deps.err" 2>/dev/null | sed 's/^/  /' || true
+log "done (mirror rc $mirror_rc, scan rc $scan_rc, npm rc $npm_rc, osv rc $osv_rc)"
