@@ -84,6 +84,8 @@ class Estate:
         self.status = tmp_path / "status.txt"
         self.pin = tmp_path / "osv-scanner.version"
         self.pin.write_text("2.7.1\n", encoding="utf-8")
+        self.mirrors = tmp_path / "osv-mirrors.txt"
+        self.mirrors.write_text("# none\n", encoding="utf-8")
         self.out_dir = tmp_path / "textfile"
         self.out_dir.mkdir()
         self.out = self.out_dir / "code_deps.prom"
@@ -124,7 +126,7 @@ class Estate:
         return osv.main([
             "--roster", str(self.roster), "--mirror", str(self.mirror), "--mirror-status", str(self.status),
             "--osv-scanner", str(self.binary), "--db-dir", str(self.db), "--output", str(self.out),
-            "--report", str(self.report), "--pin-file", str(self.pin), *extra,
+            "--report", str(self.report), "--pin-file", str(self.pin), "--mirrors", str(self.mirrors), *extra,
         ])
 
     def series(self) -> dict[str, int]:
@@ -287,3 +289,36 @@ def test_budget_exceeded_writes_nothing(estate: Estate, monkeypatch) -> None:
 ])
 def test_severity_buckets(raw, bucket) -> None:
     assert osv.severity_of(raw) == bucket
+
+
+def test_mirror_is_labelled_and_its_advisories_still_exported(estate: Estate) -> None:
+    estate.repo("frozen", 1, {"results": [result("/m/frozen/go.mod", [
+        pkg("Go", "github.com/labstack/echo/v4", "4.11.1", [grp("GHSA-cxf3-9h37-7rr8", "9.1")])])]})
+    estate.repo("live", 0, {"results": []})
+    estate.write(["frozen", "live"], ["frozen", "live"])
+    estate.mirrors.write_text("# kept on purpose\nFrozen\n", encoding="utf-8")
+    assert estate.run() == 0
+    s = estate.series()
+    assert s['code_deps_repo_mirror{repo="frozen"}'] == 1
+    assert 'code_deps_repo_mirror{repo="live"}' not in s
+    assert s['code_deps_repo_scanned{repo="frozen"}'] == 1
+    assert s['code_deps_vulns{repo="frozen",ecosystem="go",severity="critical"}'] == 1
+    report = json.loads(estate.report.read_text(encoding="utf-8"))
+    assert report["repos"]["frozen"]["mirror"] is True and report["repos"]["live"]["mirror"] is False
+
+
+@pytest.mark.parametrize("content", ["ghost\n", "frozen\nfrozen\n", "Bad Name\n"])
+def test_bad_mirror_list_writes_nothing(estate: Estate, content: str) -> None:
+    estate.repo("frozen", 0, {"results": []})
+    estate.write(["frozen"], ["frozen"])
+    estate.mirrors.write_text(content, encoding="utf-8")
+    assert estate.run() == osv.EXIT_INVALID_INPUT
+    assert not estate.out.exists()
+
+
+def test_shipped_mirror_list_is_a_subset_of_the_roster() -> None:
+    roster = osv.cs_facts.read_roster(osv.HERE.parent / "estate" / "code-standards-roster.txt")
+    mirrors = osv.read_mirrors(osv.MIRRORS_FILE, roster)
+    assert {"ceremony", "juicebox-hsm-realm", "juicebox-software-realm"} <= mirrors
+    assert {"cadcraft", "craft-libs", "wordcraft"} <= mirrors
+    assert "craft-tools" not in mirrors  # Ron's own tooling, not a mirror

@@ -3,6 +3,19 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.1 - 2026-11-23
+
+This release labels the upstream mirrors in the OSV feed, and corrects the inventory, which had called them Ron's own code.
+
+- `estate/osv-mirrors.txt` lists the 16 roster repos that are unmodified mirrors of a third-party or frozen upstream:
+  - 13 storytold craft repos (craft-microsoft README: mirrors never run CI and never diverge);
+  - ceremony, juicebox-hsm-realm and juicebox-software-realm (Ron decision 02d97de7, item ecada2de).
+- `osv-deps-facts.py --mirrors` exports `code_deps_repo_mirror{repo} 1` and adds `"mirror": true|false` to the JSON report. Mirrors
+  are still scanned and their advisories still exported, so nothing is hidden. A name in the list that is not on the roster, a duplicate,
+  or an invalid name refuses the run, and nothing is written.
+- `docs/github-dependencies.md` row 3 is corrected: steward-sessionwatch is the only repo of Ron's own still on hosted runners. The
+  mirrors must never be enrolled on nexus-ci, because they carry upstream's release workflows.
+
 ## 1.2.0 - 2026-11-23
 
 This release adds a local scan meant to replace GitHub Dependabot alerts. It adds a local, all-ecosystem

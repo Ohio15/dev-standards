@@ -17,10 +17,12 @@ Inputs (produced by scripts/code-standards-cron.sh in the same run):
     --db-dir         OSV offline database cache (refreshed by the scanner)
     --output         textfile, e.g. /var/lib/node_exporter/textfile_collector/code_deps.prom
     --report         JSON report with every advisory per repo (optional)
+    --mirrors        estate/osv-mirrors.txt: roster repos kept as unmodified mirrors
 
 Output contract (a SEPARATE file from code_standards.prom, whose series set
 Steward allow-lists and refuses whole on any unknown series):
     code_deps_repo_scanned{repo}                   0|1, every roster repo
+    code_deps_repo_mirror{repo}                    1, preservation mirrors only (still scanned)
     code_deps_packages{repo,ecosystem}             >0 distinct packages examined
     code_deps_vulns{repo,ecosystem,severity}       >0 distinct advisories
     code_deps_last_run_timestamp_seconds           unix seconds, last line
@@ -64,6 +66,7 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 PIN_FILE = HERE.parent / "estate" / "osv-scanner.version"
+MIRRORS_FILE = HERE.parent / "estate" / "osv-mirrors.txt"
 
 _spec = importlib.util.spec_from_file_location("cs_facts", HERE / "code-standards-facts.py")
 assert _spec is not None and _spec.loader is not None
@@ -84,6 +87,8 @@ RC_OK, RC_VULNS, RC_NO_PACKAGES = 0, 1, 128
 METRICS: tuple[tuple[str, str], ...] = (
     ("code_deps_repo_scanned",
      "1 when the repo's mirror refreshed this run and the pinned OSV-Scanner completed on it, else 0."),
+    ("code_deps_repo_mirror",
+     "1 for a roster repo kept as an unmodified preservation mirror (estate/osv-mirrors.txt); still scanned."),
     ("code_deps_packages",
      "Distinct packages OSV-Scanner examined, by ecosystem (scanned repos only, counts above 0)."),
     ("code_deps_vulns",
@@ -95,6 +100,30 @@ METRICS: tuple[tuple[str, str], ...] = (
 
 class ScanError(Exception):
     """One repo could not be examined; it exports as scanned 0."""
+
+
+def read_mirrors(path: Path, roster: list[str]) -> set[str]:
+    """Mirror repo labels. Every one must be a roster repo: a mirror list that
+    names something the roster does not is a stale config, refused whole."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InputError(f"mirror list {path} unreadable: {exc}") from exc
+    known = set(roster)
+    out: set[str] = set()
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        label = line.lower()
+        if not REPO_LABEL_RE.match(label):
+            raise InputError(f"mirror list {path}:{n}: {line!r} is not a valid repo label")
+        if label not in known:
+            raise InputError(f"mirror list {path}:{n}: {line!r} is not in the roster")
+        if label in out:
+            raise InputError(f"mirror list {path}:{n}: {line!r} listed twice")
+        out.add(label)
+    return out
 
 
 def read_pin(path: Path = PIN_FILE) -> str:
@@ -250,11 +279,14 @@ def scan_repo(binary: Path, repo_dir: Path, env: dict[str, str], cwd: Path, time
     return parsed
 
 
-def build_series(roster: list[str], scans: dict[str, dict[str, Any]]) -> dict[str, list[tuple[str, int]]]:
+def build_series(roster: list[str], scans: dict[str, dict[str, Any]],
+                 mirrors: set[str] | frozenset[str] = frozenset()) -> dict[str, list[tuple[str, int]]]:
     series: dict[str, list[tuple[str, int]]] = {name: [] for name, _ in METRICS}
     for repo in sorted(roster):
         scan = scans.get(repo)
         series["code_deps_repo_scanned"].append((f'{{repo="{repo}"}}', 1 if scan is not None else 0))
+        if repo in mirrors:
+            series["code_deps_repo_mirror"].append((f'{{repo="{repo}"}}', 1))
         if scan is None:
             continue
         for eco in sorted(scan["packages"]):
@@ -312,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--report", type=Path, default=None)
     ap.add_argument("--timeout", type=int, default=300, help="per-repo scanner timeout, seconds")
+    ap.add_argument("--mirrors", type=Path, default=MIRRORS_FILE, help="preservation-mirror list")
     ap.add_argument("--pin-file", type=Path, default=PIN_FILE, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -319,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         pin = read_pin(args.pin_file)
         roster = cs_facts.read_roster(args.roster)
         mirror_ok = cs_facts.read_mirror_status(args.mirror_status)
+        mirrors = read_mirrors(args.mirrors, roster)
         if not args.mirror.is_dir():
             raise InputError(f"mirror {args.mirror} is not a directory")
     except InputError as exc:
@@ -354,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
                     errors[repo] = str(exc)
                     print(f"osv-deps-facts: {repo}: not scanned: {exc}", file=sys.stderr)
 
-    series = build_series(roster, scans)
+    series = build_series(roster, scans, mirrors)
     now = int(time.time())
     text = render(series, now)
     size, count = len(text.encode("ascii")), text.count("\n")
@@ -365,9 +399,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.report is not None:
         write_json_atomic(args.report, {
             "generated_at": now, "started_at": started, "scanner": f"osv-scanner {pin}",
-            "repos": {r: {"status": "ok", **{k: v for k, v in scans[r].items() if k != "vulns"},
-                          "vuln_counts": {f"{e}/{s}": n for (e, s), n in scans[r]["vulns"].items()}}
-                      if r in scans else {"status": "error", "error": errors.get(r, "not scanned")}
+            "repos": {r: {"mirror": r in mirrors,
+                          **({"status": "ok", **{k: v for k, v in scans[r].items() if k != "vulns"},
+                              "vuln_counts": {f"{e}/{s}": n for (e, s), n in scans[r]["vulns"].items()}}
+                             if r in scans else {"status": "error", "error": errors.get(r, "not scanned")})}
                       for r in sorted(roster)},
         })
     cs_facts.write_atomic(args.output, text)

@@ -1,0 +1,33 @@
+# Preservation mirrors in the estate roster (scripts/osv-deps-facts.py --mirrors).
+# One roster repo name per line; `#` starts a comment. Every name must also be in
+# estate/code-standards-roster.txt, or the export refuses to run.
+#
+# A mirror is an unmodified copy of a frozen upstream, kept on purpose and never
+# built or deployed as it stands. The OSV export still scans it and still exports
+# its advisories (nothing is hidden), and adds code_deps_repo_mirror{repo} 1 so a
+# consumer can report it apart from live risk.
+#
+# Ron, 2026-11-23 (decision item ecada2de, brain 02d97de7): keep these three
+# unmodified for the personal-ai-pod SPEC 6.2 escrow leg. Each one must be
+# dependency-patched and security-gated BEFORE it is ever built or deployed.
+ceremony
+juicebox-hsm-realm
+juicebox-software-realm
+#
+# Third-party mirrors of storytold/<name>, pinned as submodules by
+# Ohio15/craft-microsoft and craft-adobe (GitHub description "Private mirror of
+# storytold/..."; craft-microsoft README: mirrors never run CI and never diverge
+# from upstream). Remediation is upstream's (decision item 11d2ed69).
+cadcraft
+craft-libs
+deckcraft
+designcraft
+effectcraft
+filmcraft
+gridcraft
+lightcraft
+pdfcraft
+photocraft
+soundcraft
+vectorcraft
+wordcraft
