@@ -994,6 +994,14 @@ audit-n3xus-notify-2026-11-21.2, LOW, `http/src/validate.ts:52-60` and
 admitting characters that render invisibly but are letters or marks; the
 Check now lists them. Fix form: explicit ranges for those code points, or an
 allow-list character class for trusted titles.
+**Amended.** 2026-11-22, approved by Ron (decision 34df38b0;
+audit-shared-brain-2026-11-22, LOW, 2 of 3 reviewers proved it by running the
+regex). The Check also requires U+17B4 and U+17B5 (Khmer inherent vowels, Mn)
+and U+180B-U+180D and U+180F (Mongolian free variation selectors, Mn), and
+each run greps EVERY `\p{Cf}`-based class in the repo, not only the one that
+feeds the sink under change (two sibling sanitizers had missed the 2026-11-21
+amendment). Prefer an allow-list character class for trusted titles: a
+deny-list of invisibles grows with every Unicode release (SC-32).
 
 ### SC-55 · A finding is marked resolved on absence rather than on a satisfied predicate
 **Shape.** A monitor clears an open finding (and its retry or undelivered
@@ -1272,6 +1280,52 @@ forwarded client address from trusted proxies only.
 `http/src/server.ts:119-121`, 1 of 3 reviewers; approved by Ron 2026-11-21,
 decision 29e9eb74).
 
+### SC-69 · An authority check that throws at its first refusal is used to classify a write, so a later stronger check never runs
+**Shape.** A validator throws at the first failed rule, and a caller catches
+that throw to classify the write ("approvable, so record a request", "soft, so
+warn", "retryable"), then re-validates under a more privileged principal or
+skips validation. Every rule ordered after the first failure is never checked
+for the real caller, so a cheap or approvable refusal masks an expensive or
+non-waivable one and the stored or approved action under-describes what it
+waives.
+**Check.** For each `catch` that turns a validator's error into a
+classification (grep `catch` blocks that call a `*ActionsOf(err)`,
+`classify*(err)` or `instanceof *Required` helper and then continue or
+re-validate), assert either that the validator collects every rule's refusal
+before throwing (with a test that a write failing two rules reports both), or
+that the classification re-runs the remaining rules as the REAL caller.
+Absent = FINDING.
+**Fix form.** Collect, don't short-circuit: evaluate every rule for the real
+caller, union the refusals, then classify on the full set.
+**Since.** approved 2026-11-22.
+**Origin.** audit-shared-brain-2026-11-22 (MEDIUM, `lib/work-items.js:961-975`:
+`assertNotBoardOnly` threw `close_ron_protected` before
+`isSecurityCloseNeedingVerification` ran, and the re-check as the board was
+exempt; 2 of 3 reviewers; approved by Ron 2026-11-22, decision 34df38b0).
+
+### SC-70 · A per-key throttle or cap whose key includes a component the caller can rotate for free
+**Shape.** A throttle, dedup window or quota is keyed on a tuple that includes
+a value the caller mints or rotates at no cost (a transport session id,
+connection id, request id or client-chosen label), while the limit is meant
+for a scope the caller cannot rotate, such as the principal. A caller at the
+real limit rotates the free component and gets a fresh key, so each attempt
+sends a notification, allocates a store entry or consumes a slot. Distinct
+from SC-68 (limiter applied only after authentication) and SC-67 (eviction
+across tenants).
+**Check.** For each throttle or dedup key on a notification or cap path, list
+the key's components and assert each is fixed by the server for the scope
+being limited, or that the throttle is keyed on exactly the scope whose limit
+was exceeded. Mechanical test: rotate the free component N times and expect
+one send. Absent = FINDING.
+**Fix form.** Key the throttle on the exceeded scope only (for example the
+principal when the principal cap was hit), and cap or resolve any store entry
+created per key.
+**Since.** approved 2026-11-22.
+**Origin.** audit-shared-brain-2026-11-22 (MEDIUM,
+`lib/work-item-requests.js:530-546`: the queue-full alert was keyed
+`principal\0mcpSession` and the MCP session is re-minted on every initialize;
+2 of 3 reviewers; approved by Ron 2026-11-22, decision 34df38b0).
+
 ---
 
 ## Proposed additions (from the routine audit; operator approval required)
@@ -1295,7 +1349,9 @@ approved 2026-11-14. SC-58..SC-61 (audit-cortex-hooks-2026-11-14),
 approved 2026-11-14. SC-62 (audit-shared-brain-2026-11-14), approved 2026-11-14.
 SC-63..SC-68 (audit-n3xus-notify-2026-11-21.2), approved 2026-11-21, decision
 29e9eb74; SC-54 amended 2026-11-21 (invisible code points beyond Cf, same
-decision). SC-37 amended 2026-10-27 (same-repo pull requests on
+decision). SC-69..SC-70 (audit-shared-brain-2026-11-22), approved
+2026-11-22, decision 34df38b0; SC-54 amended again the same day (Khmer and
+Mongolian marks, every Cf-based class). SC-37 amended 2026-10-27 (same-repo pull requests on
 nexus-ci; approved by Ron). SC-26..SC-28 were numbered by
 audit-openos-2026-09-16 but never written as proposals; the numbers stay
 reserved.
