@@ -3,6 +3,19 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.1.21 - 2026-11-22
+
+Register: graduate SC-69 and SC-70 and amend SC-54 again, from audit-shared-brain-2026-11-22.
+Approved by Ron (decision 34df38b0). Both register copies are identical, with 67 rules.
+
+- SC-69: a validator that throws at its first refusal is caught to classify a write, so a later and
+  stronger check never runs for the real caller. Shared-Brain 7.96.0 assertNotBoardOnly masked the
+  security-close verification (MEDIUM, 2 of 3 reviewers).
+- SC-70: a throttle or cap whose key includes a component the caller can rotate for free. The
+  Shared-Brain queue-full alert was keyed on principal plus MCP session (MEDIUM, 2 of 3 reviewers).
+- SC-54 amended: the Check adds U+17B4, U+17B5 and U+180B-U+180D, U+180F, greps every Cf-based class
+  in the repo, and prefers an allow-list class for trusted titles.
+
 ## 1.1.20 - 2026-11-22
 
 `scripts/npm-audit-weekly.sh` audits pnpm repos. Steward's pos-code-dependency-vulns read blind-scan for
