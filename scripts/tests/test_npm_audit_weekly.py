@@ -766,10 +766,13 @@ def test_a_symlinked_directory_is_never_walked(tmp_path: Path) -> None:
 
 @needs_jq
 @pytest.mark.skipif(IS_WINDOWS, reason="NTFS refuses a newline in a file name")
-def test_a_control_character_in_a_lockfile_path_is_unexamined(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dirname", ["a\nb", "a‮b", "a​b", "café"])
+def test_a_non_ascii_or_control_character_lockfile_path_is_unexamined(tmp_path: Path, dirname: str) -> None:
+    # SC-54/SC-60: a newline would split the list; a bidi override or a
+    # zero-width character would reorder or hide report and brain text.
     def hostile(root: Path, name: str) -> None:
         _make_repo(root, name, "clean")
-        _nested_npm(root / name, "a\nb", "clean")
+        _nested_npm(root / name, dirname, "clean")
 
     proc, report = _run(tmp_path, {"hostile": hostile})
     _assert_unexamined(_entry(report, "hostile"), "unsafe-lockfile-path")

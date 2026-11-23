@@ -493,6 +493,7 @@ audit_unit() {
 # strength of its root lockfile alone (SC-07). MAX_PACKAGE_DIRS bounds the
 # audits per repo; a repo over it is unexamined, never truncated.
 MAX_PACKAGE_DIRS="${MAX_PACKAGE_DIRS:-50}"
+SAFE_PATH_RE='^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._@/+ -]+$'
 if [[ ! "$MAX_PACKAGE_DIRS" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_PACKAGE_DIRS must be a positive integer, got '$MAX_PACKAGE_DIRS'" >&2
   exit 2
@@ -512,9 +513,13 @@ for repo in "${REPOS[@]}"; do
     walk_reason="lockfile-walk-failed"
   else
     while IFS= read -r -d '' rel; do
-      # A path is repo content: a control character (a newline above all)
-      # would split the list or forge report lines, so the repo is refused.
-      if [[ "$rel" == *[[:cntrl:]]* ]]; then walk_reason="unsafe-lockfile-path"; break; fi
+      # A path is repo content and reaches the report, the summary and the
+      # brain memory: a control character (a newline above all) would split
+      # the list or forge lines, and a Unicode format character (bidi
+      # override, zero-width) would reorder or hide text (SC-54, SC-60). So a
+      # path is allow-listed to ASCII, enumerated rather than ranged so no
+      # locale widens it, and anything else leaves the repo unexamined.
+      if [[ ! "$rel" =~ $SAFE_PATH_RE ]]; then walk_reason="unsafe-lockfile-path"; break; fi
       if [[ "$rel" == */* ]]; then units+=("${rel%/*}"); else units+=("."); fi
     done < "$locks_file"
   fi

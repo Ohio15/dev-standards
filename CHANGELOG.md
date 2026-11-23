@@ -15,7 +15,9 @@ audited and the repo read prod-clean. Measured case: nexus-realervnc `deploy/op-
   of its own, so it is still covered once, through the root.
 - A repo entry is `"ok"` only when every directory was examined; its counts are the sums over them. One directory not examined (audit
   error, timeout, yarn or bun lockfile, staging refused) makes the whole repo `"error"` with null counts, and its reason names the
-  directory (`deploy/x:full:audit-error:...`). A control character in a lockfile path, a failed walk, or more than `MAX_PACKAGE_DIRS`
+  directory (`deploy/x:full:audit-error:...`). A lockfile path outside an ASCII allow-list (`A-Z a-z 0-9 . _ @ / + -` and space;
+  a control character, a bidi override or a zero-width character would split or forge report and brain text, SC-54/SC-60), a failed
+  walk, or more than `MAX_PACKAGE_DIRS`
   (default 50) directories also leaves the repo unexamined, never truncated.
 - Repos are discovered by a root `package.json` OR a lockfile anywhere in the tree, so a repo whose only npm package is nested
   (`frontend/`, `server/`) is now audited instead of skipped.
