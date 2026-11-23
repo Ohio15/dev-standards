@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # Weekly npm-audit roll-up across all Node.js repos under one or more roots.
 #
-# For each repo containing package.json:
+# A repo is in scope when it has a root package.json or a lockfile anywhere in
+# its tree (node_modules and .git pruned). It is audited as every package
+# directory it holds: the root (when it has a package.json) plus every
+# directory holding a lockfile of its own, i.e. each standalone install such
+# as deploy/<svc>/pnpm-lock.yaml installed --ignore-workspace (item 0323e3cc:
+# until 1.2.2 only the root lockfile was read, so a repo whose nested package
+# carried 26 prod highs reported prod-clean). A workspace member has no
+# lockfile of its own, so it is covered once, through the root. The repo entry
+# is "ok" only when EVERY directory was examined, with counts summed over
+# them; one unexamined directory makes the whole repo "error" with null counts
+# ("<dir>:<reason>" in its reason). Per-directory results are in "units" and
+# the audited lockfiles in "lockfiles". For each package directory:
 #   * picks the auditor from the committed lockfile: npm-shrinkwrap.json or
 #     package-lock.json -> npm; pnpm-lock.yaml -> pnpm (npm wins when both)
 #   * runs `npm audit --json` + `npm audit --omit=dev --json`, or
@@ -100,6 +111,7 @@ Options:
 Environment:
   THRESH_CRIT=$THRESH_CRIT  exit non-zero when critical-count >= this
   THRESH_HIGH=$THRESH_HIGH  exit non-zero when high-count >= this
+  MAX_PACKAGE_DIRS=${MAX_PACKAGE_DIRS:-50}  a repo with more package dirs is unexamined
 USAGE
       exit 0
       ;;
@@ -144,15 +156,34 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 # ------------------------------- discover repos --------------------------
+LOCK_FIND_EXPR=( -name npm-shrinkwrap.json -o -name package-lock.json -o -name pnpm-lock.yaml
+                 -o -name yarn.lock -o -name bun.lock -o -name bun.lockb )
+
+# Every lockfile below <repo> as a NUL-separated list of repo-relative paths,
+# written to file $2. node_modules (installed trees) and .git are pruned; find
+# does not follow a symlinked directory, so nothing outside the repo is
+# reached, and a symlinked lockfile is listed so staging refuses it rather than
+# reading it as absent. Returns find's exit status: a walk that failed is not
+# a walk that found nothing.
+list_lockfiles() {
+  local repo="$1" out="$2"
+  find "$repo" \( -name .git -o -name node_modules \) -prune \
+    -o \( -type f -o -type l \) \( "${LOCK_FIND_EXPR[@]}" \) -printf '%P\0' > "$out" 2>/dev/null
+}
+
 REPOS=()
 for root in "${ROOTS[@]}"; do
   if [[ ! -d "$root" ]]; then continue; fi
-  # Top-level only — same scoping as the hygiene scanner
+  # Top-level only — same scoping as the hygiene scanner. A repo is in scope
+  # when it has a root package.json OR a lockfile anywhere in the tree: a
+  # standalone package in a subdirectory (frontend/, deploy/<svc>/) carries its
+  # own lockfile and is never covered by the root's (item 0323e3cc). A repo
+  # whose walk fails is kept so it reports as unexamined, never dropped.
   for d in "$root"/*/; do
-    [[ -d "$d" ]] || continue
-    if [[ -f "$d/package.json" && -d "$d/.git" ]]; then
-      REPOS+=("${d%/}")
-    fi
+    [[ -d "$d" && -d "$d/.git" ]] || continue
+    d="${d%/}"
+    if [[ -f "$d/package.json" ]]; then REPOS+=("$d"); continue; fi
+    if ! list_lockfiles "$d" "$TMP_DIR/discover.lst" || [[ -s "$TMP_DIR/discover.lst" ]]; then REPOS+=("$d"); fi
   done
 done
 
@@ -364,94 +395,208 @@ ERROR_LINES=()
 PER_REPO_JSON="["
 first="true"
 
+# True when <repo>/<rel> is a directory and no component of <rel> is a
+# symlink: a package directory is entered only through real directories.
+repo_real_dir() {
+  local repo="$1" rel="$2" cur part
+  case "/$rel/" in
+    *"/../"*|*"/./"*|"//"*) return 1 ;;
+  esac
+  cur="$repo"
+  local IFS=/
+  for part in $rel; do
+    [[ -n "$part" ]] || return 1
+    cur="$cur/$part"
+    [[ -L "$cur" ]] && return 1
+  done
+  [[ -d "$cur" ]]
+}
+
+# Audit one package directory <repo>/<rel> ("." is the root) as unit $4 of
+# repo number $3. Sets U_REASON ("" when examined), U_LOCK (the lockfile name,
+# "" for none), U_CRIT U_HIGH U_MOD U_LOW U_INFO U_PCRIT U_PHIGH and U_CVES.
+# Counts are set only when U_REASON is "".
+audit_unit() {
+  local repo="$1" rel="$2" ridx="$3" uidx="$4"
+  local dir lock tool tree problem prod_flag full_rc prod_rc
+  local full_json="$RAW_DIR/$ridx.$uidx.full.json" prod_json="$RAW_DIR/$ridx.$uidx.prod.json"
+  U_REASON=""; U_LOCK=""; U_CVES=""
+  U_CRIT=""; U_HIGH=""; U_MOD=""; U_LOW=""; U_INFO=""; U_PCRIT=""; U_PHIGH=""
+  if [[ "$rel" == "." ]]; then
+    dir="$repo"
+  elif repo_real_dir "$repo" "$rel"; then
+    dir="$repo/$rel"
+  else
+    U_REASON="stage-refused:package-dir-not-a-real-directory"; return
+  fi
+  lock="$(lockfile_kind "$dir")"
+  tool="${lock%%:*}"
+  U_LOCK="${lock#*:}"
+
+  if [[ -z "$lock" ]]; then
+    # Nothing pins the dependency tree, so no auditor can examine it.
+    U_REASON="no-lockfile"
+  elif [[ "$tool" != "npm" && "$tool" != "pnpm" ]]; then
+    U_REASON="unsupported-lockfile:$tool"
+  elif [[ "$tool" == "npm" && "$HAVE_NPM" != "true" ]]; then
+    U_REASON="npm-missing"
+  elif [[ "$tool" == "pnpm" && "$HAVE_PNPM" != "true" ]]; then
+    U_REASON="pnpm-missing"
+  elif [[ "$HAVE_JQ" != "true" ]]; then
+    U_REASON="jq-missing"
+  else
+    tree="$STAGE_DIR/$ridx.$uidx"
+    if ! mkdir -- "$tree"; then
+      U_REASON="stage-dir-failed"
+    elif [[ "$tool" == "pnpm" ]]; then
+      U_REASON="$(stage_pnpm_tree "$dir" "$tree")"
+    else
+      U_REASON="$(stage_audit_tree "$dir" "$tree")"
+    fi
+  fi
+  [[ -n "$U_REASON" ]] && return
+
+  # Both audits exit non-zero on findings, so the exit code alone says nothing;
+  # the JSON body decides (audit_file_problem). Only 124 (timeout) is read from rc.
+  if [[ "$tool" == "pnpm" ]]; then prod_flag="--prod"; else prod_flag="--omit=dev"; fi
+  full_rc="$(run_audit "$tool" "$tree" "$full_json")"
+  prod_rc="$(run_audit "$tool" "$tree" "$prod_json" "$prod_flag")"
+  problem="$(audit_file_problem "$full_json" "$full_rc")"
+  if [[ -n "$problem" ]]; then U_REASON="full:$problem"; return; fi
+  problem="$(audit_file_problem "$prod_json" "$prod_rc")"
+  if [[ -n "$problem" ]]; then U_REASON="prod:$problem"; return; fi
+
+  U_CRIT=$(jq -r '.metadata.vulnerabilities.critical' < "$full_json")
+  U_HIGH=$(jq -r '.metadata.vulnerabilities.high' < "$full_json")
+  U_MOD=$(jq -r '.metadata.vulnerabilities.moderate' < "$full_json")
+  U_LOW=$(jq -r '.metadata.vulnerabilities.low' < "$full_json")
+  U_INFO=$(jq -r '.metadata.vulnerabilities.info' < "$full_json")
+  U_PCRIT=$(jq -r '.metadata.vulnerabilities.critical' < "$prod_json")
+  U_PHIGH=$(jq -r '.metadata.vulnerabilities.high' < "$prod_json")
+  # CVE IDs from advisory entries, intersected with KEV by the caller.
+  # npm: .vulnerabilities[].via[].url; pnpm: .advisories[].cves[] and .url.
+  U_CVES=$(jq -r '
+    ( [ .vulnerabilities[]?.via[]? | select(type=="object") | .url // empty ]
+      + [ .advisories[]? | ((.cves // [])[]?), (.url // empty) ] )
+    | map(strings | capture("CVE-[0-9]{4}-[0-9]+"; "g")?.[]?)
+    | unique[]?
+  ' < "$full_json" 2>/dev/null | sort -u || true)
+}
+
+# A repo is audited as every package directory it holds: the root when it has
+# a package.json, and every directory holding a lockfile (item 0323e3cc). A
+# directory with a lockfile of its own is a standalone install (a workspace
+# member has none: the root lockfile resolves it), so the root audit never
+# covers it. The repo is "ok" only when EVERY directory was examined; its
+# counts are the sums over them. One unexamined directory makes the whole repo
+# "error" with null counts, so a repo is never reported prod-clean on the
+# strength of its root lockfile alone (SC-07). MAX_PACKAGE_DIRS bounds the
+# audits per repo; a repo over it is unexamined, never truncated.
+MAX_PACKAGE_DIRS="${MAX_PACKAGE_DIRS:-50}"
+if [[ ! "$MAX_PACKAGE_DIRS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_PACKAGE_DIRS must be a positive integer, got '$MAX_PACKAGE_DIRS'" >&2
+  exit 2
+fi
+
 repo_idx=0
 for repo in "${REPOS[@]}"; do
   name="$(basename "$repo")"
   echo "auditing $name..." >&2
   repo_idx=$(( repo_idx + 1 ))
 
-  reason=""
-  full_json="$RAW_DIR/$name.full.json"
-  prod_json="$RAW_DIR/$name.prod.json"
-  lock="$(lockfile_kind "$repo")"
-  tool="${lock%%:*}"
-  lockfile="${lock#*:}"
-
-  if [[ -z "$lock" ]]; then
-    # Nothing pins the dependency tree, so no auditor can examine it.
-    reason="no-lockfile"
-  elif [[ "$tool" != "npm" && "$tool" != "pnpm" ]]; then
-    reason="unsupported-lockfile:$tool"
-  elif [[ "$tool" == "npm" && "$HAVE_NPM" != "true" ]]; then
-    reason="npm-missing"
-  elif [[ "$tool" == "pnpm" && "$HAVE_PNPM" != "true" ]]; then
-    reason="pnpm-missing"
-  elif [[ "$HAVE_JQ" != "true" ]]; then
-    reason="jq-missing"
+  walk_reason=""
+  units=()
+  [[ -e "$repo/package.json" || -L "$repo/package.json" ]] && units+=(".")
+  locks_file="$TMP_DIR/locks.$repo_idx"
+  if ! list_lockfiles "$repo" "$locks_file"; then
+    walk_reason="lockfile-walk-failed"
   else
-    tree="$STAGE_DIR/$repo_idx"
-    if ! mkdir -- "$tree"; then
-      reason="stage-dir-failed"
-    elif [[ "$tool" == "pnpm" ]]; then
-      reason="$(stage_pnpm_tree "$repo" "$tree")"
-    else
-      reason="$(stage_audit_tree "$repo" "$tree")"
-    fi
+    while IFS= read -r -d '' rel; do
+      # A path is repo content: a control character (a newline above all)
+      # would split the list or forge report lines, so the repo is refused.
+      if [[ "$rel" == *[[:cntrl:]]* ]]; then walk_reason="unsafe-lockfile-path"; break; fi
+      if [[ "$rel" == */* ]]; then units+=("${rel%/*}"); else units+=("."); fi
+    done < "$locks_file"
   fi
-  if [[ -z "$reason" ]]; then
-    # Both audits exit non-zero on findings, so the exit code alone says nothing;
-    # the JSON body decides (audit_file_problem). Only 124 (timeout) is read from rc.
-    if [[ "$tool" == "pnpm" ]]; then prod_flag="--prod"; else prod_flag="--omit=dev"; fi
-    full_rc="$(run_audit "$tool" "$tree" "$full_json")"
-    prod_rc="$(run_audit "$tool" "$tree" "$prod_json" "$prod_flag")"
-    problem="$(audit_file_problem "$full_json" "$full_rc")"
-    [[ -n "$problem" ]] && reason="full:$problem"
-    if [[ -z "$reason" ]]; then
-      problem="$(audit_file_problem "$prod_json" "$prod_rc")"
-      [[ -n "$problem" ]] && reason="prod:$problem"
-    fi
+  if [[ -z "$walk_reason" && ${#units[@]} -gt 0 ]]; then
+    mapfile -t units < <(printf '%s\n' "${units[@]}" | LC_ALL=C sort -u)
+  fi
+  if [[ -z "$walk_reason" ]] && (( ${#units[@]} > MAX_PACKAGE_DIRS )); then
+    walk_reason="too-many-package-dirs:${#units[@]}>${MAX_PACKAGE_DIRS}"
+  fi
+  if [[ -z "$walk_reason" && ${#units[@]} -eq 0 ]]; then
+    walk_reason="no-lockfile"
   fi
 
-  if [[ -n "$reason" ]]; then
-    # Unexamined: no counts at all (null), never zeros.
+  reasons=()
+  root_lock=""
+  lockfiles_json="["
+  units_json="["
+  r_crit=0; r_high=0; r_mod=0; r_low=0; r_info=0; r_pcrit=0; r_phigh=0
+  r_cves=""
+  if [[ -n "$walk_reason" ]]; then
+    reasons+=("$walk_reason")
+  else
+    unit_idx=0
+    for rel in "${units[@]}"; do
+      unit_idx=$(( unit_idx + 1 ))
+      audit_unit "$repo" "$rel" "$repo_idx" "$unit_idx"
+      if [[ "$rel" == "." ]]; then
+        root_lock="$U_LOCK"; path_prefix=""; lock_path="$U_LOCK"
+      else
+        path_prefix="$rel:"; lock_path="${U_LOCK:+$rel/$U_LOCK}"
+      fi
+      if [[ -n "$lock_path" ]]; then
+        [[ "$lockfiles_json" == "[" ]] || lockfiles_json+=","
+        lockfiles_json+="$(json_str "$lock_path")"
+      fi
+      lock_json="null"; [[ -n "$U_LOCK" ]] && lock_json="$(json_str "$U_LOCK")"
+      [[ "$units_json" == "[" ]] || units_json+=","
+      if [[ -n "$U_REASON" ]]; then
+        reasons+=("$path_prefix$U_REASON")
+        units_json+=$(printf '{"path":%s,"lockfile":%s,"status":"error","reason":%s,"critical":null,"high":null,"moderate":null,"low":null,"info":null,"prod_critical":null,"prod_high":null}' \
+          "$(json_str "$rel")" "$lock_json" "$(json_str "$U_REASON")")
+      else
+        units_json+=$(printf '{"path":%s,"lockfile":%s,"status":"ok","reason":null,"critical":%s,"high":%s,"moderate":%s,"low":%s,"info":%s,"prod_critical":%s,"prod_high":%s}' \
+          "$(json_str "$rel")" "$lock_json" "$U_CRIT" "$U_HIGH" "$U_MOD" "$U_LOW" "$U_INFO" "$U_PCRIT" "$U_PHIGH")
+        r_crit=$(( r_crit + U_CRIT )); r_high=$(( r_high + U_HIGH )); r_mod=$(( r_mod + U_MOD ))
+        r_low=$(( r_low + U_LOW )); r_info=$(( r_info + U_INFO ))
+        r_pcrit=$(( r_pcrit + U_PCRIT )); r_phigh=$(( r_phigh + U_PHIGH ))
+        if [[ -n "$U_CVES" ]]; then r_cves+="$U_CVES"$'\n'; fi
+      fi
+    done
+  fi
+  lockfiles_json+="]"
+  units_json+="]"
+  root_lock_json="null"; [[ -n "$root_lock" ]] && root_lock_json="$(json_str "$root_lock")"
+
+  if (( ${#reasons[@]} > 0 )); then
+    # Unexamined, wholly or in part: no counts at all (null), never zeros.
+    reason="$(printf '%s; ' "${reasons[@]}")"; reason="${reason%; }"
     REPOS_ERROR=$(( REPOS_ERROR + 1 ))
     ERROR_LINES+=("$name: $reason")
     echo "  UNEXAMINED $name: $reason" >&2
-    lock_json="null"; [[ -n "$lock" ]] && lock_json="$(json_str "$lockfile")"
-    entry=$(printf '{"repo":%s,"path":%s,"status":"error","reason":%s,"lockfile":%s,"critical":null,"high":null,"moderate":null,"low":null,"info":null,"prod_critical":null,"prod_high":null,"kev_cves":null,"kev_checked":false}' \
-      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$reason")" "$lock_json")
+    entry=$(printf '{"repo":%s,"path":%s,"status":"error","reason":%s,"lockfile":%s,"lockfiles":%s,"units":%s,"critical":null,"high":null,"moderate":null,"low":null,"info":null,"prod_critical":null,"prod_high":null,"kev_cves":null,"kev_checked":false}' \
+      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$reason")" "$root_lock_json" "$lockfiles_json" "$units_json")
   else
     REPOS_OK=$(( REPOS_OK + 1 ))
-    crit=$(jq -r '.metadata.vulnerabilities.critical' < "$full_json")
-    high=$(jq -r '.metadata.vulnerabilities.high' < "$full_json")
-    mod=$(jq -r '.metadata.vulnerabilities.moderate' < "$full_json")
-    low=$(jq -r '.metadata.vulnerabilities.low' < "$full_json")
-    info=$(jq -r '.metadata.vulnerabilities.info' < "$full_json")
-    pcrit=$(jq -r '.metadata.vulnerabilities.critical' < "$prod_json")
-    phigh=$(jq -r '.metadata.vulnerabilities.high' < "$prod_json")
-
-    # Collect CVE IDs from advisory entries; intersect with KEV (best effort,
-    # reported via kev_checked so a failed KEV fetch is not read as "no KEV hits").
-    # npm: .vulnerabilities[].via[].url; pnpm: .advisories[].cves[] and .url.
-    cves=$(jq -r '
-      ( [ .vulnerabilities[]?.via[]? | select(type=="object") | .url // empty ]
-        + [ .advisories[]? | ((.cves // [])[]?), (.url // empty) ] )
-      | map(strings | capture("CVE-[0-9]{4}-[0-9]+"; "g")?.[]?)
-      | unique[]?
-    ' < "$full_json" 2>/dev/null | sort -u || true)
+    # KEV cross-reference over every directory's CVEs (best effort, reported
+    # via kev_checked so a failed KEV fetch is not read as "no KEV hits").
+    cves="$(printf '%s' "$r_cves" | sed '/^$/d' | sort -u)"
     kev_hits=""
     if [[ -n "$KEV_CVES" && -n "$cves" ]]; then
       kev_hits=$(comm -12 <(echo "$cves") <(echo "$KEV_CVES") | tr '\n' ',' | sed 's/,$//')
     fi
 
-    SEV_TOTALS[critical]=$(( SEV_TOTALS[critical] + crit ))
-    SEV_TOTALS[high]=$(( SEV_TOTALS[high] + high ))
-    SEV_TOTALS[moderate]=$(( SEV_TOTALS[moderate] + mod ))
-    SEV_TOTALS[low]=$(( SEV_TOTALS[low] + low ))
-    SEV_TOTALS[info]=$(( SEV_TOTALS[info] + info ))
+    SEV_TOTALS[critical]=$(( SEV_TOTALS[critical] + r_crit ))
+    SEV_TOTALS[high]=$(( SEV_TOTALS[high] + r_high ))
+    SEV_TOTALS[moderate]=$(( SEV_TOTALS[moderate] + r_mod ))
+    SEV_TOTALS[low]=$(( SEV_TOTALS[low] + r_low ))
+    SEV_TOTALS[info]=$(( SEV_TOTALS[info] + r_info ))
 
-    entry=$(printf '{"repo":%s,"path":%s,"status":"ok","reason":null,"lockfile":%s,"critical":%s,"high":%s,"moderate":%s,"low":%s,"info":%s,"prod_critical":%s,"prod_high":%s,"kev_cves":%s,"kev_checked":%s}' \
-      "$(json_str "$name")" "$(json_str "$repo")" "$(json_str "$lockfile")" "$crit" "$high" "$mod" "$low" "$info" "$pcrit" "$phigh" \
+    entry=$(printf '{"repo":%s,"path":%s,"status":"ok","reason":null,"lockfile":%s,"lockfiles":%s,"units":%s,"critical":%s,"high":%s,"moderate":%s,"low":%s,"info":%s,"prod_critical":%s,"prod_high":%s,"kev_cves":%s,"kev_checked":%s}' \
+      "$(json_str "$name")" "$(json_str "$repo")" "$root_lock_json" "$lockfiles_json" "$units_json" \
+      "$r_crit" "$r_high" "$r_mod" "$r_low" "$r_info" "$r_pcrit" "$r_phigh" \
       "$(json_str "$kev_hits")" "$KEV_CHECKED")
   fi
 

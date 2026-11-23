@@ -3,6 +3,29 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.2 - 2026-11-23
+
+This release closes a fail-open in the estate production-dependency signal (work item 0323e3cc, security HIGH; discovery a0eb44f4).
+`npm-audit-weekly.sh` audited only each repo's ROOT lockfile, so a standalone package in a subdirectory with its own lockfile was never
+audited and the repo read prod-clean. Measured case: nexus-realervnc `deploy/op-auth-proxy/pnpm-lock.yaml` (installed
+`--ignore-workspace`, 26 production highs). On paxson 29 nested committed lockfiles across 13 repos had the same blind spot.
+
+- `npm-audit-weekly.sh` audits a repo as every package directory it holds: the root (when it has a `package.json`) and every directory
+  holding a lockfile of its own, `node_modules` and `.git` pruned, symlinked directories never followed. A workspace member has no lockfile
+  of its own, so it is still covered once, through the root.
+- A repo entry is `"ok"` only when every directory was examined; its counts are the sums over them. One directory not examined (audit
+  error, timeout, yarn or bun lockfile, staging refused) makes the whole repo `"error"` with null counts, and its reason names the
+  directory (`deploy/x:full:audit-error:...`). A control character in a lockfile path, a failed walk, or more than `MAX_PACKAGE_DIRS`
+  (default 50) directories also leaves the repo unexamined, never truncated.
+- Repos are discovered by a root `package.json` OR a lockfile anywhere in the tree, so a repo whose only npm package is nested
+  (`frontend/`, `server/`) is now audited instead of skipped.
+- The JSON report adds `"lockfiles"` (every audited lockfile, repo-relative) and `"units"` (per-directory status, reason and counts).
+  `"lockfile"` stays the root's lockfile.
+- `code-standards-facts.py` gives `code_standards_deps_scanned` to a scanned repo with a root `package.json` or a lockfile in any
+  subdirectory, so a missed nested package reads as not scanned rather than as having no npm dependencies. No series or label is
+  added: the `code_standards.prom` contract Steward parses is unchanged. `code_deps.prom` (OSV, every ecosystem) remains the
+  authoritative all-lockfile vulnerability feed.
+
 ## 1.2.1 - 2026-11-23
 
 This release labels the upstream mirrors in the OSV feed, and corrects the inventory, which had called them Ron's own code.
