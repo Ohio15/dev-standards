@@ -5,7 +5,7 @@ and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusabl
 
 ## 1.2.0 - 2026-11-23
 
-This release replaces GitHub Dependabot alerts with a local scan. It adds a local, all-ecosystem
+This release adds a local scan meant to replace GitHub Dependabot alerts. It adds a local, all-ecosystem
 dependency-vulnerability scan on NEXUS, and `docs/github-dependencies.md`, the inventory of what still runs
 on or arrives from GitHub (Ron, brief e26f9441).
 
@@ -23,9 +23,13 @@ on or arrives from GitHub (Ron, brief e26f9441).
   repo, and its environment is scrubbed, with no Go toolchain on PATH. No repo code is built or run, and
   no package list leaves the host.
 - `scripts/install-osv-scanner.sh` builds the version pinned in `estate/osv-scanner.version` with
-  `go install`, verified by the Go checksum database, and swaps `current` atomically.
+  `go install` under `env -i` (no inherited GOINSECURE, GONOSUMDB or go.env), verified by the Go
+  checksum database, and swaps `current` atomically.
 - `scripts/code-standards-cron.sh` step 6 runs the scanner after the code-standards export. The step is
   degradable: a failure never blocks that export.
+- No consumer exists yet. Steward ingestion (work item 8276fa8d) and APM Phase 4 (brain d04159db) are
+  pending, and so is a staleness alert on `code_deps_last_run_timestamp_seconds`. Until those land, the feed
+  is a report, not a control, and GitHub alerts stay on (security gate pass 1, SC-53 LOW).
 
 ## 1.1.21 - 2026-11-22
 

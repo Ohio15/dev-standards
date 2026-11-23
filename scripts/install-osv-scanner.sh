@@ -4,8 +4,10 @@
 # The version is estate/osv-scanner.version (one source). The binary is built
 # with `go install` from the Go module proxy: every module, and the Go
 # toolchain the module requires, is verified against sum.golang.org, so no
-# unverified release asset is downloaded. GOFLAGS/GOPROXY/GOSUMDB are pinned
-# here so an inherited environment cannot point the build elsewhere.
+# unverified release asset is downloaded. The build runs under `env -i` with
+# an explicit allow-list (PATH, HOME, GOENV=off, GOBIN, GOFLAGS, GOPROXY,
+# GOSUMDB, GOTOOLCHAIN), so no inherited GOINSECURE, GONOSUMDB, GOPRIVATE,
+# GONOPROXY or go.env file can weaken the checksum verification.
 #
 # Installs to <prefix>/<version>/osv-scanner and repoints <prefix>/current
 # atomically, so a failed build never replaces a working binary.
@@ -32,9 +34,11 @@ else
   mkdir -p -- "$prefix"
   stage="$(mktemp -d "$prefix/.stage.XXXXXX")"
   trap 'rm -rf -- "$stage"' EXIT
-  env GOBIN="$stage" GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
-    GONOSUMDB= GONOSUMCHECK= GOPRIVATE= GOTOOLCHAIN=auto \
-    go install "github.com/google/osv-scanner/v2/cmd/osv-scanner@v$version"
+  go_bin="$(command -v go)" || { echo "install-osv-scanner: go not on PATH" >&2; exit 2; }
+  env -i PATH="$(dirname "$go_bin"):/usr/bin:/bin" HOME="$HOME" GOENV=off \
+    GOBIN="$stage" GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
+    GOTOOLCHAIN=auto \
+    "$go_bin" install "github.com/google/osv-scanner/v2/cmd/osv-scanner@v$version"
   "$stage/osv-scanner" --version | grep -qx "osv-scanner version: $version" \
     || { echo "install-osv-scanner: built binary does not report $version" >&2; exit 1; }
   mkdir -p "$dest"
