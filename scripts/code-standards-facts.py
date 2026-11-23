@@ -15,6 +15,7 @@ Output contract (Steward parses exactly this; do not change it unilaterally):
     code_standards_repo_scanned{repo}            0|1, every roster repo
     code_standards_violation{repo,check}         1, violations only, scanned repos only
     code_standards_deps_scanned{repo}            0|1, scanned repos with a root package.json
+                                                 or a lockfile in any subdirectory
     code_standards_deps_prod_vulns{repo,severity} >0 counts, deps_scanned repos only
     code_standards_last_run_timestamp_seconds    unix seconds, last line
   All gauges; integral values; no timestamps; ASCII; LF; each series once;
@@ -23,9 +24,12 @@ Output contract (Steward parses exactly this; do not change it unilaterally):
 
 "Unknown is never clean": a repo is scanned=1 only when its mirror refresh
 succeeded THIS run and the hygiene report contains it; a dependency audit
-counts only when its npm-audit entry says status "ok". npm-audit-weekly.sh
-does not yet emit a per-repo status (an errored `npm audit` reads as all
-zeros there), so until it does every deps_scanned is 0 by design.
+counts only when its npm-audit entry says status "ok", which npm-audit-weekly.sh
+gives a repo only when every package directory in it (the root and each
+nested lockfile) was audited; its prod counts are the sums over them.
+code_deps.prom (osv-deps-facts.py, every ecosystem, every lockfile) is the
+authoritative all-lockfile vulnerability feed; this series is the npm/pnpm
+production subset Steward already consumes.
 
 The write is atomic: temp file in the target directory, fsync, chmod 0644,
 os.replace. node_exporter's textfile collector reads only *.prom, so the
@@ -78,7 +82,7 @@ METRICS: tuple[tuple[str, str], ...] = (
     ("code_standards_violation",
      "1 per code-standards check the repo violates (violations only; scanned repos only)."),
     ("code_standards_deps_scanned",
-     "1 when npm audit succeeded for a scanned repo with a root package.json, else 0."),
+     "1 when npm audit examined every package directory of a scanned repo, else 0."),
     ("code_standards_deps_prod_vulns",
      "Production-dependency vulnerabilities by severity (counts above 0 only)."),
     ("code_standards_last_run_timestamp_seconds",
@@ -192,9 +196,36 @@ def read_npm_audit(path: Path | None) -> dict[str, dict[str, int]]:
     return out
 
 
-def has_root_package_json(entry: dict[str, Any]) -> bool:
+# The lockfile names npm-audit-weekly.sh walks for (its LOCK_FIND_EXPR).
+NPM_LOCKFILES = frozenset({"npm-shrinkwrap.json", "package-lock.json", "pnpm-lock.yaml",
+                           "yarn.lock", "bun.lock", "bun.lockb"})
+
+
+def has_npm_packages(entry: dict[str, Any]) -> bool:
+    """True when the repo has a root package.json or a lockfile anywhere in its
+    tree (node_modules and .git pruned, symlinked dirs not followed): the scope
+    npm-audit-weekly.sh audits. A repo whose only npm package sits in a
+    subdirectory (item 0323e3cc) gets a deps_scanned series like any other, so
+    an audit that missed it reads as not scanned, never as "no npm deps". A
+    walk that cannot list a directory counts as applicable: unknown is never
+    read as out of scope."""
     path = entry.get("path")
-    return isinstance(path, str) and bool(path) and (Path(path) / "package.json").is_file()
+    if not isinstance(path, str) or not path:
+        return False
+    root = Path(path)
+    if (root / "package.json").is_file():
+        return True
+    walk_failed = False
+
+    def on_error(_exc: OSError) -> None:
+        nonlocal walk_failed
+        walk_failed = True
+
+    for _dir, dirs, files in os.walk(root, onerror=on_error, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        if NPM_LOCKFILES.intersection(files):
+            return True
+    return walk_failed and root.is_dir()
 
 
 def build_series(
@@ -222,7 +253,7 @@ def build_series(
                          if isinstance(f, dict) and f.get("code") in CHECK_MAP})
         for check in checks:
             series["code_standards_violation"].append((f'{{repo="{repo}",check="{check}"}}', 1))
-        if has_root_package_json(entry):
+        if has_npm_packages(entry):
             audit = npm.get(repo)
             series["code_standards_deps_scanned"].append((f'{{repo="{repo}"}}', 1 if audit else 0))
             if audit:

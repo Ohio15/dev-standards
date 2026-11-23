@@ -304,3 +304,49 @@ def test_an_npm_error_entry_with_null_counts_reads_as_not_scanned(estate: Estate
     assert 'code_standards_deps_scanned{repo="web"} 1' in body
     assert 'code_standards_deps_prod_vulns{repo="web",severity="high"} 1' in body
     assert not any('deps_prod_vulns{repo="apm"' in line for line in body)
+
+
+# ── item 0323e3cc: a repo whose npm package is nested still gets a deps series ──
+
+def test_nested_lockfile_only_repo_is_deps_applicable(estate: Estate) -> None:
+    lib = Path(estate.repo_dir("svc"))
+    (lib / "deploy" / "op-auth-proxy").mkdir(parents=True)
+    (lib / "deploy" / "op-auth-proxy" / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    estate.write(roster="svc\n", status=f"svc ok {SHA}\n",
+                 repos=[{"name": "svc", "path": str(lib), "findings": []}],
+                 npm=[{"repo": "svc", "status": "ok", "prod_critical": 0, "prod_high": 26}])
+    assert estate.run() == 0
+    s = estate.series()
+    assert s['code_standards_deps_scanned{repo="svc"}'] == 1
+    assert s['code_standards_deps_prod_vulns{repo="svc",severity="high"}'] == 26
+
+
+def test_nested_lockfile_repo_without_an_ok_audit_is_not_scanned(estate: Estate) -> None:
+    lib = Path(estate.repo_dir("svc"))
+    (lib / "frontend").mkdir()
+    (lib / "frontend" / "package-lock.json").write_text("{}", encoding="utf-8")
+    estate.write(roster="svc\n", status=f"svc ok {SHA}\n",
+                 repos=[{"name": "svc", "path": str(lib), "findings": []}],
+                 npm=[{"repo": "svc", "status": "error", "prod_critical": None, "prod_high": None}])
+    assert estate.run() == 0
+    s = estate.series()
+    assert s['code_standards_deps_scanned{repo="svc"}'] == 0
+    assert not any(k.startswith("code_standards_deps_prod_vulns") for k in s)
+
+
+def test_lockfiles_under_node_modules_and_git_do_not_make_a_repo_applicable(estate: Estate) -> None:
+    lib = Path(estate.repo_dir("lib"))
+    for sub in ("node_modules/x", ".git/y"):
+        (lib / sub).mkdir(parents=True)
+        (lib / sub / "package-lock.json").write_text("{}", encoding="utf-8")
+    estate.write(roster="lib\n", status=f"lib ok {SHA}\n",
+                 repos=[{"name": "lib", "path": str(lib), "findings": []}])
+    assert estate.run() == 0
+    assert not any(k.startswith("code_standards_deps") for k in estate.series())
+
+
+def test_every_walked_lockfile_name_matches_the_audit_script() -> None:
+    text = (SCRIPT.parent / "npm-audit-weekly.sh").read_text(encoding="utf-8")
+    block = re.search(r"LOCK_FIND_EXPR=\((.*?)\)", text, re.S)
+    assert block is not None
+    assert set(re.findall(r"-name (\S+)", block.group(1))) == facts.NPM_LOCKFILES

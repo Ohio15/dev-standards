@@ -269,7 +269,7 @@ def _tools_dir(tmp_path: Path, *, jq: bool) -> Path:
     tools = tmp_path / "tools"
     tools.mkdir()
     wanted = ["bash", "mktemp", "date", "mkdir", "rm", "sort", "comm", "sed", "tr", "cut", "basename",
-              "uname", "cat", "dirname", "sleep", "timeout", "env", "head", "cp", "grep", "ls"]
+              "uname", "cat", "dirname", "sleep", "timeout", "env", "head", "cp", "grep", "ls", "find"]
     if jq:
         wanted.append("jq")
     for tool in wanted:
@@ -620,3 +620,160 @@ def test_missing_pnpm_is_unexamined(tmp_path: Path) -> None:
     assert proc.returncode == 4
     _assert_unexamined(_entry(report, "p"), "pnpm-missing")
     assert _entry(report, "n")["status"] == "ok", _entry(report, "n")["reason"]
+
+
+# ── item 0323e3cc: every lockfile in a repo is audited, not only the root's ──
+# Measured case: nexus-realervnc deploy/op-auth-proxy/pnpm-lock.yaml (installed
+# --ignore-workspace, 26 prod highs) sat beside a clean root and the repo read
+# prod-clean. A repo is ok only when every package directory was examined.
+
+def _nested_pnpm(root: Path, rel: str, mode: str, *, prod_mode: str | None = None) -> None:
+    d = root / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "package.json").write_text(json.dumps({"name": d.name, "dependencies": {"a": "^1.0.0"}}),
+                                    encoding="utf-8")
+    lock = f"lockfileVersion: '9.0'\n# fake_mode: {mode}\n"
+    if prod_mode is not None:
+        lock += f"# fake_mode_prod: {prod_mode}\n"
+    (d / "pnpm-lock.yaml").write_text(lock, encoding="utf-8")
+
+
+def _nested_npm(root: Path, rel: str, mode: str) -> None:
+    d = root / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "package.json").write_text(json.dumps({"name": d.name, "fake_mode": mode}, separators=(",", ":")),
+                                    encoding="utf-8")
+    (d / "package-lock.json").write_text("{}", encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def nested_run(tmp_path_factory: pytest.TempPathFactory):
+    def realervnc(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean")
+        _nested_pnpm(root / name, "deploy/op-auth-proxy", "findings")
+
+    def nestedonly(root: Path, name: str) -> None:
+        (root / name / ".git").mkdir(parents=True)
+        _nested_npm(root / name, "frontend", "clean")
+        _nested_npm(root / name, "server", "findings")
+
+    def nestedbroken(root: Path, name: str) -> None:
+        _make_repo(root, name, "findings")
+        _nested_pnpm(root / name, "tools/x", "brokenlock")
+
+    def nestedyarn(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean")
+        (root / name / "web").mkdir()
+        (root / name / "web" / "package.json").write_text("{}", encoding="utf-8")
+        (root / name / "web" / "yarn.lock").write_text("# yarn lockfile v1\n", encoding="utf-8")
+
+    def installed(root: Path, name: str) -> None:
+        # Lockfiles inside node_modules and .git are installed or VCS state, not packages.
+        _make_repo(root, name, "clean")
+        _nested_npm(root / name, "node_modules/dep", "enolock")
+        _nested_npm(root / name, ".git/x", "enolock")
+
+    def workspacemember(root: Path, name: str) -> None:
+        # A member with a package.json and no lockfile is the root's to resolve.
+        _make_repo(root, name, "clean")
+        (root / name / "packages" / "a").mkdir(parents=True)
+        (root / name / "packages" / "a" / "package.json").write_text("{}", encoding="utf-8")
+
+    def nopkg(root: Path, name: str) -> None:
+        (root / name / ".git").mkdir(parents=True)
+        (root / name / "README.md").write_text("go repo\n", encoding="utf-8")
+
+    def toomany(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean")
+        for i in range(3):
+            _nested_npm(root / name, f"p{i}", "clean")
+
+    repos = {"realervnc": realervnc, "nestedonly": nestedonly, "nestedbroken": nestedbroken,
+             "nestedyarn": nestedyarn, "installed": installed, "workspacemember": workspacemember,
+             "nopkg": nopkg, "toomany": toomany}
+    return _run(tmp_path_factory.mktemp("nested"), repos, env_extra={"MAX_PACKAGE_DIRS": "3"})
+
+
+@needs_jq
+def test_nested_lockfile_findings_reach_the_repo_prod_counts(nested_run) -> None:
+    _, report = nested_run
+    e = _entry(report, "realervnc")
+    assert (e["status"], e["reason"]) == ("ok", None)
+    assert e["lockfile"] == "package-lock.json"
+    assert e["lockfiles"] == ["package-lock.json", "deploy/op-auth-proxy/pnpm-lock.yaml"]
+    # Root clean, nested findings: the repo is NOT prod-clean.
+    assert (e["prod_critical"], e["prod_high"]) == (4, 3)
+    assert (e["critical"], e["high"], e["moderate"], e["low"]) == (4, 3, 2, 1)
+    units = {u["path"]: u for u in e["units"]}
+    assert set(units) == {".", "deploy/op-auth-proxy"}
+    assert units["."]["prod_high"] == 0 and units["deploy/op-auth-proxy"]["prod_high"] == 3
+
+
+@needs_jq
+def test_a_repo_with_only_nested_packages_is_discovered_and_summed(nested_run) -> None:
+    _, report = nested_run
+    e = _entry(report, "nestedonly")
+    assert e["status"] == "ok" and e["lockfile"] is None
+    assert e["lockfiles"] == ["frontend/package-lock.json", "server/package-lock.json"]
+    assert (e["critical"], e["high"], e["prod_critical"], e["prod_high"]) == (4, 3, 4, 3)
+    assert all(r["repo"] != "nopkg" for r in report["repos"])  # no npm package anywhere: out of scope
+
+
+@needs_jq
+def test_one_unexamined_nested_lockfile_makes_the_repo_unexamined(nested_run) -> None:
+    _, report = nested_run
+    e = _entry(report, "nestedbroken")
+    _assert_unexamined(e, "tools/x:full:audit-error:ERR_PNPM_BROKEN_LOCKFILE")
+    units = {u["path"]: u for u in e["units"]}
+    assert units["."]["status"] == "ok" and units["tools/x"]["status"] == "error"
+    _assert_unexamined(_entry(report, "nestedyarn"), "web:unsupported-lockfile:yarn")
+    # Totals cover wholly examined repos only: the root findings of nestedbroken stay out.
+    assert report["totals"]["critical"] == 4 + 4  # realervnc nested + nestedonly server
+
+
+@needs_jq
+def test_installed_trees_and_workspace_members_are_not_package_dirs(nested_run) -> None:
+    _, report = nested_run
+    for name in ("installed", "workspacemember"):
+        e = _entry(report, name)
+        assert e["status"] == "ok", e
+        assert e["lockfiles"] == ["package-lock.json"] and [u["path"] for u in e["units"]] == ["."]
+
+
+@needs_jq
+def test_a_repo_over_the_package_dir_cap_is_unexamined_not_truncated(nested_run) -> None:
+    proc, report = nested_run
+    _assert_unexamined(_entry(report, "toomany"), "too-many-package-dirs:4>3")
+    assert proc.returncode == 3  # findings exceed thresholds; unexamined still reported
+    assert report["status"] == "error"
+
+
+@needs_jq
+@pytest.mark.skipif(IS_WINDOWS, reason="needs a real directory symlink")
+def test_a_symlinked_directory_is_never_walked(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    _nested_npm(outside, "pkg", "findings")
+
+    def linked(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean")
+        (root / name / "vendor").symlink_to(outside, target_is_directory=True)
+
+    proc, report = _run(tmp_path, {"linked": linked})
+    e = _entry(report, "linked")
+    assert e["status"] == "ok" and e["lockfiles"] == ["package-lock.json"]
+    assert proc.returncode == 0
+
+
+@needs_jq
+@pytest.mark.skipif(IS_WINDOWS, reason="NTFS refuses a newline in a file name")
+@pytest.mark.parametrize("dirname", ["a\nb", "a‮b", "a​b", "café"])
+def test_a_non_ascii_or_control_character_lockfile_path_is_unexamined(tmp_path: Path, dirname: str) -> None:
+    # SC-54/SC-60: a newline would split the list; a bidi override or a
+    # zero-width character would reorder or hide report and brain text.
+    def hostile(root: Path, name: str) -> None:
+        _make_repo(root, name, "clean")
+        _nested_npm(root / name, dirname, "clean")
+
+    proc, report = _run(tmp_path, {"hostile": hostile})
+    _assert_unexamined(_entry(report, "hostile"), "unsafe-lockfile-path")
+    assert proc.returncode == 4
