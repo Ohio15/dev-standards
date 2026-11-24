@@ -53,6 +53,13 @@ def test_binary_update_channel_is_excluded_with_a_reason() -> None:
     assert re.search(r"^#\s*aibrowser-updates\s+--\s+\S", text, re.MULTILINE)
 
 
+def test_deployed_forks_are_listed() -> None:
+    # `gh repo list --source` omits forks; the OpenClaw gateway NEXUS runs is
+    # the fork Ohio15/openclaw-1, so dropping it would leave the deployed
+    # gateway's dependencies unexamined while a stale snapshot stood in.
+    assert "openclaw-1" in {e.lower() for e in active_entries()}
+
+
 def test_scanner_inputs_are_mirrored() -> None:
     # code-standards-cron.sh reads the security roster and the canonical
     # register from these two mirrors and refuses to export without them.

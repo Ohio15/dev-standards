@@ -3,6 +3,21 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.3 - 2026-11-24
+
+The code-standards roster now lists the deployed OpenClaw fork `openclaw-1` (Steward item 0533106b follow-on; lesson fe7c2549).
+The roster was built from `gh repo list Ohio15 --source`, which drops forks, so it listed only `OpenClaw` (Ohio15/OpenClaw), a non-fork
+repo whose default branch is a 2025-11-25 snapshot with no lockfile, and never the gateway NEXUS actually runs (Ohio15/openclaw-1, a fork
+with `pnpm-lock.yaml`). Steward's `pos-code-dependency-vulns/openclaw` read blind-scan (`no-lockfile`) and the deployed gateway's
+dependencies were never audited. `openclaw-1` is the only fork pushed since 2026-08-10. Test `test_deployed_forks_are_listed`.
+`OpenClaw` stays listed: whether that snapshot repo is archived or excluded is an owner decision, so its position stays honestly blind.
+
+Expected after deploy, measured on NEXUS 2026-11-24 in a scratch mirror: `openclaw-1` reads UNEXAMINED, reason
+`vendor/a2ui/renderers/angular:stage-refused:workspace-path-outside-repo`. That vendored package depends on `file:../lit`, an in-repo
+sibling, and the 1.2.2 staging guard refuses every `../` lockfile key, including keys that resolve inside the repo. That is a scanner
+gap filed as its own work item (a path guard on untrusted repo content, security-gated). Until it lands, the deployed gateway is
+visibly unexamined, where before it was silently never scanned.
+
 ## 1.2.2 - 2026-11-23
 
 This release closes a fail-open in the estate production-dependency signal (work item 0323e3cc, security HIGH; discovery a0eb44f4).
