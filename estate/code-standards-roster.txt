@@ -9,6 +9,13 @@
 # steward-sessionwatch, steward-presence, steward-governance) are reviewed like
 # every other repo: no exemption (scripts/tests/test_code_standards_roster.py).
 #
+# Forks: `--source` drops forks, so a fork the estate DEPLOYS is added by hand
+# (1.2.3). openclaw-1 is the OpenClaw gateway NEXUS runs (~/OpenClaw, remote
+# Ohio15/openclaw-1, pnpm-lock.yaml); `OpenClaw` (Ohio15/OpenClaw) is a separate,
+# non-fork repo whose default branch is a 2025-11-25 snapshot with no lockfile.
+# Before 1.2.3 only the snapshot was listed, so Steward's dependency position for
+# the deployed gateway read blind-scan (no-lockfile) instead of being examined.
+#
 # Excluded:
 # aibrowser-updates   -- ~3 GB binary update channel for AIBrowser, not source code
 # Not listed (no push since 2026-08-10): PDFReaderEditor, PDFConverter, AdGuardHome
@@ -61,6 +68,7 @@ notification-service
 op-front
 op-proxy
 OpenClaw
+openclaw-1
 OpenOBD
 OpenOS
 OSTViewer
