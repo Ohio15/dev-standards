@@ -3,6 +3,14 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.4 - 2026-11-25
+
+STANDARDS.md 14.7 gains rule 7: the "requested, never blocked" rule is IMMUTABLE (Ron 2026-11-25, decision `fe5ac5ad`). The approval-request
+path is a server obligation with no flag, no per-class or per-principal disable, covering every refusal class; a bare refusal is a server
+defect (shared-brain work item `52c87ce3`) and rule 3's decision-item fallback is the backstop for that defect, not the intended path.
+The enforcement row for the shared-brain flag is marked non-compliant until the flag is removed. Trigger: 2026-11-25 `complete` on security
+item `2a3d5d61` and decision item `f7c2f214` refused with no request stored. Mirrors the cortex-hooks DR-041 amendment (0.106.3, PR in flight at the time of this entry; 0.106.2 is the deployed release).
+
 ## 1.2.3 - 2026-11-24
 
 The code-standards roster now lists the deployed OpenClaw fork `openclaw-1` (Steward item 0533106b follow-on; lesson fe7c2549).
