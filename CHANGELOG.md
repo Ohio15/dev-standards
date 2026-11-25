@@ -3,6 +3,15 @@
 dev-standards had no root version until 1.1.0; earlier changes are recorded in the PR history
 and the `v1` / `v1-rcN` workflow tags (which remain the consumer pin for reusable workflows).
 
+## 1.2.5 - 2026-11-25
+
+STANDARDS.md 1 gains "Process-memory corrections carry the artifact check" (Ron 2026-11-25, memory `1c12e9cf`): a correction to a
+memory that describes a process is complete only when every artifact encoding that process (code, scripts, hooks, runbooks, STANDARDS.md,
+decision register, scheduled tasks, agent briefs) has been checked in the same turn and the record names each as CHANGED (PR/commit) or
+ALREADY CORRECT (evidence location). Steward enforces (work item `28d98ab6`). Origin: lesson `1524c3f7` corrected `7ac95d78` and the
+follow-through found the handoff watcher already correct. Also fixes version drift: PR #109 recorded 1.2.4 in this file but left
+`version.json` at 1.2.3; both now read 1.2.5 (defect filed to the work queue as a class: a docs-only PR can skip the bump unobserved).
+
 ## 1.2.4 - 2026-11-25
 
 STANDARDS.md 14.7 gains rule 7: the "requested, never blocked" rule is IMMUTABLE (Ron 2026-11-25, decision `fe5ac5ad`). The approval-request
