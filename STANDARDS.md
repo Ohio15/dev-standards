@@ -715,7 +715,7 @@ The weights and goals file is Ron's: Steward and sessions change it only on his 
 | Mechanism | Scope | Status |
 |---|---|---|
 | Shared-brain approval requests (7.96.0, flag `WORK_QUEUE_APPROVAL_REQUESTS`): an approvable refusal is stored as a request and returned as `NOT APPLIED`; close capacity is reserved so no append can make an item uncloseable (incident `906cb149`) | shared-brain work queue | SHIPPED off; NON-COMPLIANT with rule 7 while a flag exists. Work item `52c87ce3`: remove the flag (after the three 2026-11-22 audit MEDIUMs, memory `c8b37153`) and cover every refusal class |
-| cortex-hooks DR-041 (warn): `board-request-backstop` on `brain_commitments` results, plus claim-check CHECK 5 (`board_claim`, `board_handoff`) | every AI session | SHIPPED (cortex-hooks v0.104.0); `settings.json` registration is human-run |
+| cortex-hooks DR-041 (warn): `board-request-backstop` on `brain_commitments` results, plus claim-check CHECK 5 (`board_claim`, `board_handoff`) | every AI session | SHIPPED (cortex-hooks v0.104.0; register text amended to IMMUTABLE in 0.106.3, pending); `settings.json` registration is human-run |
 | cortex-hooks DR-042 (block): `board-key-guard` refuses reads of board key material through shell, file and Windows-MCP channels | every AI session | SHIPPED (cortex-hooks v0.104.0), interim containment; `settings.json` registration is human-run |
 | Phase 2: passkey-bound batch approval, APM "Needs you" queue, board key removed from agent reach | shared-brain + APM + n3xus-identity | PENDING (work item `227339d8`) |
 

@@ -9,7 +9,7 @@ STANDARDS.md 14.7 gains rule 7: the "requested, never blocked" rule is IMMUTABLE
 path is a server obligation with no flag, no per-class or per-principal disable, covering every refusal class; a bare refusal is a server
 defect (shared-brain work item `52c87ce3`) and rule 3's decision-item fallback is the backstop for that defect, not the intended path.
 The enforcement row for the shared-brain flag is marked non-compliant until the flag is removed. Trigger: 2026-11-25 `complete` on security
-item `2a3d5d61` and decision item `f7c2f214` refused with no request stored. Mirrors cortex-hooks DR-041 (0.106.3).
+item `2a3d5d61` and decision item `f7c2f214` refused with no request stored. Mirrors the cortex-hooks DR-041 amendment (0.106.3, PR in flight at the time of this entry; 0.106.2 is the deployed release).
 
 ## 1.2.3 - 2026-11-24
 
